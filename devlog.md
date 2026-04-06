@@ -1,4 +1,5 @@
 | 날짜 | ID | 작업 내용 | 상세 |
+| 2026-04-06 | 024 | sit/lie 학습 데이터 수집 및 XG-Posture 6클래스 재학습 (210샘플, CV F1=69.93%) | [상세](devlog/2026-04-06/024-sit-lie-data-collection.md) |
 | 2026-04-06 | 023 | XG-Posture 재훈련 — KTH 데이터 통합, 141샘플 4-class, CV F1=86.19% | [상세](devlog/2026-04-06/023-xg-posture-retrain.md) |
 | 2026-04-06 | 022 | KTH Action Recognition Dataset 다운로드 (walk 81 + run 80 = 161 clips) | [상세](devlog/2026-04-06/022-kth-data-download.md) |
 | 2026-04-06 | 021 | 웹캠 모드 화면 표시 오류 수정 (CSS Grid grid-rows-1 + layout flex + h-full) | [상세](devlog/2026-04-06/021-webcam-display-grid-fix.md) |
