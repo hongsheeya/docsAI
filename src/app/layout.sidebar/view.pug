@@ -1,21 +1,5 @@
-div(class="h-screen bg-[#f4f5f5] overflow-hidden")
-    div(class="relative z-50 lg:hidden", *ngIf="!service.status.navbar")
-        div(class="fixed inset-0 bg-gray-900/80")
-        div(class="fixed inset-0 flex")
-            div(class="relative mr-16 flex w-full max-w-[14rem] flex-1")
-                div(class="absolute left-full top-0 flex w-16 justify-center pt-5")
-                    button(type="button", class="-m-2.5 p-2.5", (click)="service.status.toggle('navbar'); $event.stopPropagation();")
-                        span(class="sr-only") Close sidebar
-                        svg(class="h-5 w-5 text-white", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", aria-hidden="true")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M6 18L18 6M6 6l12 12")
-                div(class="flex grow flex-col overflow-y-auto bg-white px-3 pb-3")
-                    wiz-component-nav-sidebar(style="display: contents;")
-
-    div(class="hidden lg:fixed lg:inset-y-0 lg:z-50 lg:flex lg:w-56 lg:flex-col")
-        div(class="flex grow flex-col overflow-y-auto border-r border-gray-200 bg-white px-3 pb-3")
-            wiz-component-nav-sidebar(style="display: contents;")
-
-    div(class="h-full lg:pl-56 overflow-auto")
+div(class="flex flex-col h-full bg-[#f4f5f5] overflow-hidden")
+    div(class="flex-1 min-h-0 overflow-auto")
         router-outlet
 
 wiz-portal-season-modal

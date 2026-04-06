@@ -15,6 +15,9 @@ export class Component implements OnInit {
     }
 
     public isActive(link: string) {
+        if (link === '/') {
+            return location.pathname === '/' || location.pathname === '';
+        }
         return location.pathname.indexOf(link) === 0
     }
 
@@ -23,5 +26,9 @@ export class Component implements OnInit {
             return "group flex gap-x-2 items-center rounded-md bg-gray-100 px-2 py-1.5 text-[13px] font-medium text-indigo-600";
         }
         return "group flex gap-x-2 items-center rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 hover:bg-gray-50 hover:text-indigo-600";
+    }
+
+    public isAdmin() {
+        return this.service.auth?.check?.role('admin') === true;
     }
 }

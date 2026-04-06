@@ -1,0 +1,375 @@
+div(class="min-h-screen bg-slate-50")
+    div(class="mx-auto max-w-[1800px] px-6 py-10")
+        div(class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between")
+            div
+                p(class="text-xs font-semibold uppercase tracking-[0.2em] text-sky-600") Pipeline Detail
+                h1(class="mt-2 text-3xl font-bold text-slate-950") AI 파이프라인 상세
+                p(class="mt-3 max-w-3xl text-sm leading-7 text-slate-600") 데이터 학습 과정, 분석 엔진 구조, 파이프라인 흐름을 이 페이지에서 확인합니다.
+            div(class="flex flex-wrap gap-2")
+                a(routerLink="/", class="inline-flex items-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50") 메인 분석으로 이동
+                a(routerLink="/admin/analysis", class="inline-flex items-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50", *ngIf="isAdminUser()") 관리자 상세
+
+        div(class="mt-8 grid gap-4 md:grid-cols-4")
+            div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
+                p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 현재 런타임
+                p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.label}}
+                p(class="mt-2 text-xs text-slate-500") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.note}}
+            div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
+                p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 낙상 학습 샘플
+                p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.dataset_summary?.fall_sample_count || 0}}건
+                p(class="mt-2 text-[13px] font-medium text-slate-700") {{prototypeInfo?.dataset_summary?.fall_model_label}}
+                p(class="mt-2 text-xs text-slate-500") {{prototypeInfo?.dataset_summary?.fall_sample_note}}
+            div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
+                p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 행동 학습 샘플
+                p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.dataset_summary?.behavior_sample_count || 0}}건
+                p(class="mt-2 text-[13px] font-medium text-slate-700") {{prototypeInfo?.dataset_summary?.behavior_model_label}}
+                p(class="mt-2 text-xs text-slate-500") {{prototypeInfo?.dataset_summary?.behavior_sample_note}}
+            div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
+                p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 실시간 청크
+                p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.dataset_summary?.realtime_chunk_sec || 5}}초
+                p(class="mt-2 text-xs text-slate-500") 2초 오버랩 듀얼 녹화
+
+        div(class="mt-8 grid gap-6 xl:grid-cols-2")
+            div(class="space-y-6")
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") 데이터 학습 과정
+                    p(class="mt-2 text-sm text-slate-600") 데이터 수집부터 모델 평가까지의 전체 파이프라인입니다.
+                    div(class="mt-5 grid gap-3 md:grid-cols-5")
+                        div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
+                            div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 1
+                            p(class="mt-2 text-sm font-semibold text-sky-900") 데이터 수집
+                            p(class="mt-1 text-xs text-sky-700") {{prototypeInfo?.trained_model?.sample_count || 320}}건 영상
+                        div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
+                            div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 2
+                            p(class="mt-2 text-sm font-semibold text-sky-900") 전처리
+                            p(class="mt-1 text-xs text-sky-700") 프레임 추출 · 정규화
+                        div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
+                            div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 3
+                            p(class="mt-2 text-sm font-semibold text-sky-900") 라벨링
+                            p(class="mt-1 text-xs text-sky-700") N/FY/SY/BY 분류
+                        div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
+                            div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 4
+                            p(class="mt-2 text-sm font-semibold text-sky-900") 학습
+                            p(class="mt-1 text-xs text-sky-700") train {{prototypeInfo?.trained_model?.train_count || 256}} · val {{prototypeInfo?.trained_model?.validation_count || 64}}
+                        div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
+                            div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 5
+                            p(class="mt-2 text-sm font-semibold text-sky-900") 평가
+                            p(class="mt-1 text-xs text-sky-700") 검증 정확도 확인
+
+                div(class="rounded-3xl border border-violet-200 bg-violet-50 p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-violet-950") XGBoost v2 파이프라인 흐름 (기본 운영 모델)
+                    p(class="mt-2 text-sm text-violet-700") YOLO ByteTrack 다중 인물 추적 + XGBoost v2 분류 기반 기본 운영 파이프라인입니다. (1500건 학습, threshold 50%)
+                    div(class="mt-5 flex flex-wrap items-center justify-center gap-2")
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") INPUT
+                            p(class="mt-1 text-sm font-semibold text-violet-900") 영상 파일
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") TRACK
+                            p(class="mt-1 text-sm font-semibold text-violet-900") YOLO + ByteTrack
+                            p(class="mt-1 text-xs text-violet-600") 다중 인물 추적
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") WINDOW
+                            p(class="mt-1 text-sm font-semibold text-violet-900") 슬라이딩 윈도우
+                            p(class="mt-1 text-xs text-violet-600") 10개 모션 특징 추출
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") CLASSIFY
+                            p(class="mt-1 text-sm font-semibold text-violet-900") XGBoost v2
+                            p(class="mt-1 text-xs text-violet-600") 바닥근접도·하강속도
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") GATE
+                            p(class="mt-1 text-sm font-semibold text-violet-900") Motion Gate
+                            p(class="mt-1 text-xs text-violet-600") 오탐 억제
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-rose-600") OUTPUT
+                            p(class="mt-1 text-sm font-semibold text-rose-900") 위험도 판정
+
+                div(class="rounded-3xl border border-indigo-200 bg-indigo-50 p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-indigo-950") RF 보조 파이프라인 흐름
+                    p(class="mt-2 text-sm text-indigo-700") RandomForest + YOLOv8n-Pose 기반 보조 비교 모델입니다. (Acc 94.5%, F1 94.6%)
+                    div(class="mt-5 flex flex-wrap items-center justify-center gap-2")
+                        div(class="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-indigo-600") INPUT
+                            p(class="mt-1 text-sm font-semibold text-indigo-900") 영상 파일
+                        div(class="text-xl font-bold text-indigo-400") →
+                        div(class="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-indigo-600") DETECT
+                            p(class="mt-1 text-sm font-semibold text-indigo-900") YOLOv8n-Pose
+                            p(class="mt-1 text-xs text-indigo-600") 사람 bbox 검출
+                        div(class="text-xl font-bold text-indigo-400") →
+                        div(class="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-indigo-600") FEATURES
+                            p(class="mt-1 text-sm font-semibold text-indigo-900") 13개 통계 특징
+                            p(class="mt-1 text-xs text-indigo-600") Y변위·가속도·자세높이 등
+                        div(class="text-xl font-bold text-indigo-400") →
+                        div(class="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-indigo-600") GUARD
+                            p(class="mt-1 text-sm font-semibold text-indigo-900") Motion Guard
+                            p(class="mt-1 text-xs text-indigo-600") 오탐 억제
+                        div(class="text-xl font-bold text-indigo-400") →
+                        div(class="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-indigo-600") CLASSIFY
+                            p(class="mt-1 text-sm font-semibold text-indigo-900") RandomForest
+                            p(class="mt-1 text-xs text-indigo-600") 낙상 확률 산출
+                        div(class="text-xl font-bold text-indigo-400") →
+                        div(class="rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-rose-600") OUTPUT
+                            p(class="mt-1 text-sm font-semibold text-rose-900") 위험도 판정
+
+                //- RF 특징 상세
+                div(class="rounded-3xl border border-indigo-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-indigo-950") RF 보조 모델 특징(Feature) 상세
+                    p(class="mt-2 text-sm text-indigo-700") 13개 통계 특징의 역할과 중요도입니다. (학습: 2,000건, Threshold: 52%)
+                    div(class="mt-5 space-y-3")
+                        div(class="grid gap-2 md:grid-cols-2")
+                            div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-emerald-900") #1 최종 자세 높이 (final_height_ratio)
+                                    span(class="text-xs font-semibold text-emerald-700") 23.7%
+                                p(class="mt-1 text-xs text-emerald-700") 영상 마지막 구간 높이/평균 높이 비율. 1 미만이면 넘어진 후 낮은 자세.
+                            div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-emerald-900") #2 종횡비 변동 (aspect_ratio_std)
+                                    span(class="text-xs font-semibold text-emerald-700") 12.0%
+                                p(class="mt-1 text-xs text-emerald-700") 자세 변화(세로→가로) 감지. 넘어질 때 급격히 변동.
+                            div(class="rounded-xl border border-sky-200 bg-sky-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-sky-900") #3 검출률 (detection_rate)
+                                    span(class="text-xs font-semibold text-sky-700") 11.5%
+                                p(class="mt-1 text-xs text-sky-700") 사람이 검출된 프레임 비율. 영상 길이에 무관한 정규화된 지표.
+                            div(class="rounded-xl border border-sky-200 bg-sky-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-sky-900") #4 평균 하강 변위 (delta_y_mean)
+                                    span(class="text-xs font-semibold text-sky-700") 11.3%
+                                p(class="mt-1 text-xs text-sky-700") 프레임 간 아래 방향 이동의 평균. 지속적 하강 패턴 감지.
+                            div(class="rounded-xl border border-sky-200 bg-sky-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-sky-900") #5 최대 하강 변위 (delta_y_max)
+                                    span(class="text-xs font-semibold text-sky-700") 8.4%
+                                p(class="mt-1 text-xs text-sky-700") 프레임 간 최대 하강량. 급격한 낙하 순간 포착.
+                            div(class="rounded-xl border border-slate-200 bg-slate-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-slate-900") #6 Y축 변동성 (center_y_std)
+                                    span(class="text-xs font-semibold text-slate-600") 7.4%
+                                p(class="mt-1 text-xs text-slate-600") 수직 위치의 표준편차. 큰 값은 급격한 높이 변화 의미.
+                            div(class="rounded-xl border border-slate-200 bg-slate-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-slate-900") #7 종횡비 평균 (aspect_ratio_mean)
+                                    span(class="text-xs font-semibold text-slate-600") 7.0%
+                                p(class="mt-1 text-xs text-slate-600") 평균 자세 비율. 가로로 넓으면 넘어진 상태.
+                            div(class="rounded-xl border border-amber-200 bg-amber-50 p-3")
+                                div(class="flex items-center justify-between")
+                                    p(class="text-[13px] font-semibold text-amber-900") #8 하강 가속도 (delta_y_accel_max)
+                                    span(class="text-xs font-semibold text-amber-700") 3.9%
+                                p(class="mt-1 text-xs text-amber-700") 하강 속도의 급격한 증가. 넘어지는 순간의 가속 감지.
+                        div(class="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3")
+                            p(class="text-xs font-semibold text-slate-500") 나머지 5개 (각 2~3%)
+                            p(class="mt-1 text-xs text-slate-500") center_y_mean · delta_width_mean · height_mean · height_std · delta_height_mean
+                    div(class="mt-5 grid gap-3 md:grid-cols-4")
+                        div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-center")
+                            p(class="text-xs text-emerald-600") Accuracy
+                            p(class="mt-1 text-lg font-bold text-emerald-900") 94.5%
+                        div(class="rounded-xl border border-sky-200 bg-sky-50 p-3 text-center")
+                            p(class="text-xs text-sky-600") Precision
+                            p(class="mt-1 text-lg font-bold text-sky-900") 94.1%
+                        div(class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-center")
+                            p(class="text-xs text-violet-600") Recall
+                            p(class="mt-1 text-lg font-bold text-violet-900") 95.0%
+                        div(class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-center")
+                            p(class="text-xs text-rose-600") F1 Score
+                            p(class="mt-1 text-lg font-bold text-rose-900") 94.5%
+                    div(class="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3")
+                        p(class="text-xs text-slate-500") 모델 HP: n_estimators=300, max_depth=None, min_samples_leaf=1, class_weight=balanced | Threshold 52%
+
+                div(class="rounded-3xl border border-violet-200 bg-violet-50 p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-violet-950") XGBoost v2 사람 추적 파이프라인 흐름 (기본 모델)
+                    p(class="mt-2 text-sm text-violet-700") YOLO ByteTrack 다중 인물 추적 + XGBoost v2 분류 기반 기본 운영 파이프라인입니다.
+                    div(class="mt-5 flex flex-wrap items-center justify-center gap-2")
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") INPUT
+                            p(class="mt-1 text-sm font-semibold text-violet-900") 영상 파일
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") TRACK
+                            p(class="mt-1 text-sm font-semibold text-violet-900") YOLO + ByteTrack
+                            p(class="mt-1 text-xs text-violet-600") 다중 인물 추적
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") WINDOW
+                            p(class="mt-1 text-sm font-semibold text-violet-900") 슬라이딩 윈도우
+                            p(class="mt-1 text-xs text-violet-600") 모션 특징 추출
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") CLASSIFY
+                            p(class="mt-1 text-sm font-semibold text-violet-900") XGBoost
+                            p(class="mt-1 text-xs text-violet-600") 바닥근접도·하강속도
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-violet-300 bg-white px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-violet-600") GATE
+                            p(class="mt-1 text-sm font-semibold text-violet-900") Motion Gate
+                            p(class="mt-1 text-xs text-violet-600") 오탐 억제
+                        div(class="text-xl font-bold text-violet-400") →
+                        div(class="rounded-xl border border-rose-300 bg-rose-50 px-4 py-3 text-center")
+                            p(class="text-xs font-semibold text-rose-600") OUTPUT
+                            p(class="mt-1 text-sm font-semibold text-rose-900") 위험도 판정
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") RF vs XGBoost 비교
+                    p(class="mt-2 text-sm text-slate-600") 기본 모델(XGBoost v2)과 보조 모델(RF)의 특성 차이입니다.
+                    div(class="mt-5 grid gap-4 md:grid-cols-2")
+                        div(class="rounded-2xl border border-emerald-200 bg-emerald-50 p-5")
+                            div(class="flex items-center gap-2")
+                                div(class="flex size-8 items-center justify-center rounded-full bg-emerald-500 text-xs font-bold text-white") ⚡
+                                p(class="text-sm font-semibold text-emerald-900") RF 보조 파이프라인
+                            div(class="mt-4 space-y-2")
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 분석 방식
+                                    span(class="font-semibold text-emerald-800") 프레임 통계 특징
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 모델
+                                    span(class="font-semibold text-emerald-800") RandomForest
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 낙상 임계값
+                                    span(class="font-semibold text-emerald-800") 52%
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 학습 데이터
+                                    span(class="font-semibold text-emerald-800") 2000건 (RF v5)
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 예상 소요 시간
+                                    span(class="font-semibold text-emerald-800") ~5초
+                        div(class="rounded-2xl border border-violet-200 bg-violet-50 p-5")
+                            div(class="flex items-center gap-2")
+                                div(class="flex size-8 items-center justify-center rounded-full bg-violet-500 text-xs font-bold text-white") 🔬
+                                p(class="text-sm font-semibold text-violet-900") XGBoost v2 파이프라인 (기본)
+                            div(class="mt-4 space-y-2")
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 분석 방식
+                                    span(class="font-semibold text-violet-800") ByteTrack 추적 + 윈도우
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 모델
+                                    span(class="font-semibold text-violet-800") XGBoost
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 낙상 임계값
+                                    span(class="font-semibold text-violet-800") 50%
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 학습 데이터
+                                    span(class="font-semibold text-violet-800") 1500건 (XGBoost v2)
+                                div(class="flex items-center justify-between text-sm")
+                                    span(class="text-slate-600") 예상 소요 시간
+                                    span(class="font-semibold text-violet-800") ~15초
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") 처리 단계
+                    div(class="mt-5 grid gap-3 md:grid-cols-5")
+                        div(*ngFor="let step of prototypeInfo?.analysis_steps; let idx = index", class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-center")
+                            p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") Step {{idx + 1}}
+                            p(class="mt-2 text-sm font-semibold text-slate-900") {{step}}
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    div(class="flex items-center justify-between gap-3")
+                        h2(class="text-xl font-semibold text-slate-950") 현재 사용 중인 분석 레이어
+                        span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(prototypeInfo?.analysis_engine_summary?.current_runtime?.key)") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.key}}
+                    div(class="mt-5 grid gap-3")
+                        div(*ngFor="let layer of prototypeInfo?.analysis_engine_summary?.layers", class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4")
+                            div(class="flex items-center justify-between gap-3")
+                                p(class="text-sm font-semibold text-slate-900") {{layer.title}}
+                                span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(layer.status)") {{layer.status}}
+                            p(class="mt-2 text-sm text-slate-700") {{layer.active_label}}
+                            p(class="mt-2 text-xs text-slate-500") summary {{layer.summary_exists ? '있음' : '없음'}} · model {{layer.model_exists ? '있음' : '없음'}} · samples {{layer.sample_count}}
+
+                div(class="rounded-3xl border border-slate-200 bg-slate-950 p-6 text-white shadow-sm")
+                    h2(class="text-xl font-semibold") 실시간 전환 계획
+                    p(class="mt-3 text-sm leading-7 text-slate-300") {{prototypeInfo?.realtime_readiness?.headline}}
+                    div(class="mt-5 grid gap-3 md:grid-cols-3")
+                        div(*ngFor="let item of prototypeInfo?.realtime_readiness?.recommended_stack", class="rounded-2xl border border-white/10 bg-white/5 px-4 py-4")
+                            div(class="flex items-center justify-between gap-2")
+                                p(class="text-sm font-semibold text-white") {{item.title}}
+                                span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(item.status)") {{item.status}}
+                            p(class="mt-2 text-sm text-slate-300") {{item.description}}
+                    ul(class="mt-5 space-y-2")
+                        li(*ngFor="let item of prototypeInfo?.camera_transition_plan", class="text-sm text-slate-300") • {{item}}
+
+            div(class="space-y-6")
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") 모델 설명 카드
+                    p(class="mt-3 text-sm leading-7 text-slate-600") {{prototypeInfo?.model_explanation?.headline}}
+                    div(class="mt-5 space-y-3")
+                        div(*ngFor="let card of prototypeInfo?.model_explanation?.cards", class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4")
+                            div(class="flex items-center justify-between gap-3")
+                                p(class="text-sm font-semibold text-slate-900") {{card.title}}
+                                span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(card.status)") {{card.status}}
+                            p(class="mt-2 text-sm text-slate-700") {{card.summary}}
+                            ul(class="mt-3 space-y-1")
+                                li(*ngFor="let item of card.items", class="text-xs text-slate-500") • {{item}}
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") RF 보조 파이프라인 모델
+                    div(class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3")
+                        p(class="text-sm font-semibold text-sky-800") {{prototypeInfo?.trained_model?.metric_note || '3-Fold 교차 검증 기준 메트릭'}}
+                    div(class="mt-5 grid gap-3 md:grid-cols-2")
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4")
+                            p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 모델/가중치
+                            p(class="mt-2 text-sm font-semibold text-slate-900") {{prototypeInfo?.trained_model?.model_name || '-'}}
+                            p(class="mt-2 text-xs text-slate-500") {{prototypeInfo?.trained_model?.weights_path || '-'}}
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4")
+                            p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 학습 데이터
+                            p(class="mt-2 text-sm font-semibold text-slate-900") 총 {{prototypeInfo?.trained_model?.sample_count || 0}}건
+                            p(class="mt-1 text-xs text-slate-400") {{prototypeInfo?.trained_model?.split_note}}
+                    div(class="mt-5 grid gap-3 md:grid-cols-3", *ngIf="prototypeInfo?.trained_model?.rf_pipeline?.metric_ready")
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-xs text-slate-400") CV F1
+                            p(class="mt-2 text-lg font-bold text-slate-900") {{prototypeInfo?.trained_model?.rf_pipeline?.cv_f1 * 100 | number:'1.0-1'}}%
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-xs text-slate-400") CV AUC
+                            p(class="mt-2 text-lg font-bold text-slate-900") {{prototypeInfo?.trained_model?.rf_pipeline?.cv_auc * 100 | number:'1.0-1'}}%
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-xs text-slate-400") 특징 수
+                            p(class="mt-2 text-lg font-bold text-slate-900") {{prototypeInfo?.trained_model?.rf_pipeline?.feature_count || 13}}개
+                    div(class="mt-5 grid gap-3 md:grid-cols-1", *ngIf="!prototypeInfo?.trained_model?.rf_pipeline?.metric_ready")
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-xs text-slate-400") 모델 정보
+                            p(class="mt-2 text-sm text-slate-700") {{prototypeInfo?.trained_model?.rf_pipeline?.model_class || 'RandomForestClassifier'}} · 트리 {{prototypeInfo?.trained_model?.rf_pipeline?.n_estimators || 0}}개 · 특징 {{prototypeInfo?.trained_model?.rf_pipeline?.feature_count || 0}}개
+                    div(class="mt-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3", *ngIf="prototypeInfo?.trained_model?.evaluation_source")
+                        p(class="text-xs font-semibold text-slate-400") 검증 결과 ({{prototypeInfo?.trained_model?.evaluation_source}})
+                        p(class="mt-2 text-sm text-slate-700") {{prototypeInfo?.trained_model?.evaluation_note}}
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") 영상 분석 진단
+                    p(class="mt-3 text-sm leading-7 text-slate-600") {{prototypeInfo?.analysis_diagnostics?.headline}}
+                    div(class="mt-5 space-y-3")
+                        div(*ngFor="let item of prototypeInfo?.analysis_diagnostics?.items", class="rounded-2xl px-4 py-4", [ngClass]="diagnosticClass(item.severity)")
+                            div(class="flex items-center justify-between gap-3")
+                                p(class="text-sm font-semibold") {{item.title}}
+                                span(class="inline-flex items-center rounded-full border border-current/10 px-2.5 py-1 text-[11px] font-semibold uppercase") {{item.severity}}
+                            p(class="mt-2 text-sm leading-6") {{item.description}}
+                            p(class="mt-2 text-xs leading-5 opacity-80") 조치: {{item.action}}
+
+                div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-slate-950") 관련 운영 정보
+                    div(class="mt-5 grid gap-3")
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-sm font-medium text-slate-900") 분석 아카이브
+                            p(class="mt-2 text-sm text-slate-700") 총 {{prototypeInfo?.analysis_archive_summary?.total || 0}}건 · 누적 {{prototypeInfo?.analysis_archive_summary?.total_duration_sec || 0}}초
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-sm font-medium text-slate-900") 학습 intake
+                            p(class="mt-2 text-sm text-slate-700") Y {{prototypeInfo?.intake_summary?.Y || 0}}건 · N {{prototypeInfo?.intake_summary?.N || 0}}건 · 총 {{prototypeInfo?.intake_summary?.total || 0}}건
+                        div(class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3")
+                            p(class="text-sm font-medium text-slate-900") 라우팅 체크리스트
+                            ul(class="mt-2 space-y-1")
+                                li(*ngFor="let item of prototypeInfo?.routing_checklist", class="text-sm text-slate-700") • {{item}}
+
+                div(class="rounded-3xl border border-rose-200 bg-rose-50 p-6 shadow-sm")
+                    h2(class="text-xl font-semibold text-rose-950") 낙상 시 응급 프로토콜
+                    p(class="mt-3 text-sm leading-7 text-rose-900") {{prototypeInfo?.emergency_protocol?.headline}}
+                    div(class="mt-5 grid gap-3")
+                        div(*ngFor="let protocol of prototypeInfo?.emergency_protocol?.levels", class="rounded-2xl border border-rose-200 bg-white px-4 py-4")
+                            div(class="flex items-center justify-between gap-3")
+                                p(class="text-sm font-semibold text-slate-900") {{protocol.label}}
+                                span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(protocol.level === 'high' ? 'fallback' : 'preview')") {{protocol.level}}
+                            p(class="mt-2 text-sm text-slate-700") {{protocol.trigger}}
+                            ul(class="mt-3 space-y-1")
+                                li(*ngFor="let step of protocol.steps", class="text-xs text-slate-600") • {{step}}

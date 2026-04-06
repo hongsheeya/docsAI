@@ -1,0 +1,11 @@
+{
+    "mode": "page",
+    "id": "page.pipeline",
+    "title": "/pipeline",
+    "namespace": "pipeline",
+    "viewuri": "/pipeline",
+    "category": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-pipeline()"
+}

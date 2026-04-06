@@ -1,79 +1,613 @@
-nav(class="sticky top-0 z-20 bg-white shadow")
-    div(class="max-w-6xl px-2 sm:px-4 lg:px-8 py-3 lg:px-6")
-        div(class="flex items-center justify-between")
-            div(class="min-w-0 flex-1")
-                h1(class="flex text-lg font-semibold text-zinc-950 gap-x-3 items-center")
-                    svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-6")
-                        path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 3v11.25A2.25 2.25 0 0 0 6 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0 1 18 16.5h-2.25m-7.5 0h7.5m-7.5 0-1 3m8.5-3 1 3m0 0 .5 1.5m-.5-1.5h-9.5m0 0-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6")
-                    span Dashboard
+//- ── 숨겨진 파일 입력 ──
+input(type="file", accept="video/*",
+    #fileInput="",
+    (change)="onFileSelected($event)",
+    style="display:none")
 
-div(class="max-w-6xl pt-6 px-8 pb-8")
-    //- Stats Cards
-    div(class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8")
-        div(*ngFor="let stat of stats", class="bg-white rounded-xl border border-gray-200 p-5 hover:shadow-md transition-shadow")
-            div(class="flex items-center justify-between")
+//- ── 네비게이션 헤더 ──
+nav(class="bg-white border-b border-zinc-200 sticky top-0 z-30")
+    div(class="max-w-[1800px] mx-auto px-4 sm:px-6 h-[52px] flex items-center justify-between")
+        div(class="flex items-center gap-3")
+            span(class="text-lg font-bold text-zinc-900") FallAI
+            span(class="text-xs text-zinc-400") 낙상 감지 시스템
+        div(class="flex items-center gap-2")
+            button(*ngIf="inputMode === 'upload'",
+                (click)="switchInputMode('webcam')",
+                class="text-xs px-3 py-1 rounded-lg border border-zinc-200 hover:bg-zinc-50 text-zinc-600") 실시간 모드
+            button(*ngIf="inputMode === 'webcam'",
+                (click)="switchInputMode('upload')",
+                class="text-xs px-3 py-1 rounded-lg border border-zinc-200 hover:bg-zinc-50 text-zinc-600") 업로드 모드
+
+//- ── 히어로 섹션 (업로드 모드만) ──
+section(*ngIf="inputMode !== 'webcam'",
+    class="bg-gradient-to-b from-zinc-50 to-white py-8")
+    div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
+        h1(class="text-lg font-semibold text-zinc-950 mb-1") AI 낙상 감지 분석
+        p(class="text-[13px] text-zinc-500 mb-4") 영상을 업로드하여 낙상 위험도를 분석합니다
+        div(class="grid md:grid-cols-3 gap-4")
+            div(class="bg-white rounded-xl border border-zinc-200 p-4")
+                div(class="text-xs text-zinc-400 mb-1") 지원 포맷
+                div(class="text-[13px] text-zinc-700") MP4, MOV, AVI, MKV, WebM (최대 200MB)
+            div(class="bg-white rounded-xl border border-zinc-200 p-4")
+                div(class="text-xs text-zinc-400 mb-1") 운영 모델
+                div(class="text-[13px] text-zinc-700") {{ currentEngineLabel() }}
+            div(class="bg-white rounded-xl border border-zinc-200 p-4")
+                div(class="text-xs text-zinc-400 mb-1") 학습 데이터
+                div(class="text-[13px] text-zinc-700") {{ prototypeInfo?.dataset_summary?.fall_sample_count || 0 }}건
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 메인 분석 영역
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+//- ── 웹캠 모드 ──
+section(*ngIf="inputMode === 'webcam'",
+    class="h-full flex flex-col overflow-hidden bg-zinc-900")
+    div(class="flex-1 min-h-0 grid grid-cols-[1fr_380px] grid-rows-1 gap-0")
+        //- 좌측: 비디오 영역
+        div(class="relative flex flex-col min-h-0 bg-black")
+            div(class="flex-1 min-h-0 relative")
+                video(#webcamVideo="",
+                    autoplay="", playsinline="", muted="",
+                    class="w-full h-full object-contain")
+                canvas(#mpPoseCanvas="",
+                    data-mp-pose-canvas="",
+                    class="absolute inset-0 w-full h-full pointer-events-none",
+                    style="z-index:1")
+                canvas(#realtimeBboxCanvas="",
+                    class="absolute inset-0 w-full h-full pointer-events-none",
+                    style="z-index:2")
+                //- 실시간 오버레이 패널
+                div(*ngIf="realtimeActive || analysisResult",
+                    class="absolute top-3 left-3 z-10",
+                    style="min-width:260px; max-width:380px")
+                    div(class="rounded-2xl backdrop-blur-md p-3",
+                        [class.bg-black/70]="realtimeOverlayLevel !== 'high'",
+                        [class.bg-rose-900/80]="realtimeOverlayLevel === 'high'",
+                        [class.ring-2]="realtimeOverlayFlash",
+                        [class.ring-rose-400]="realtimeOverlayFlash")
+                        //- 점수 바
+                        div(class="flex items-center gap-3 mb-2")
+                            div(class="text-2xl font-bold",
+                                [class.text-emerald-400]="realtimeOverlayLevel === 'low'",
+                                [class.text-amber-400]="realtimeOverlayLevel === 'medium'",
+                                [class.text-rose-400]="realtimeOverlayLevel === 'high'") {{ realtimeOverlayScore }}%
+                            div(class="flex-1")
+                                div(class="text-xs text-zinc-300") {{ realtimeOverlayLabel }}
+                                div(class="mt-1 h-1 rounded-full bg-white/20 overflow-hidden")
+                                    div(class="h-full rounded-full transition-all duration-500",
+                                        [class.bg-emerald-400]="realtimeOverlayLevel === 'low'",
+                                        [class.bg-amber-400]="realtimeOverlayLevel === 'medium'",
+                                        [class.bg-rose-400]="realtimeOverlayLevel === 'high'",
+                                        [style.width.%]="realtimeOverlayScore")
+                        //- 자세 라벨
+                        div(*ngIf="hasPostureData()",
+                            class="text-xs text-zinc-300 mb-1") 자세: {{ postureLabel() }}
+                        //- 6-class 확률 분포 바
+                        div(*ngIf="hasPostureData()",
+                            class="space-y-1 mb-2")
+                            div(*ngFor="let item of postureItems()",
+                                class="flex items-center gap-1 text-[10px]",
+                                [class.bg-white/10]="item.active",
+                                class="rounded px-1")
+                                span(class="w-3") {{ item.icon }}
+                                span(class="w-8 text-zinc-400",
+                                    [class.text-zinc-200]="item.active") {{ item.label }}
+                                div(class="flex-1 h-1 rounded-full bg-white/10 overflow-hidden")
+                                    div(class="h-full rounded-full bg-sky-400 transition-all",
+                                        [style.width.%]="item.percent")
+                                span(class="w-8 text-right text-zinc-400") {{ item.percent }}%
+                        //- 판단 근거
+                        div(*ngIf="realtimeOverlayBasis",
+                            class="text-[10px] text-zinc-400 leading-tight") {{ realtimeOverlayBasis }}
+
+            //- 컨트롤 바 (하단)
+            div(class="shrink-0 bg-zinc-800 border-t border-zinc-700 p-3")
+                div(class="flex items-center gap-3 flex-wrap")
+                    //- 시작/중지
+                    button(*ngIf="!realtimeActive",
+                        (click)="startRealtimeAnalysis()",
+                        [disabled]="!webcamReady",
+                        class="px-4 py-2 rounded-lg bg-emerald-600 text-white text-[13px] font-medium hover:bg-emerald-700 disabled:opacity-50") ▶ 분석 시작
+                    button(*ngIf="realtimeActive",
+                        (click)="stopRealtimeAnalysis()",
+                        class="px-4 py-2 rounded-lg bg-rose-600 text-white text-[13px] font-medium hover:bg-rose-700") ■ 중지
+                    //- MediaPipe 상태
+                    span(class="text-[10px] text-zinc-400")
+                        span(*ngIf="mpInitializing") 포즈 모델 로딩...
+                        span(*ngIf="mpReady && mpRunning") 🦴 {{ mpFps }}fps
+                        span(*ngIf="!mpReady && !mpInitializing") 포즈 대기
+                    //- 성능 모니터
+                    span(*ngIf="realtimeActive",
+                        class="text-[10px] text-zinc-500") RTT {{ realtimePerfStats.avgRtt | number:'1.0-0' }}ms · 서버 {{ realtimePerfStats.avgServer | number:'1.0-0' }}ms
+                    //- 모델 선택
+                    select([(ngModel)]="selectedModelType",
+                        class="text-[10px] bg-zinc-700 text-zinc-300 rounded px-2 py-1 border-none")
+                        option(value="person-feature") XGBoost v2
+                        option(value="xg-dual") XG-Dual
+                        option(value="rf-pipeline") RF 보조
+                    //- 줌
+                    div(class="flex items-center gap-1")
+                        span(class="text-[10px] text-zinc-500") 줌
+                        input(type="range", min="1", max="5", step="0.1",
+                            [value]="webcamZoom",
+                            (input)="setWebcamHwZoom($event.target.value)",
+                            class="w-16 accent-zinc-400")
+
+        //- 우측: 로그 사이드 패널
+        div(class="flex flex-col min-h-0 bg-zinc-800 border-l border-zinc-700")
+            div(class="shrink-0 px-3 py-2 border-b border-zinc-700 flex items-center justify-between")
+                span(class="text-xs font-medium text-zinc-300") 분석 로그
+                span(class="text-[10px] text-zinc-500") {{ realtimeLogEntries.length }}건
+            //- 로그 목록 (스크롤 영역)
+            div(#logScrollContainer="",
+                class="flex-1 min-h-0 overflow-y-auto")
+                //- 빈 안내
+                div(*ngIf="realtimeLogEntries.length === 0",
+                    class="flex flex-col items-center justify-center h-full text-zinc-500 text-xs p-4")
+                    div(class="text-3xl mb-2") 📋
+                    div 실시간 분석을 시작하면 로그가 표시됩니다
+                //- 로그 항목
+                div(*ngFor="let entry of realtimeLogEntries",
+                    (click)="openLogDetail(entry)",
+                    class="px-3 py-2 border-b border-zinc-700/50 hover:bg-zinc-700/30 cursor-pointer transition-colors")
+                    div(class="flex items-center gap-2")
+                        div(class="w-2 h-2 rounded-full shrink-0",
+                            [ngClass]="logRiskDotClass(entry.level)")
+                        div(class="flex-1 min-w-0")
+                            div(class="flex items-center gap-1")
+                                span(class="text-[10px] font-medium",
+                                    [ngClass]="logRiskClass(entry.level)") {{ entry.label }}
+                                span(class="text-[10px] text-zinc-500") {{ (entry.score * 100) | number:'1.0-0' }}%
+                                span(*ngIf="entry.feedbackDone",
+                                    class="text-[10px] text-emerald-500") ✓
+                            div(class="text-[10px] text-zinc-500 truncate") {{ entry.timestamp }} · {{ entry.elapsed | number:'1.1-1' }}초
+                        button((click)="deleteLogEntry(entry, $event)",
+                            class="shrink-0 text-zinc-600 hover:text-rose-400 text-[10px]") ✕
+
+//- ── 업로드 모드 ──
+section(*ngIf="inputMode === 'upload'",
+    class="py-6")
+    div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
+        div(class="grid md:grid-cols-2 gap-6")
+            //- 비디오 프리뷰 / 드래그앤드롭
+            div(class="relative")
+                div(*ngIf="!selectedVideoUrl",
+                    (drop)="onDrop($event)",
+                    (dragover)="onDragOver($event)",
+                    (dragleave)="onDragLeave($event)",
+                    (click)="fileInput.click()",
+                    class="border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-colors",
+                    [class.border-blue-400]="dragover",
+                    [class.border-zinc-300]="!dragover",
+                    [class.bg-blue-50]="dragover")
+                    div(class="text-4xl mb-3") 🎬
+                    div(class="text-[13px] text-zinc-600") 영상을 드래그하거나 클릭하여 선택
+                    div(class="text-xs text-zinc-400 mt-1") MP4, MOV, AVI, MKV, WebM
+                div(*ngIf="selectedVideoUrl",
+                    class="relative rounded-2xl overflow-hidden bg-black")
+                    video(#uploadPreviewVideo="",
+                        [src]="selectedVideoUrl",
+                        controls="",
+                        class="w-full max-h-[500px] object-contain")
+                    canvas(#uploadBboxCanvas="",
+                        class="absolute inset-0 w-full h-full pointer-events-none")
+                    canvas(#detCanvas="",
+                        class="absolute inset-0 w-full h-full pointer-events-none")
+                    button((click)="clearSelectedFile()",
+                        class="absolute top-2 right-2 bg-black/50 text-white rounded-full w-8 h-8 flex items-center justify-center text-sm hover:bg-black/70") ✕
+            //- 업로드 컨트롤
+            div(class="space-y-4")
+                div(class="bg-white rounded-xl border border-zinc-200 p-4 space-y-3")
+                    div(class="text-[13px] font-medium text-zinc-700") 분석 설정
+                    div(class="flex items-center gap-2")
+                        label(class="text-xs text-zinc-500 w-16") 모델
+                        select([(ngModel)]="selectedModelType",
+                            class="flex-1 text-[13px] border border-zinc-200 rounded-lg px-3 py-2")
+                            option(value="person-feature") XGBoost v2 (사람 추적)
+                            option(value="xg-dual") XG-Dual (Fall+Posture)
+                            option(value="rf-pipeline") RF 보조
+                    div(class="text-[10px] text-zinc-400") 예상 소요: {{ modelSpeedHint() }}
+                button((click)="analyze()",
+                    [disabled]="!selectedFile || analyzing",
+                    class="w-full py-3 rounded-xl text-white font-medium text-[13px] transition-colors",
+                    [class.bg-blue-600]="!analyzing",
+                    [class.hover:bg-blue-700]="!analyzing",
+                    [class.bg-zinc-400]="analyzing",
+                    [class.cursor-not-allowed]="analyzing")
+                    span(*ngIf="!analyzing") 🔍 분석 시작
+                    span(*ngIf="analyzing") ⏳ 분석 중...
+                //- 에러 메시지
+                div(*ngIf="errorMessage",
+                    class="bg-rose-50 border border-rose-200 rounded-xl p-3 text-[13px] text-rose-700") {{ errorMessage }}
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 분석 결과 (업로드 모드 전용)
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+div(*ngIf="analysisResult && inputMode !== 'webcam'",
+    class="max-w-[1800px] mx-auto px-4 sm:px-6 pb-12")
+    //- ── 결과 요약 ──
+    div(class="mb-6")
+        div(class="rounded-2xl border p-6",
+            [ngClass]="riskBgClass(analysisResult.risk_level)")
+            div(class="grid md:grid-cols-3 gap-6")
+                //- 위험 점수
                 div
-                    p(class="text-xs font-medium text-gray-500 uppercase tracking-wider") {{stat.label}}
-                    p(class="mt-2 text-2xl font-bold text-gray-900") {{stat.value}}
-                    p(class="mt-1 text-xs", [ngClass]="stat.change >= 0 ? 'text-green-600' : 'text-red-600'")
-                        span(*ngIf="stat.change >= 0") ↑ +{{stat.change}}%
-                        span(*ngIf="stat.change < 0") ↓ {{stat.change}}%
-                        span(class="text-gray-400 ml-1") vs last month
-                div(class="flex items-center justify-center w-12 h-12 rounded-lg", [ngClass]="stat.bgColor || 'bg-indigo-50'")
-                    span(class="text-xl") {{stat.icon}}
+                    div(class="text-xs text-zinc-500 mb-1") 위험 점수
+                    div(class="text-3xl font-bold",
+                        [ngClass]="riskClass(analysisResult.risk_level)") {{ riskScorePercent() }}%
+                    div(class="mt-1")
+                        span(class="text-xs px-2 py-0.5 rounded-full",
+                            [ngClass]="riskBadgeClass(analysisResult.risk_level)") {{ analysisResult.risk_label }}
+                    div(class="text-xs text-zinc-500 mt-2") {{ analysisResult.summary }}
+                //- 행동 분류
+                div
+                    div(class="text-xs text-zinc-500 mb-1") 행동 분류
+                    div(class="text-[15px] font-semibold text-zinc-900") {{ analysisResult.behavior_label }}
+                    div(*ngIf="isXgDualResult() && hasPostureData()")
+                        div(class="mt-1 text-xs text-zinc-500") 자세: {{ postureLabel() }}
+                        div(class="flex items-center gap-2 mt-1")
+                            span(class="text-[10px] px-2 py-0.5 rounded-full border",
+                                [ngClass]="decisionStateMeta().badgeCls") {{ decisionStateMeta().icon }} {{ decisionStateMeta().label }}
+                //- 엔진 / 타이밍
+                div
+                    div(class="text-xs text-zinc-500 mb-1") 분석 엔진
+                    div(class="text-[13px] text-zinc-700") {{ currentEngineLabel() }}
+                    div(*ngIf="analysisResult.server_timing",
+                        class="text-xs text-zinc-400 mt-1") 서버 처리: {{ analysisResult.server_timing.total_server_sec | number:'1.2-2' }}초
 
-    div(class="grid grid-cols-1 lg:grid-cols-3 gap-6")
-        //- Recent Activity
-        div(class="lg:col-span-2 bg-white rounded-xl border border-gray-200 overflow-hidden")
-            div(class="px-6 py-4 border-b border-gray-100 flex items-center justify-between")
-                h2(class="text-[15px] font-semibold text-gray-900") 최근 활동
-                a(routerLink="/posts", class="text-xs text-indigo-600 hover:text-indigo-500 font-medium") 전체 보기 →
+        //- 알림 워크플로
+        div(*ngIf="alertWorkflow",
+            class="mt-4 bg-amber-50 border border-amber-200 rounded-xl p-4")
+            div(class="flex items-center gap-2 mb-2")
+                span(class="text-sm") 🔔
+                span(class="text-[13px] font-medium text-amber-800") 알림 발송 대기
+            div(class="text-xs text-zinc-600 mb-2") {{ alertWorkflow.protocol_headline }}
+            button(*ngIf="alertWorkflow.emergency?.popup_required",
+                (click)="emergencyPopupOpen = true",
+                class="text-xs px-3 py-1 bg-rose-600 text-white rounded-lg hover:bg-rose-700") 🚨 응급 프로토콜
 
-            div(class="divide-y divide-gray-100")
-                ng-container(*ngIf="loading")
-                    div(class="px-6 py-8 text-center text-[13px] text-gray-400") 로딩 중...
+    //- ── 분석 결과 상세 ──
+    div(class="space-y-6")
+        //- 분석 요약
+        div(*ngIf="analysisResult.analysis_overview",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-2") 분석 요약
+            div(*ngFor="let line of analysisResult.analysis_overview",
+                class="text-[13px] text-zinc-600 leading-relaxed") {{ line }}
 
-                ng-container(*ngIf="!loading")
-                    div(*ngIf="recentItems.length === 0", class="px-6 py-8 text-center text-[13px] text-gray-400") 최근 활동이 없습니다.
+        //- 위험 점수 상세
+        div(class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-2") 위험 점수 산출
+            div(class="text-xs text-zinc-500 mb-3") 산출식: {{ getRiskScoreFormula() }}
+            div(class="h-3 rounded-full bg-zinc-100 overflow-hidden")
+                div(class="h-full rounded-full transition-all",
+                    [class.bg-emerald-500]="analysisResult.risk_level === 'low'",
+                    [class.bg-amber-500]="analysisResult.risk_level === 'medium'",
+                    [class.bg-rose-500]="analysisResult.risk_level === 'high'",
+                    [style.width.%]="riskScorePercent()")
 
-                    div(*ngFor="let item of recentItems", class="px-6 py-3 hover:bg-gray-50 transition-colors cursor-pointer", routerLink="/posts/{{item.id}}/view")
-                        div(class="flex items-center gap-3")
-                            div(class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold", [ngClass]="item.avatarColor || 'bg-indigo-100 text-indigo-700'")
-                                | {{item.author?.charAt(0) || '?'}}
-                            div(class="min-w-0 flex-1")
-                                p(class="text-[13px] font-medium text-gray-900 truncate") {{item.title}}
-                                p(class="text-[11px] text-gray-400 mt-0.5") {{item.author}} · {{item.date}}
-                            span(class="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
-                                [ngClass]="{'bg-green-50 text-green-700 border border-green-200': item.status === 'published', 'bg-yellow-50 text-yellow-700 border border-yellow-200': item.status === 'draft', 'bg-gray-50 text-gray-600 border border-gray-200': item.status !== 'published' && item.status !== 'draft'}")
-                                | {{item.status}}
+        //- XG-Dual Posture & Decision (self-contained section)
+        div(*ngIf="isXgDualResult() && hasPostureData()",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-3") 자세 분류 & 판정
+            //- 6-class 확률 바
+            div(class="space-y-2 mb-4")
+                div(*ngFor="let item of postureItems()",
+                    class="flex items-center gap-2",
+                    [class.bg-zinc-50]="item.active",
+                    class="rounded-lg px-2 py-1")
+                    span(class="text-sm w-5") {{ item.icon }}
+                    span(class="text-[13px] w-12",
+                        [class.font-semibold]="item.active") {{ item.label }}
+                    div(class="flex-1 h-2 rounded-full bg-zinc-100 overflow-hidden")
+                        div(class="h-full rounded-full bg-sky-500 transition-all",
+                            [style.width.%]="item.percent")
+                    span(class="text-xs text-zinc-500 w-10 text-right") {{ item.percent }}%
+            //- Decision State
+            div(class="flex items-center gap-2 mb-2")
+                span(class="text-xs text-zinc-500") 판정:
+                span(class="text-xs px-2 py-0.5 rounded-full border",
+                    [ngClass]="decisionStateMeta().badgeCls") {{ decisionStateMeta().icon }} {{ decisionStateMeta().label }}
+            //- 불확실 경고
+            div(*ngIf="isAmbiguousDecision()",
+                class="bg-violet-50 border border-violet-200 rounded-lg p-2 text-xs text-violet-700 mt-2") ⚠ 판정이 불확실합니다. 피드백으로 모델 정확도를 개선해 주세요.
+            //- Explain items
+            div(*ngIf="getExplainItems().length > 0",
+                class="mt-3")
+                div(class="text-xs text-zinc-500 mb-1") 판단 근거
+                div(*ngFor="let ex of getExplainItems()",
+                    class="text-xs text-zinc-600 pl-3 border-l-2 border-zinc-200 mb-1") {{ ex }}
+            //- Guard 억제 배지
+            div(*ngIf="getSuppressedBy().length > 0",
+                class="mt-2 flex items-center gap-1 flex-wrap")
+                span(*ngFor="let s of getSuppressedBy()",
+                    class="text-[10px] px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-600 border border-zinc-200") 🛡 {{ s }}
 
-        //- Quick Links / Summary
-        div(class="bg-white rounded-xl border border-gray-200 overflow-hidden")
-            div(class="px-6 py-4 border-b border-gray-100")
-                h2(class="text-[15px] font-semibold text-gray-900") 바로가기
+        //- 판단 근거 카드
+        div(*ngIf="sortedAnalysisBasis().length > 0",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-3") 판단 근거
+            div(class="grid md:grid-cols-2 gap-3")
+                div(*ngFor="let item of sortedAnalysisBasis()",
+                    class="rounded-lg border p-3",
+                    [ngClass]="basisCardClass(item)")
+                    div(class="flex items-center justify-between mb-1")
+                        span(class="text-[13px] font-medium text-zinc-800") {{ item.label }}
+                        span(*ngIf="item.contribution_rank",
+                            class="text-[10px] text-zinc-400") {{ '#' + item.contribution_rank }}
+                    div(class="text-xs text-zinc-600") {{ item.value }} {{ item.unit }}
+                    div(*ngIf="item.description",
+                        class="text-[10px] text-zinc-400 mt-1") {{ item.description }}
 
-            div(class="p-4 space-y-2")
-                a(routerLink="/posts", class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-gray-50 transition-colors group")
-                    div(class="flex items-center justify-center w-9 h-9 rounded-lg bg-blue-50 text-blue-600 group-hover:bg-blue-100 transition-colors")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z")
-                    div
-                        p(class="text-[13px] font-medium text-gray-900") 게시물 관리
-                        p(class="text-[11px] text-gray-400") 게시물 목록 및 작성
+        //- 모델 런타임
+        div(*ngIf="analysisResult.model_runtime",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-2") 모델 런타임
+            div(class="grid grid-cols-2 gap-2 text-xs")
+                div(class="text-zinc-500") 엔진
+                div(class="text-zinc-700") {{ analysisResult.model_runtime.label }}
+                div(*ngIf="analysisResult.model_runtime.processed_frames != null")
+                    span(class="text-zinc-500") 처리 프레임
+                div(*ngIf="analysisResult.model_runtime.processed_frames != null")
+                    span(class="text-zinc-700") {{ analysisResult.model_runtime.processed_frames }}
+                div(*ngIf="analysisResult.model_runtime.windows != null")
+                    span(class="text-zinc-500") 분석 윈도우
+                div(*ngIf="analysisResult.model_runtime.windows != null")
+                    span(class="text-zinc-700") {{ analysisResult.model_runtime.windows }}
 
-                a(routerLink="/members", class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-gray-50 transition-colors group")
-                    div(class="flex items-center justify-center w-9 h-9 rounded-lg bg-purple-50 text-purple-600 group-hover:bg-purple-100 transition-colors")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z")
-                    div
-                        p(class="text-[13px] font-medium text-gray-900") 멤버 관리
-                        p(class="text-[11px] text-gray-400") 팀 멤버 초대 및 권한
+        //- 서버 타이밍 E2E
+        div(*ngIf="analysisResult.server_timing",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="text-[13px] font-semibold text-zinc-800 mb-2") 처리 시간 상세
+            div(class="space-y-1")
+                div(*ngFor="let item of getServerTimingDetail()",
+                    class="flex items-center gap-2 text-xs")
+                    span(class="w-24 text-zinc-500") {{ item.label }}
+                    div(class="flex-1 h-1.5 rounded-full bg-zinc-100 overflow-hidden")
+                        div(class="h-full rounded-full bg-blue-400",
+                            [style.width.%]="(item.value / (analysisResult.server_timing.total_server_sec || 1)) * 100")
+                    span(class="w-12 text-right text-zinc-500") {{ item.value | number:'1.2-2' }}초
 
-                a(routerLink="/mypage", class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-gray-50 transition-colors group")
-                    div(class="flex items-center justify-center w-9 h-9 rounded-lg bg-orange-50 text-orange-600 group-hover:bg-orange-100 transition-colors")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z")
-                    div
-                        p(class="text-[13px] font-medium text-gray-900") 내 프로필
-                        p(class="text-[11px] text-gray-400") 계정 정보 및 비밀번호
+        //- 검출 리플레이
+        div(*ngIf="getDetectionFrames().length > 0",
+            class="bg-white rounded-xl border border-zinc-200 p-4")
+            div(class="flex items-center justify-between mb-2")
+                div(class="text-[13px] font-semibold text-zinc-800") 검출 리플레이
+                button((click)="toggleDetectionReplay()",
+                    class="text-xs px-3 py-1 rounded-lg border border-zinc-200 hover:bg-zinc-50")
+                    span(*ngIf="!detectionReplayPlaying") ▶ 재생
+                    span(*ngIf="detectionReplayPlaying") ⏸ 정지
+            div(class="text-xs text-zinc-500 mb-1") 프레임 {{ detectionReplayIndex + 1 }} / {{ getDetectionFrames().length }}
+            input(type="range", min="0",
+                [max]="getDetectionFrames().length - 1",
+                [value]="detectionReplayIndex",
+                (input)="seekDetectionReplay($event.target.value)",
+                class="w-full accent-blue-500")
+
+    //- ── 2-Level 피드백 (업로드 모드) ──
+    div(*ngIf="analysisResult && inputMode !== 'webcam'",
+        class="mt-6 bg-white rounded-xl border border-zinc-200 p-4")
+        div(class="text-[13px] font-semibold text-zinc-800 mb-3") 결과 피드백
+        //- Level 1: 낙상 판정
+        div(class="mb-3")
+            div(class="text-xs text-zinc-500 mb-2") 낙상 판정이 맞나요?
+            div(class="flex gap-2")
+                button((click)="feedbackStatus = 'correct'",
+                    class="px-4 py-2 rounded-lg border text-[13px] transition-colors",
+                    [class.bg-emerald-50]="feedbackStatus === 'correct'",
+                    [class.border-emerald-300]="feedbackStatus === 'correct'",
+                    [class.text-emerald-700]="feedbackStatus === 'correct'",
+                    [class.border-zinc-200]="feedbackStatus !== 'correct'") ✅ 맞음
+                button((click)="feedbackStatus = 'incorrect'; feedbackActualLabel = analysisResult?.fall_detected ? 'N' : 'Y'",
+                    class="px-4 py-2 rounded-lg border text-[13px] transition-colors",
+                    [class.bg-rose-50]="feedbackStatus === 'incorrect'",
+                    [class.border-rose-300]="feedbackStatus === 'incorrect'",
+                    [class.text-rose-700]="feedbackStatus === 'incorrect'",
+                    [class.border-zinc-200]="feedbackStatus !== 'incorrect'") ❌ 틀림
+        //- Level 2: 자세 6-class
+        div(*ngIf="feedbackStatus",
+            class="mb-3")
+            div(class="text-xs text-zinc-500 mb-2") 실제 자세는? (선택)
+            div(class="flex flex-wrap gap-2")
+                button(*ngFor="let pc of postureClasses",
+                    (click)="feedbackPostureClass = feedbackPostureClass === pc.code ? '' : pc.code",
+                    class="px-3 py-1.5 rounded-lg border text-xs transition-colors",
+                    [class.bg-sky-50]="feedbackPostureClass === pc.code",
+                    [class.border-sky-300]="feedbackPostureClass === pc.code",
+                    [class.border-zinc-200]="feedbackPostureClass !== pc.code") {{ pc.icon }} {{ pc.label }}
+        //- 추가 태그
+        div(*ngIf="feedbackStatus",
+            class="mb-3 flex flex-wrap gap-2")
+            label(class="flex items-center gap-1 text-xs text-zinc-600 cursor-pointer")
+                input(type="checkbox",
+                    [checked]="feedbackAmbiguityFlag",
+                    (change)="toggleFeedbackFlag('ambiguity')")
+                span 애매한 영상
+            label(class="flex items-center gap-1 text-xs text-zinc-600 cursor-pointer")
+                input(type="checkbox",
+                    [checked]="feedbackOcclusionFlag",
+                    (change)="toggleFeedbackFlag('occlusion')")
+                span 가림/폐색
+            label(class="flex items-center gap-1 text-xs text-zinc-600 cursor-pointer")
+                input(type="checkbox",
+                    [checked]="feedbackShortClipFlag",
+                    (change)="toggleFeedbackFlag('short_clip')")
+                span 짧은 영상
+        //- 메모 + 제출
+        div(*ngIf="feedbackStatus",
+            class="space-y-2")
+            textarea([(ngModel)]="feedbackNote",
+                placeholder="추가 메모 (선택)",
+                rows="2",
+                class="w-full text-xs border border-zinc-200 rounded-lg p-2 resize-none")
+            button((click)="submitAnalysisFeedback()",
+                [disabled]="feedbackSubmitting",
+                class="px-4 py-2 rounded-lg bg-blue-600 text-white text-[13px] font-medium hover:bg-blue-700 disabled:opacity-50")
+                span(*ngIf="!feedbackSubmitting") 피드백 제출
+                span(*ngIf="feedbackSubmitting") 저장 중...
+        //- 피드백 메시지
+        div(*ngIf="feedbackMessage",
+            class="mt-2 text-xs rounded-lg p-2",
+            [class.bg-emerald-50]="feedbackMessageType === 'success'",
+            [class.text-emerald-700]="feedbackMessageType === 'success'",
+            [class.bg-rose-50]="feedbackMessageType === 'error'",
+            [class.text-rose-700]="feedbackMessageType === 'error'") {{ feedbackMessage }}
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 하단 바로가기 (업로드 모드만)
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+section(*ngIf="inputMode !== 'webcam'",
+    class="py-8 bg-zinc-50")
+    div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
+        div(class="grid md:grid-cols-3 gap-4")
+            div((click)="goPipelinePage()",
+                class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
+                div(class="text-sm mb-1") 🔬
+                div(class="text-[13px] font-medium text-zinc-800") AI 파이프라인
+                div(class="text-xs text-zinc-400") 모델 흐름도 확인
+            div((click)="goManualPage()",
+                class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
+                div(class="text-sm mb-1") 📖
+                div(class="text-[13px] font-medium text-zinc-800") 사용 설명서
+                div(class="text-xs text-zinc-400") 시스템 가이드
+            div((click)="goAdminPage()",
+                class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
+                div(class="text-sm mb-1") ⚙️
+                div(class="text-[13px] font-medium text-zinc-800") 관리자 설정
+                div(class="text-xs text-zinc-400") 알림/학습 설정
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 로그 상세 팝업 모달
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+div(*ngIf="logDetailOpen && logDetailEntry",
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+    (click)="closeLogDetail()")
+    div(class="bg-white rounded-2xl shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto",
+        (click)="$event.stopPropagation()")
+        div(class="p-4 border-b border-zinc-200 flex items-center justify-between")
+            div(class="text-[13px] font-semibold text-zinc-800") {{ '분석 상세 #' + logDetailEntry.id }}
+            button((click)="closeLogDetail()",
+                class="text-zinc-400 hover:text-zinc-600 text-lg") ✕
+        div(class="p-4 space-y-3")
+            //- 영상 프리뷰
+            video(*ngIf="logDetailEntry.blobUrl",
+                [src]="logDetailEntry.blobUrl",
+                controls="",
+                class="w-full rounded-xl bg-black max-h-64 object-contain")
+            //- 점수
+            div(class="flex items-center gap-3")
+                div(class="text-2xl font-bold",
+                    [ngClass]="riskClass(logDetailEntry.level)") {{ (logDetailEntry.score * 100) | number:'1.0-0' }}%
+                div
+                    div(class="text-xs",
+                        [ngClass]="riskClass(logDetailEntry.level)") {{ logDetailEntry.label }}
+                    div(class="text-[10px] text-zinc-400") {{ logDetailEntry.timestamp }} · {{ logDetailEntry.elapsed | number:'1.1-1' }}초
+            //- 판단 근거 (from result)
+            div(*ngIf="logDetailEntry.result?.analysis_basis",
+                class="space-y-1")
+                div(*ngFor="let item of logDetailEntry.result.analysis_basis | slice:0:4",
+                    class="text-xs text-zinc-600") {{ item.label }}: {{ item.value }} {{ item.unit }}
+            //- 자세 정보
+            div(*ngIf="logDetailEntry.result?.posture_label",
+                class="flex items-center gap-2")
+                span(class="text-xs text-zinc-500") 자세:
+                span(class="text-xs font-medium") {{ POSTURE_LABEL_MAP[logDetailEntry.result.posture_label] || logDetailEntry.result.posture_label }}
+            //- 로그 피드백
+            div(*ngIf="!logDetailEntry.feedbackDone",
+                class="border-t border-zinc-200 pt-3 space-y-2")
+                div(class="text-xs text-zinc-500") 이 분석 결과가 맞나요?
+                div(class="flex gap-2")
+                    button((click)="logFeedbackStatus = 'correct'",
+                        class="px-3 py-1 rounded-lg border text-xs",
+                        [class.bg-emerald-50]="logFeedbackStatus === 'correct'",
+                        [class.border-emerald-300]="logFeedbackStatus === 'correct'",
+                        [class.border-zinc-200]="logFeedbackStatus !== 'correct'") ✅ 맞음
+                    button((click)="logFeedbackStatus = 'incorrect'; logFeedbackActualLabel = logDetailEntry.result?.fall_detected ? 'N' : 'Y'",
+                        class="px-3 py-1 rounded-lg border text-xs",
+                        [class.bg-rose-50]="logFeedbackStatus === 'incorrect'",
+                        [class.border-rose-300]="logFeedbackStatus === 'incorrect'",
+                        [class.border-zinc-200]="logFeedbackStatus !== 'incorrect'") ❌ 틀림
+                //- 자세 선택
+                div(*ngIf="logFeedbackStatus",
+                    class="flex flex-wrap gap-1")
+                    button(*ngFor="let pc of postureClasses",
+                        (click)="setLogFeedbackPostureClass(pc.code)",
+                        class="px-2 py-1 rounded border text-[10px]",
+                        [class.bg-sky-50]="logFeedbackPostureClass === pc.code",
+                        [class.border-sky-300]="logFeedbackPostureClass === pc.code",
+                        [class.border-zinc-200]="logFeedbackPostureClass !== pc.code") {{ pc.icon }} {{ pc.label }}
+                //- 태그
+                div(*ngIf="logFeedbackStatus",
+                    class="flex flex-wrap gap-2")
+                    label(class="flex items-center gap-1 text-[10px] text-zinc-600 cursor-pointer")
+                        input(type="checkbox",
+                            [checked]="logFeedbackAmbiguityFlag",
+                            (change)="toggleLogFeedbackFlag('ambiguity')")
+                        span 애매함
+                    label(class="flex items-center gap-1 text-[10px] text-zinc-600 cursor-pointer")
+                        input(type="checkbox",
+                            [checked]="logFeedbackOcclusionFlag",
+                            (change)="toggleLogFeedbackFlag('occlusion')")
+                        span 가림
+                    label(class="flex items-center gap-1 text-[10px] text-zinc-600 cursor-pointer")
+                        input(type="checkbox",
+                            [checked]="logFeedbackShortClipFlag",
+                            (change)="toggleLogFeedbackFlag('short_clip')")
+                        span 짧은영상
+                //- 메모 + 제출
+                div(*ngIf="logFeedbackStatus")
+                    textarea([(ngModel)]="logFeedbackNote",
+                        placeholder="메모 (선택)",
+                        rows="1",
+                        class="w-full text-[10px] border border-zinc-200 rounded p-1 resize-none mb-1")
+                    button((click)="submitLogFeedback()",
+                        [disabled]="logFeedbackSubmitting",
+                        class="px-3 py-1 rounded-lg bg-blue-600 text-white text-xs hover:bg-blue-700 disabled:opacity-50")
+                        span(*ngIf="!logFeedbackSubmitting") 피드백 제출
+                        span(*ngIf="logFeedbackSubmitting") 저장 중...
+            div(*ngIf="logDetailEntry.feedbackDone",
+                class="text-xs text-emerald-600 border-t border-zinc-200 pt-3") ✅ 피드백 완료
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 기준 영상 팝업
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+div(*ngIf="referencePopupOpen",
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/60",
+    (click)="closeReferencePopup()")
+    div(class="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden",
+        (click)="$event.stopPropagation()")
+        div(class="p-4 border-b border-zinc-200 flex items-center justify-between")
+            span(class="text-[13px] font-semibold text-zinc-800") 기준 영상
+            button((click)="closeReferencePopup()",
+                class="text-zinc-400 hover:text-zinc-600 text-lg") ✕
+        div(class="p-4")
+            div(*ngIf="referencePopupLoading",
+                class="text-center text-xs text-zinc-400 py-8") 로딩 중...
+            div(*ngIf="!referencePopupLoading && referencePopupData")
+                video(*ngIf="referencePopupData.clip_info?.clip_path",
+                    [src]="'/wiz/api/page.dashboard/reference_preview?scene_id=' + referencePopupData.scene_id",
+                    controls="",
+                    class="w-full rounded-xl bg-black max-h-64 object-contain")
+                div(class="mt-2 text-xs text-zinc-500") {{ referencePopupData.clip_info?.message || '' }}
+
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//- 119 응급 팝업
+//- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+div(*ngIf="emergencyPopupOpen && alertWorkflow?.emergency",
+    class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70",
+    (click)="closeEmergencyPopup()")
+    div(class="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden",
+        (click)="$event.stopPropagation()")
+        div(class="bg-rose-600 p-4 text-white text-center")
+            div(class="text-3xl mb-1") 🚨
+            div(class="text-lg font-bold") 응급 상황
+        div(class="p-4 space-y-3")
+            div(class="text-[13px] text-zinc-700") {{ alertWorkflow.emergency.popup_message }}
+            div(*ngIf="alertWorkflow.emergency.call_script",
+                class="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs text-rose-800 whitespace-pre-line") {{ alertWorkflow.emergency.call_script }}
+            div(class="flex gap-2 mt-2")
+                a(href="tel:119",
+                    class="flex-1 py-3 bg-rose-600 text-white rounded-xl text-center text-[13px] font-bold hover:bg-rose-700") 📞 119 전화
+                button((click)="closeEmergencyPopup()",
+                    class="flex-1 py-3 border border-zinc-300 rounded-xl text-[13px] text-zinc-600 hover:bg-zinc-50") 닫기

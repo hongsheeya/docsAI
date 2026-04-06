@@ -15,6 +15,7 @@ class Struct:
 
         # 프로젝트 고유 Sub-Struct 클래스 로드
         self._User = wiz.model("struct/user")
+        self._VideoAnalysis = wiz.model("struct/video_analysis")
 
         # 패키지 Struct 캐시
         self._packages = {}
@@ -40,6 +41,11 @@ class Struct:
     def user(self):
         """User Sub-Struct 접근 (호출마다 새 인스턴스)"""
         return self._User(self)
+
+    @property
+    def video_analysis(self):
+        """낙상 분석 프로토타입 Sub-Struct 접근"""
+        return self._VideoAnalysis(self)
 
     def __getattr__(self, name):
         """알 수 없는 속성 → 패키지 Struct 동적 로드"""

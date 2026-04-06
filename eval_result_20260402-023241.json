@@ -1,0 +1,245 @@
+{
+  "evaluation_date": "2026-04-02T02:32:41.486691",
+  "dataset": "/opt/app/041.낙상사고_위험동작_영상-센서_쌍_데이터/3.개방데이터/1.데이터/Validation/01.원천데이터/VS/영상",
+  "sample_size": {
+    "fall": 500,
+    "nonfall": 500,
+    "total": 1000
+  },
+  "seed": 42,
+  "total_elapsed_sec": 7967.1,
+  "pipelines": {
+    "RF Pipeline": {
+      "pipeline": "RF Pipeline",
+      "model_info": {
+        "type": "RandomForest",
+        "model_path": "/opt/app/project/main/storage/training/fall-detection/rf-pipeline/rf_hitl_model.pkl",
+        "n_estimators": 200,
+        "max_depth": null,
+        "n_features": 16,
+        "threshold": 0.6
+      },
+      "overall_metrics": {
+        "accuracy": 0.711,
+        "precision": 0.9567,
+        "recall": 0.442,
+        "f1_score": 0.6047,
+        "specificity": 0.98,
+        "confusion_matrix": {
+          "TP": 221,
+          "TN": 490,
+          "FP": 10,
+          "FN": 279
+        },
+        "total": 1000,
+        "auc_roc": 0.8927
+      },
+      "subcategory_metrics": {
+        "N/N": {
+          "accuracy": 0.98,
+          "precision": 0.0,
+          "recall": 0,
+          "f1_score": 0,
+          "specificity": 0.98,
+          "confusion_matrix": {
+            "TP": 0,
+            "TN": 490,
+            "FP": 10,
+            "FN": 0
+          },
+          "total": 500,
+          "count": 500
+        },
+        "Y/BY": {
+          "accuracy": 0.435,
+          "precision": 1.0,
+          "recall": 0.435,
+          "f1_score": 0.6063,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 77,
+            "TN": 0,
+            "FP": 0,
+            "FN": 100
+          },
+          "total": 177,
+          "count": 177
+        },
+        "Y/FY": {
+          "accuracy": 0.4459,
+          "precision": 1.0,
+          "recall": 0.4459,
+          "f1_score": 0.6168,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 99,
+            "TN": 0,
+            "FP": 0,
+            "FN": 123
+          },
+          "total": 222,
+          "count": 222
+        },
+        "Y/SY": {
+          "accuracy": 0.4455,
+          "precision": 1.0,
+          "recall": 0.4455,
+          "f1_score": 0.6164,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 45,
+            "TN": 0,
+            "FP": 0,
+            "FN": 56
+          },
+          "total": 101,
+          "count": 101
+        }
+      },
+      "timing": {
+        "mean_sec": 3.176,
+        "median_sec": 3.158,
+        "p95_sec": 3.594,
+        "min_sec": 2.491,
+        "max_sec": 4.128,
+        "total_sec": 3175.9
+      },
+      "feature_importance": {
+        "n_frames": 0.0905,
+        "center_y_mean": 0.0567,
+        "center_y_std": 0.016,
+        "height_mean": 0.0585,
+        "height_std": 0.0765,
+        "width_mean": 0.0279,
+        "width_std": 0.0482,
+        "area_mean": 0.0422,
+        "area_std": 0.0805,
+        "aspect_ratio_mean": 0.0499,
+        "aspect_ratio_std": 0.0835,
+        "delta_y_mean": 0.0697,
+        "delta_y_max": 0.1056,
+        "delta_height_mean": 0.0498,
+        "delta_width_mean": 0.0587,
+        "delta_area_mean": 0.0857
+      },
+      "error_count": 3,
+      "error_samples": [
+        {
+          "video": "00053_H_A_SY_C8.mp4",
+          "error": "사람 검출 부족 (1 프레임)",
+          "subcat": "Y/SY"
+        },
+        {
+          "video": "01024_O_E_N_C4.mp4",
+          "error": "사람 검출 부족 (0 프레임)",
+          "subcat": "N/N"
+        },
+        {
+          "video": "01052_O_E_FY_C3.mp4",
+          "error": "사람 검출 부족 (1 프레임)",
+          "subcat": "Y/FY"
+        }
+      ]
+    },
+    "Person-Feature (XGBoost)": {
+      "pipeline": "Person-Feature (XGBoost)",
+      "model_info": {
+        "type": "XGBoost (Person-Feature)",
+        "person_detector": "/mnt/data/wiz/project/main/storage/training/fall-detection/person-detect/runs/person-det-20260326-051849/weights/best.pt",
+        "fall_classifier": "/opt/app/project/main/storage/training/fall-detection/fall-classifier/best_model.pkl",
+        "classifier_type": "Pipeline",
+        "threshold": 0.5,
+        "cv_f1": 0.5519,
+        "cv_auc": 0.6364
+      },
+      "overall_metrics": {
+        "accuracy": 0.619,
+        "precision": 0.7245,
+        "recall": 0.384,
+        "f1_score": 0.502,
+        "specificity": 0.854,
+        "confusion_matrix": {
+          "TP": 192,
+          "TN": 427,
+          "FP": 73,
+          "FN": 308
+        },
+        "total": 1000,
+        "auc_roc": 0.6818
+      },
+      "subcategory_metrics": {
+        "N/N": {
+          "accuracy": 0.854,
+          "precision": 0.0,
+          "recall": 0,
+          "f1_score": 0,
+          "specificity": 0.854,
+          "confusion_matrix": {
+            "TP": 0,
+            "TN": 427,
+            "FP": 73,
+            "FN": 0
+          },
+          "total": 500,
+          "count": 500
+        },
+        "Y/BY": {
+          "accuracy": 0.3955,
+          "precision": 1.0,
+          "recall": 0.3955,
+          "f1_score": 0.5668,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 70,
+            "TN": 0,
+            "FP": 0,
+            "FN": 107
+          },
+          "total": 177,
+          "count": 177
+        },
+        "Y/FY": {
+          "accuracy": 0.3874,
+          "precision": 1.0,
+          "recall": 0.3874,
+          "f1_score": 0.5584,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 86,
+            "TN": 0,
+            "FP": 0,
+            "FN": 136
+          },
+          "total": 222,
+          "count": 222
+        },
+        "Y/SY": {
+          "accuracy": 0.3564,
+          "precision": 1.0,
+          "recall": 0.3564,
+          "f1_score": 0.5255,
+          "specificity": 0,
+          "confusion_matrix": {
+            "TP": 36,
+            "TN": 0,
+            "FP": 0,
+            "FN": 65
+          },
+          "total": 101,
+          "count": 101
+        }
+      },
+      "timing": {
+        "mean_sec": 4.791,
+        "median_sec": 3.646,
+        "p95_sec": 9.272,
+        "min_sec": 0.922,
+        "max_sec": 166.078,
+        "total_sec": 4790.7
+      },
+      "feature_importance": {},
+      "error_count": 0,
+      "error_samples": []
+    }
+  }
+}

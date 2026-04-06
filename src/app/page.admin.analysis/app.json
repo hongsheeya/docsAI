@@ -1,0 +1,11 @@
+{
+    "mode": "page",
+    "id": "page.admin.analysis",
+    "title": "/admin/analysis",
+    "namespace": "admin.analysis",
+    "viewuri": "/admin/analysis",
+    "category": "",
+    "controller": "admin",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-admin-analysis()"
+}

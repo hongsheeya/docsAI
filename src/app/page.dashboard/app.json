@@ -1,11 +1,11 @@
 {
     "mode": "page",
     "id": "page.dashboard",
-    "title": "/dashboard",
+    "title": "/",
     "namespace": "dashboard",
-    "viewuri": "/dashboard",
+    "viewuri": "/",
     "category": "",
-    "controller": "user",
+    "controller": "base",
     "layout": "layout.sidebar",
     "template": "wiz-page-dashboard()"
 }

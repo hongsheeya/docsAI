@@ -1,0 +1,12 @@
+{
+    "id": "page.manual",
+    "mode": "page",
+    "title": "/manual",
+    "namespace": "manual",
+    "category": "manual",
+    "viewuri": "/manual",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-manual()"
+}

@@ -1,0 +1,229 @@
+input(#trainingInput="", type="file", accept="video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,video/webm", class="hidden", (change)="onTrainingFileSelected($event)")
+
+nav(class="sticky top-0 z-20 border-b border-gray-200 bg-white/95 backdrop-blur")
+    div(class="max-w-7xl px-4 py-4 sm:px-6 lg:px-8")
+        div(class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between")
+            div(class="min-w-0")
+                p(class="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-600") Admin Console
+                h1(class="mt-1 text-lg font-semibold text-zinc-950") 관리자 분석 설정
+                p(class="mt-1 text-[13px] text-gray-500") 일반 사용자에게 숨길 운영 정보, 학습 데이터, 게이트웨이 설정을 이 페이지에서 관리합니다.
+            div(class="flex flex-wrap items-center gap-2")
+                a(routerLink="/", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-4 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 메인으로 이동
+                a(routerLink="/pipeline", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-4 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 파이프라인 보기
+
+div(class="max-w-7xl px-4 pb-8 pt-6 sm:px-6 lg:px-8")
+    div(class="grid grid-cols-1 gap-4 lg:grid-cols-3")
+        div(class="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm")
+            p(class="text-xs font-semibold uppercase tracking-wider text-gray-400") 기본 분석 모드
+            p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.analysis_profiles?.default === 'fast' ? '빠른 분석' : '정밀 분석'}}
+            p(class="mt-1 text-[13px] text-gray-500") {{prototypeInfo?.message}}
+        div(class="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm")
+            p(class="text-xs font-semibold uppercase tracking-wider text-gray-400") 웹캠 준비 상태
+            p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.webcam_mode?.status || '-'}}
+            p(class="mt-1 text-[13px] text-gray-500") {{prototypeInfo?.webcam_mode?.message}}
+        div(class="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm")
+            p(class="text-xs font-semibold uppercase tracking-wider text-gray-400") 지원 포맷
+            p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.supported_formats?.join(', ') || '-'}}
+            p(class="mt-1 text-[13px] text-gray-500") 최대 {{prototypeInfo?.max_upload_mb || '-'}}MB
+
+    div(class="mt-6 grid grid-cols-1 gap-6 xl:grid-cols-2")
+        div(class="space-y-6")
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                h2(class="text-[15px] font-semibold text-gray-900") 분석 시간 단축 재정리
+                div(class="mt-4 space-y-3")
+                    div(*ngFor="let item of prototypeInfo?.analysis_profiles?.optimization_notes", class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-[13px] text-gray-600") {{item}}
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                div(class="flex items-start justify-between gap-3")
+                    div
+                        h2(class="text-[15px] font-semibold text-gray-900") 실시간 분석 적용 범위 검토
+                        p(class="mt-2 text-[13px] text-gray-600") {{prototypeInfo?.realtime_readiness?.headline}}
+                    span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(prototypeInfo?.realtime_readiness?.status)") {{prototypeInfo?.realtime_readiness?.status}}
+                div(class="mt-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                    p(class="text-[13px] font-medium text-gray-900") 적용 요약
+                    p(class="mt-2 text-[13px] leading-6 text-gray-600") {{prototypeInfo?.realtime_readiness?.summary}}
+                div(class="mt-4 grid gap-3 md:grid-cols-3")
+                    div(*ngFor="let item of prototypeInfo?.realtime_readiness?.recommended_stack", class="rounded-2xl border border-gray-200 bg-white px-4 py-3")
+                        div(class="flex items-center justify-between gap-2")
+                            p(class="text-[13px] font-medium text-gray-900") {{item.title}}
+                            span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(item.status)") {{item.status}}
+                        p(class="mt-2 text-[13px] text-gray-600") {{item.description}}
+                div(class="mt-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                    p(class="text-[13px] font-medium text-gray-900") 제약 사항
+                    ul(class="mt-2 space-y-1")
+                        li(*ngFor="let item of prototypeInfo?.realtime_readiness?.constraints", class="text-[13px] text-gray-600") • {{item}}
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                h2(class="text-[15px] font-semibold text-gray-900") 학습 데이터 분석 및 모델 설명
+                p(class="mt-2 text-[13px] text-gray-600") {{prototypeInfo?.model_explanation?.headline}}
+                div(class="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3")
+                    p(class="text-[13px] font-medium text-indigo-900") 현재 분석 엔진
+                    p(class="mt-2 text-[13px] text-indigo-800") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.label}}
+                    p(class="mt-1 text-xs text-indigo-700") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.note}}
+                    p(class="mt-2 text-xs text-indigo-700") 낙상 모델: {{prototypeInfo?.dataset_summary?.fall_model_label}}
+                    p(class="mt-1 text-xs text-indigo-700") 행동 모델: {{prototypeInfo?.dataset_summary?.behavior_model_label}}
+                div(class="mt-4 grid gap-3 md:grid-cols-2")
+                    div(*ngFor="let item of prototypeInfo?.model_explanation?.learning_data", class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[13px] font-medium text-gray-900") {{item.label}}
+                            p(class="text-[15px] font-semibold text-gray-900") {{item.value}}
+                        p(class="mt-1 text-xs text-gray-500") {{item.note}}
+                div(class="mt-4 space-y-3")
+                    div(*ngFor="let card of prototypeInfo?.model_explanation?.cards", class="rounded-2xl border border-gray-200 bg-white px-4 py-3")
+                        div(class="flex items-center justify-between gap-2")
+                            p(class="text-[13px] font-medium text-gray-900") {{card.title}}
+                            span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(card.status)") {{card.status}}
+                        p(class="mt-2 text-[13px] text-gray-600") {{card.summary}}
+                        ul(class="mt-3 space-y-1")
+                            li(*ngFor="let item of card.items", class="text-[13px] text-gray-600") • {{item}}
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                div(class="flex items-start justify-between gap-3")
+                    div
+                        h2(class="text-[15px] font-semibold text-gray-900") 학습된 YOLO 모델 상세
+                        p(class="mt-2 text-[13px] text-gray-600") 웹페이지 업로드 분석이 이 모델을 통해 실제 프레임 추론을 수행합니다.
+                    span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(prototypeInfo?.trained_model?.runtime_ready ? 'trained-yolo-runtime' : 'not-run')") {{prototypeInfo?.trained_model?.runtime_ready ? 'trained-yolo-runtime' : 'not-run'}}
+                div(class="mt-4 grid gap-3 md:grid-cols-2")
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-[13px] font-medium text-gray-900") 모델 파일
+                        p(class="mt-2 text-[13px] text-gray-700") {{prototypeInfo?.trained_model?.model_name || '-'}}
+                        p(class="mt-1 text-xs text-gray-500") {{prototypeInfo?.trained_model?.weights_path || '-'}}
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-[13px] font-medium text-gray-900") 학습 데이터
+                        p(class="mt-2 text-[13px] text-gray-700") 총 {{prototypeInfo?.trained_model?.sample_count || 0}}건
+                        p(class="mt-1 text-xs text-gray-500") train {{prototypeInfo?.trained_model?.train_count || 0}} · val {{prototypeInfo?.trained_model?.validation_count || 0}}
+                div(class="mt-4 grid gap-3 md:grid-cols-4")
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-xs text-gray-400") Accuracy
+                        p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.trained_model?.accuracy * 100 | number:'1.0-1'}}%
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-xs text-gray-400") Precision
+                        p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.trained_model?.precision * 100 | number:'1.0-1'}}%
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-xs text-gray-400") Recall
+                        p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.trained_model?.recall * 100 | number:'1.0-1'}}%
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        p(class="text-xs text-gray-400") F1
+                        p(class="mt-2 text-[15px] font-semibold text-gray-900") {{prototypeInfo?.trained_model?.f1 * 100 | number:'1.0-1'}}%
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                div(class="flex items-start justify-between gap-3")
+                    div
+                        h2(class="text-[15px] font-semibold text-gray-900") 영상 분석 진단 메모
+                        p(class="mt-2 text-[13px] text-gray-600") {{prototypeInfo?.analysis_diagnostics?.headline}}
+                    span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="statusBadgeClass(prototypeInfo?.analysis_diagnostics?.status)") {{prototypeInfo?.analysis_diagnostics?.status}}
+                div(class="mt-4 space-y-3")
+                    div(*ngFor="let item of prototypeInfo?.analysis_diagnostics?.items", class="rounded-2xl px-4 py-3", [ngClass]="diagnosticClass(item.severity)")
+                        p(class="text-[13px] font-medium") {{item.title}}
+                        p(class="mt-2 text-[13px] leading-6") {{item.description}}
+                        p(class="mt-2 text-xs opacity-80") 조치: {{item.action}}
+
+            div(class="rounded-3xl border border-rose-200 bg-rose-50 p-5 shadow-sm")
+                h2(class="text-[15px] font-semibold text-rose-900") 낙상 시 응급 프로토콜
+                p(class="mt-2 text-[13px] text-rose-800") {{prototypeInfo?.emergency_protocol?.headline}}
+                div(class="mt-4 grid gap-3")
+                    div(*ngFor="let protocol of prototypeInfo?.emergency_protocol?.levels", class="rounded-2xl border border-rose-200 bg-white px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[13px] font-medium text-gray-900") {{protocol.label}}
+                            span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-medium", [ngClass]="healthClass(protocol.level === 'high' ? 'fail' : 'warn')") {{protocol.level}}
+                        p(class="mt-2 text-[13px] text-gray-600") {{protocol.trigger}}
+                        ul(class="mt-3 space-y-1")
+                            li(*ngFor="let step of protocol.steps", class="text-[13px] text-gray-600") • {{step}}
+
+        div(class="space-y-6")
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                h2(class="text-[15px] font-semibold text-gray-900") 보호자/게이트웨이 설정
+                div(class="mt-4 grid grid-cols-1 gap-4")
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[13px] font-medium text-gray-900") 보호자 목록
+                            button(type="button", class="inline-flex items-center rounded-lg border border-indigo-300 bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-100", (click)="addGuardian()") + 보호자 추가
+                        div(class="mt-3 space-y-2")
+                            div(*ngFor="let g of guardians; let i = index", class="flex items-center gap-2")
+                                input(type="checkbox", [checked]="g.enabled", (change)="g.enabled = $any($event.target).checked")
+                                input(type="text", class="flex-1 rounded-xl border border-gray-300 px-3 py-2 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="이름", [value]="g.name", (input)="g.name = $any($event.target).value")
+                                input(type="text", class="flex-1 rounded-xl border border-gray-300 px-3 py-2 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="연락처", [value]="g.phone", (input)="g.phone = $any($event.target).value")
+                                button(type="button", class="rounded-lg border border-rose-300 bg-rose-50 px-2 py-1 text-xs text-rose-600 hover:bg-rose-100", (click)="removeGuardian(i)") 삭제
+                            p(class="text-xs text-gray-500 mt-1", *ngIf="guardians.length === 0") 등록된 보호자가 없습니다. 위 버튼으로 추가하세요.
+                        div(class="mt-3 flex gap-2")
+                            button(type="button", class="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50", (click)="saveGuardians()", [disabled]="settingsSaving")
+                                span(*ngIf="!settingsSaving") 보호자 저장
+                                span(*ngIf="settingsSaving") 저장 중...
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[13px] font-medium text-gray-900") 문자 게이트웨이
+                            input(type="checkbox", [checked]="smsGatewayEnabled", (change)="smsGatewayEnabled = $any($event.target).checked")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Provider 이름", [value]="smsProviderName", (input)="smsProviderName = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="발신번호", [value]="smsSender", (input)="smsSender = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="SMS Webhook URL", [value]="smsWebhookUrl", (input)="smsWebhookUrl = $any($event.target).value")
+                        input(type="password", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Bearer Token", [value]="smsAuthToken", (input)="smsAuthToken = $any($event.target).value")
+                        p(class="mt-1 text-xs text-gray-500", *ngIf="smsAuthTokenMasked") 현재 저장 토큰 {{smsAuthTokenMasked}}
+                    div(class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[13px] font-medium text-gray-900") 푸시 게이트웨이
+                            input(type="checkbox", [checked]="pushGatewayEnabled", (change)="pushGatewayEnabled = $any($event.target).checked")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Provider 이름", [value]="pushProviderName", (input)="pushProviderName = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Push Platform", [value]="pushPlatform", (input)="pushPlatform = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Push Webhook URL", [value]="pushWebhookUrl", (input)="pushWebhookUrl = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Push Target/Topic", [value]="pushTarget", (input)="pushTarget = $any($event.target).value")
+                        input(type="text", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="iOS Bundle ID", [value]="pushBundleId", (input)="pushBundleId = $any($event.target).value")
+                        input(type="password", class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", placeholder="Bearer Token", [value]="pushAuthToken", (input)="pushAuthToken = $any($event.target).value")
+                        p(class="mt-1 text-xs text-gray-500", *ngIf="pushAuthTokenMasked") 현재 저장 토큰 {{pushAuthTokenMasked}}
+                div(class="mt-4 flex flex-wrap gap-2")
+                    button(type="button", class="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50", (click)="saveAlertSettings()", [disabled]="settingsSaving")
+                        span(*ngIf="!settingsSaving") 설정 저장
+                        span(*ngIf="settingsSaving") 저장 중...
+                p(class="mt-3 text-[13px] text-gray-600", *ngIf="settingsMessage") {{settingsMessage}}
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                div(class="flex items-center justify-between gap-3")
+                    div
+                        h2(class="text-[15px] font-semibold text-gray-900") 학습 데이터 관리
+                        p(class="mt-1 text-[13px] text-gray-500") 운영자가 추가 학습 샘플과 재학습을 관리합니다.
+                    button(type="button", class="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-indigo-500", (click)="trainingInput.click()") 학습 영상 선택
+                div(class="mt-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                    p(class="text-[13px] font-medium text-gray-900") 현재 등록 현황
+                    p(class="mt-2 text-[13px] text-gray-600") Y {{prototypeInfo?.intake_summary?.Y || 0}}건 · N {{prototypeInfo?.intake_summary?.N || 0}}건 · 총 {{prototypeInfo?.intake_summary?.total || 0}}건
+                div(class="mt-4 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                    p(class="text-[13px] font-medium text-gray-900") 라벨 선택
+                    div(class="mt-3 flex flex-wrap gap-2")
+                        button(type="button", class="inline-flex items-center rounded-xl px-4 py-2 text-[13px] font-semibold", [ngClass]="trainingLabel === 'Y' ? 'bg-rose-600 text-white' : 'border border-gray-300 bg-white text-gray-700'", (click)="setTrainingLabel('Y')") Y · 낙상
+                        button(type="button", class="inline-flex items-center rounded-xl px-4 py-2 text-[13px] font-semibold", [ngClass]="trainingLabel === 'N' ? 'bg-emerald-600 text-white' : 'border border-gray-300 bg-white text-gray-700'", (click)="setTrainingLabel('N')") N · 비낙상
+                    div(class="mt-3 rounded-xl border border-gray-200 bg-white px-4 py-3", *ngIf="trainingFile")
+                        p(class="truncate text-[13px] font-medium text-gray-900") {{trainingFile?.name}}
+                        p(class="mt-1 text-xs text-gray-500") {{(trainingFile?.size || 0) / 1024 / 1024 | number:'1.1-1'}} MB
+                    textarea(class="mt-3 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-700 outline-none focus:border-indigo-400", rows="3", placeholder="촬영 위치, 자세, 이벤트 메모", [value]="trainingNote", (input)="trainingNote = $any($event.target).value")
+                    div(class="mt-4 h-2 overflow-hidden rounded-full bg-gray-200")
+                        div(class="h-full rounded-full bg-indigo-600 transition-all", [style.width.%]="intakeProgress")
+                    div(class="mt-4 flex flex-wrap gap-2")
+                        button(type="button", class="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50", (click)="submitTrainingSample()", [disabled]="!trainingFile || intakeUploading")
+                            span(*ngIf="!intakeUploading") 학습 데이터 등록
+                            span(*ngIf="intakeUploading") 업로드 중...
+                        button(type="button", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-4 py-2 text-[13px] font-medium text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50", (click)="retrainBaseline()", [disabled]="retraining")
+                            span(*ngIf="!retraining") 베이스라인 재학습
+                            span(*ngIf="retraining") 재학습 중...
+                    p(class="mt-3 text-[13px] text-gray-600", *ngIf="trainingMessage") {{trainingMessage}}
+
+            div(class="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm")
+                div(class="flex items-center justify-between gap-3")
+                    h2(class="text-[15px] font-semibold text-gray-900") 알람 이력
+                    button(type="button", class="inline-flex items-center rounded-lg border border-gray-300 bg-white px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50", (click)="loadAlertHistory(1)") 새로고침
+                div(class="mt-4", *ngIf="alertHistoryLoading")
+                    p(class="text-[13px] text-gray-500") 알람 이력을 불러오는 중...
+                div(class="mt-4 space-y-3", *ngIf="!alertHistoryLoading && alertHistory")
+                    p(class="text-xs text-gray-500") 총 {{alertHistory?.total || 0}}건
+                    div(*ngFor="let item of alertHistory?.items", class="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            div(class="min-w-0")
+                                p(class="truncate text-[13px] font-medium text-gray-900") {{item.saved_name || item.filename}}
+                                p(class="mt-1 text-xs text-gray-500") {{item.created_at}} · {{item.summary}}
+                            div(class="flex items-center gap-2")
+                                span(class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium", [ngClass]="riskBadgeClass(item.risk_level)") {{item.risk_level}}
+                                span(class="text-xs text-gray-600") {{guardianStatusLabel(item.guardian_status)}}
+                        div(class="mt-2 flex flex-wrap gap-1", *ngIf="item.dispatch_results?.length")
+                            span(*ngFor="let dr of item.dispatch_results", class="inline-flex items-center rounded-full bg-white border border-gray-200 px-2 py-0.5 text-xs text-gray-600") {{dr.name}} · SMS:{{dr.sms || '-'}} · Push:{{dr.push || '-'}}
+                    div(class="mt-3 flex items-center justify-center gap-2", *ngIf="alertHistory?.total > 10")
+                        button(type="button", class="rounded-lg border border-gray-300 px-3 py-1 text-xs text-gray-700 hover:bg-gray-50 disabled:opacity-50", [disabled]="alertHistoryPage <= 1", (click)="loadAlertHistory(alertHistoryPage - 1)") 이전
+                        span(class="text-xs text-gray-500") {{alertHistoryPage}} 페이지
+                        button(type="button", class="rounded-lg border border-gray-300 px-3 py-1 text-xs text-gray-700 hover:bg-gray-50", (click)="loadAlertHistory(alertHistoryPage + 1)") 다음
+                    p(class="mt-3 text-xs text-gray-500", *ngIf="!alertHistory?.items?.length") 기록된 알람 이력이 없습니다.
