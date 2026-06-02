@@ -1,5 +1,9 @@
 # XG 듀얼 아키텍처 설계서
 
+> **레거시 문서**
+> 현재 운영 기본은 `RF-Dual (RF Fall + XG-Posture)`이며, 이 문서는 XG-Dual 설계 이력을 보존하기 위한 참고 자료입니다.
+> 최신 운영 기준은 [2026-06-01-current-status-and-training-pipeline.md](2026-06-01-current-status-and-training-pipeline.md) 및 [prototype/fall-detection/README.md](prototype/fall-detection/README.md)를 따릅니다.
+
 > **RF-Pose 삭제 + XGBoost 중심 2단계 체계 재편**
 > 작성일: 2026-04-06
 

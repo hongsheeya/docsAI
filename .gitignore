@@ -7,6 +7,33 @@ node_modules/
 /test/
 package-lock.json
 
+# Runtime data, training artifacts, and local model weights
+/data/
+/storage/
+/outputs/
+/outputs
+/runs/
+/runs
+/datasets/
+*.pt
+*.onnx
+*.pkl
+*.joblib
+*.model
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.csv
+tmp_*
+낙상영상/
+낙상영상
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -294,4 +294,5 @@ export class Component implements OnInit {
                 return 'bg-gray-50 text-gray-700 border border-gray-200';
         }
     }
+
 }

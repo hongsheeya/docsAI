@@ -17,6 +17,7 @@ export class Component implements OnInit {
         { id: 'feedback', label: '피드백 / 재학습', icon: 'feedback' },
         { id: 'alert', label: '위험 알림', icon: 'alert' },
         { id: 'pipeline', label: 'AI 파이프라인', icon: 'pipeline' },
+        { id: 'model-training', label: 'RF/XGBoost/SHAP 재현', icon: 'pipeline' },
         { id: 'admin', label: '관리자 설정', icon: 'admin' },
         { id: 'faq', label: '자주 묻는 질문', icon: 'faq' },
     ];
@@ -39,6 +40,10 @@ export class Component implements OnInit {
     public toggleSidebar() {
         this.sidebarOpen = !this.sidebarOpen;
         this.service.render();
+    }
+
+    public isAdminUser() {
+        return this.service.auth?.check?.role('admin') === true;
     }
 
     public goMain() {

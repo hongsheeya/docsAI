@@ -3,11 +3,11 @@ div(class="flex shrink-0 items-center justify-center pt-5 pb-4")
         div(class="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600 text-white")
             svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-5")
                 path(stroke-linecap="round", stroke-linejoin="round", d="M3 7.5h18M6.75 3.75h10.5A2.25 2.25 0 0 1 19.5 6v12A2.25 2.25 0 0 1 17.25 20.25H6.75A2.25 2.25 0 0 1 4.5 18V6a2.25 2.25 0 0 1 2.25-2.25Zm1.5 8.25 2.25 2.25 4.5-4.5")
-        span(class="text-[15px] font-bold text-gray-900") Fall Prototype
+        span(class="text-[15px] font-bold text-gray-900") FallAI
 
 div(class="mx-2 mb-4 rounded-lg border border-indigo-100 bg-indigo-50/70 p-3")
-    p(class="text-[13px] font-semibold text-indigo-700") 단일 메인페이지 프로토타입
-    p(class="mt-1 text-xs leading-5 text-indigo-600") 로그인 없이 업로드/웹캠 기반 낙상 분석을 우선 제공하며, 상세 운영 기능은 관리자 화면으로 분리합니다.
+    p(class="text-[13px] font-semibold text-indigo-700") RF-Dual 운영 콘솔
+    p(class="mt-1 text-xs leading-5 text-indigo-600") 업로드·웹캠 로그, 낙상 판단 기준, 파이프라인 설명을 한 화면에서 확인합니다.
 
 nav(class="flex flex-1 flex-col overflow-y-auto")
     ul(role="list", class="flex flex-1 flex-col gap-y-4 mx-2")
@@ -33,6 +33,11 @@ nav(class="flex flex-1 flex-col overflow-y-auto")
                         svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                             path(stroke-linecap="round", stroke-linejoin="round", d="M10.5 6h9m-9 6h9m-9 6h9M4.5 6h.008v.008H4.5V6Zm0 6h.008v.008H4.5V12Zm0 6h.008v.008H4.5V18Z")
                         span(class="truncate") 관리자 분석 설정
+                li
+                    a(routerLink="/admin/llm", [class]="activeClass('/admin/llm')")
+                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                            path(stroke-linecap="round", stroke-linejoin="round", d="M9.75 3.104v5.714a2.25 2.25 0 0 1-.659 1.591L5.16 14.34M9.75 3.104c.251.023.501.05.75.082m-.75-.082a24.301 24.301 0 0 0-4.5 0m4.5 0v.75m.75-.668a24.301 24.301 0 0 1 4.5 0m0 0v.75m0-.75c.251.023.501.05.75.082m-5.25 0h4.5m-7.5 7.5h9m-9 0 3.75 6.495a2.25 2.25 0 0 0 3.897 0l3.75-6.495")
+                        span(class="truncate") LLM 판독 설정
 
         li
             div(class="text-[11px] font-semibold uppercase tracking-wider text-gray-400 px-2") Help
@@ -42,3 +47,8 @@ nav(class="flex flex-1 flex-col overflow-y-auto")
                         svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                             path(stroke-linecap="round", stroke-linejoin="round", d="M12 6.042A8.967 8.967 0 0 0 6 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 0 1 6 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 0 1 6-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0 0 18 18a8.967 8.967 0 0 0-6 2.292m0-14.25v14.25")
                         span(class="truncate") 사용 설명서
+                li
+                    a(routerLink="/presentation", [class]="activeClass('/presentation')")
+                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                            path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 3.75h16.5M3.75 8.25h16.5m-16.5 4.5h7.5m-7.5 4.5h7.5")
+                        span(class="truncate") 표정·가림 발표자료

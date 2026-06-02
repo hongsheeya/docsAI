@@ -1,0 +1,22 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="36" y1="24" x2="220" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4F46E5"/>
+      <stop offset="0.55" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="pulse" x1="64" y1="128" x2="192" y2="128" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#DBEAFE"/>
+    </linearGradient>
+    <filter id="shadow" x="24" y="20" width="208" height="216" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#1E3A8A" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <path d="M128 24C157.715 43.6227 189.184 53.5184 220 54C220 142.989 187.707 204.485 128 232C68.2933 204.485 36 142.989 36 54C66.8163 53.5184 98.2851 43.6227 128 24Z" fill="url(#bg)"/>
+    <path d="M128 48C151.038 61.1799 175.072 68.6708 198.769 70.2654C196.196 138.153 171.757 185.665 128 207.65C84.2429 185.665 59.8043 138.153 57.231 70.2654C80.9279 68.6708 104.962 61.1799 128 48Z" fill="white" fill-opacity="0.10"/>
+    <path d="M67 136H95L109 107L127 151L142 122L153 136H189" stroke="url(#pulse)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="128" cy="88" r="16" fill="#F8FAFC" fill-opacity="0.9"/>
+  </g>
+</svg>

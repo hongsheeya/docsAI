@@ -1,15 +1,19 @@
 //- Header with back button and tabs
-nav(class="sticky top-0 z-20 bg-white shadow")
+nav(class="sticky top-0 z-20 border-b border-zinc-200 bg-white/95 backdrop-blur")
     div(class="max-w-4xl px-2 sm:px-4 lg:px-8 py-3 lg:px-6")
         div(class="flex items-center justify-between")
             div(class="flex items-center gap-3")
                 button(routerLink="/posts", class="flex items-center justify-center w-8 h-8 rounded-lg hover:bg-gray-100 transition-colors")
                     svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-5 text-gray-500")
                         path(stroke-linecap="round", stroke-linejoin="round", d="M10.5 19.5 3 12m0 0 7.5-7.5M3 12h18")
-                h1(class="text-lg font-semibold text-zinc-950")
-                    span(*ngIf="isNewPost()") 새 글 작성
-                    span(*ngIf="!isNewPost() && data") {{data.title}}
-                    span(*ngIf="!isNewPost() && !data") 로딩 중...
+                span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
+                    img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
+                div
+                    h1(class="text-lg font-semibold text-zinc-950")
+                        span(*ngIf="isNewPost()") 새 글 작성
+                        span(*ngIf="!isNewPost() && data") {{data.title}}
+                        span(*ngIf="!isNewPost() && !data") 로딩 중...
+                    p(class="text-xs text-zinc-400") FallAI · 게시물 상세
 
     //- Tab Navigation
     div(class="max-w-4xl px-4 lg:px-8", *ngIf="!isNewPost()")

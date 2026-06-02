@@ -1,15 +1,34 @@
 import datetime
+import copy
 import hashlib
+import io
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import sys
+import tarfile
+import tempfile
 import time
+import zipfile
+
+os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL', '-8')
+os.environ.setdefault('OPENCV_LOG_LEVEL', 'SILENT')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
 
 try:
     import cv2
+    try:
+        cv2.setLogLevel(0)
+    except Exception:
+        pass
 except Exception:
     cv2 = None
 
@@ -22,6 +41,9 @@ except Exception:
 class VideoAnalysis:
     _runtime_module_cache = None
     _runtime_module_mtime = None
+    _prototype_info_cache = None
+    _prototype_info_cache_ts = 0.0
+    _PROTOTYPE_INFO_CACHE_TTL_SEC = 5.0
     # FN-20260406-0001: HITL 피드백 N건 누적 시 자동 재학습 트리거 임계값
     AUTO_RETRAIN_THRESHOLD = 10
 
@@ -29,14 +51,54 @@ class VideoAnalysis:
         self.core = core
         self.allowed_extensions = ['mp4', 'mov', 'avi', 'mkv', 'webm']
         self.max_upload_mb = 200
-        # FN-0025: 0.52→0.60 — 정상 활동 점수(30~40%)와 충분한 여유 확보
-        self.fall_decision_threshold = 0.60
+        # Recall-priority: 낙상 감지 누락 최소화를 위해 threshold를 낮게 설정
+        # training_summary.json의 tuned_thresholds가 있으면 그 값을 우선 사용
+        self.fall_decision_threshold = 0.465
 
     def _project_root(self):
         return wiz.project.fs().abspath()
 
+    def _invalidate_prototype_info_cache(self):
+        self.__class__._prototype_info_cache = None
+        self.__class__._prototype_info_cache_ts = 0.0
+
+    _PERSISTENT_MODEL_ROOT = os.path.join('/opt/app', 'storage', 'training', 'fall-detection')
+
+    def _persistent_model_root(self):
+        path = self._PERSISTENT_MODEL_ROOT
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        return path
+
+    def _persistent_model_path(self, *paths):
+        return os.path.join(self._persistent_model_root(), *paths)
+
+    def _promote_model_asset(self, persistent_path, legacy_path):
+        if os.path.exists(persistent_path):
+            return persistent_path
+        if os.path.exists(legacy_path):
+            try:
+                os.makedirs(os.path.dirname(persistent_path), exist_ok=True)
+                shutil.copy2(legacy_path, persistent_path)
+                return persistent_path
+            except Exception:
+                return legacy_path
+        return persistent_path
+
     def _project_abspath(self, *paths):
         base = self._project_root()
+        if paths and paths[0] in ['data', 'storage']:
+            root_name = paths[0]
+            root_link = os.path.join(base, root_name)
+            if os.path.lexists(root_link):
+                resolved_root = os.path.realpath(root_link)
+                if os.path.exists(resolved_root) is False:
+                    alt_link = os.path.join('/opt/app', root_name)
+                    if os.path.lexists(alt_link):
+                        resolved_root = os.path.realpath(alt_link)
+                return os.path.join(resolved_root, *paths[1:]) if len(paths) > 1 else resolved_root
         return os.path.join(base, *paths) if paths else base
 
     def _read_json(self, path, default=None):
@@ -49,34 +111,70 @@ class VideoAnalysis:
     def _write_json(self, path, data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
+            json.dump(self._sanitize_for_json(data), file, ensure_ascii=False, indent=2)
         return path
 
     def _sanitize_filename(self, filename):
         name = os.path.basename(filename or 'video')
         return re.sub(r'[^A-Za-z0-9._-]+', '_', name) or 'video'
 
+    @staticmethod
+    def _sanitize_for_json(obj):
+        """Recursively replace NaN/Inf float values with None so JSON serialization
+        is valid for JavaScript. Python's json module emits 'NaN' / 'Infinity' which
+        are rejected by JSON.parse() in browsers."""
+        import math
+        if isinstance(obj, dict):
+            return {k: VideoAnalysis._sanitize_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [VideoAnalysis._sanitize_for_json(v) for v in obj]
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return obj
+        if obj.__class__.__module__.startswith('numpy'):
+            try:
+                return VideoAnalysis._sanitize_for_json(obj.item())
+            except Exception:
+                return str(obj)
+        return obj
+
     def _storage_dir(self):
         path = self._project_abspath('data', 'uploads', 'fall-detection-prototype')
-        os.makedirs(path, exist_ok=True)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
         return path
 
     def _training_dir(self):
         path = self._project_abspath('storage', 'training', 'fall-detection', 'intake')
-        os.makedirs(path, exist_ok=True)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
         return path
 
     def _alerts_dir(self):
         path = self._project_abspath('storage', 'alerts', 'fall-detection')
-        os.makedirs(path, exist_ok=True)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
         return path
 
     def _alert_settings_path(self):
         return os.path.join(self._alerts_dir(), 'settings.json')
 
+    def _llm_settings_path(self):
+        return self._persistent_model_path('llm', 'settings.json')
+
     def _clip_dir(self):
         path = os.path.join(self._alerts_dir(), 'clips', datetime.datetime.now().strftime('%Y-%m-%d'))
-        os.makedirs(path, exist_ok=True)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
         return path
 
     def _load_module(self, rel_path, module_name):
@@ -245,14 +343,18 @@ class VideoAnalysis:
             fc_path = self._normalize_existing_path(fc_path)
         return bool(pd_weights and os.path.exists(pd_weights) and fc_path and os.path.exists(fc_path))
 
-    def _infer_with_trained_model(self, video_path, filename='', analysis_profile='balanced', model_type='xg-dual', input_source='upload', duration_hint=0):
-        requested = str(model_type or 'xg-dual').strip().lower()
+    def _infer_with_trained_model(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0, realtime_context=None):
+        requested = str(model_type or 'rf-dual').strip().lower()
+        if requested not in ['', 'rf-dual', 'rf-dual-runtime']:
+            requested = 'rf-dual'
         if requested in ['rf', 'rf-pipeline-runtime']:
             requested = 'rf-pipeline'
         if requested in ['rf-pose-runtime']:
             requested = 'rf-pose'
         if requested in ['person-feature-runtime']:
             requested = 'person-feature'
+        if requested in ['rf-dual-runtime']:
+            requested = 'rf-dual'
         # Legacy aliases → rf-pipeline (레거시 YOLO 분류 모델 제거됨)
         if requested in ['legacy', 'yolo-cls', 'trained-yolo']:
             requested = 'rf-pipeline'
@@ -260,33 +362,27 @@ class VideoAnalysis:
         person_feature_ready = self._trained_runtime_available() and self._person_feature_available()
         rf_ready = self._rf_pipeline_available()
         rf_pose_ready = self._rf_pose_pipeline_available()
-        xg_fall_ready = self._xg_fall_available()
-        xg_posture_ready = self._xg_posture_available()
-        xg_dual_ready = xg_fall_ready  # dual needs at least xg-fall; posture is optional
+        rf_dual_ready = rf_ready  # rf-dual needs at least rf model; posture is optional
 
         available = {
-            'xg-dual': xg_dual_ready,
-            'xg-fall': xg_fall_ready,
             'person-feature': person_feature_ready,
             'rf-pipeline': rf_ready,
             'rf-pose': rf_pose_ready,
+            'rf-dual': rf_dual_ready,
         }
         runners = {
-            'xg-dual': lambda: self._infer_xg_dual(video_path, filename, analysis_profile, input_source=input_source, duration_hint=duration_hint),
-            'xg-fall': lambda: self._infer_xg_fall(video_path, filename, analysis_profile, input_source=input_source, duration_hint=duration_hint),
             'person-feature': lambda: self._infer_person_feature(video_path, filename, analysis_profile),
             'rf-pipeline': lambda: self._infer_rf_pipeline(video_path, filename, analysis_profile, input_source=input_source),
             'rf-pose': lambda: self._infer_rf_pose_pipeline(video_path, filename, analysis_profile, input_source=input_source),
+            'rf-dual': lambda: self._infer_rf_dual(video_path, filename, analysis_profile, input_source=input_source, duration_hint=duration_hint, realtime_context=realtime_context),
         }
 
         if requested in runners:
             ordered_modes = [requested]
         else:
-            # FN-0014 Stage A: auto fallback — rf-pose 제외 (deprecated)
-            # xg-dual → xg-fall → person-feature → rf-pipeline
+            # auto fallback — rf-dual 우선
             ordered_modes = [
-                'xg-dual',
-                'xg-fall',
+                'rf-dual',
                 'person-feature',
                 'rf-pipeline',
             ]
@@ -294,16 +390,14 @@ class VideoAnalysis:
         errors = []
         for mode in ordered_modes:
             if available.get(mode) is not True:
-                if mode == 'xg-dual':
-                    errors.append('XG-Dual 모델 준비가 완료되지 않았습니다 (XG-Fall 필수).')
-                elif mode == 'xg-fall':
-                    errors.append('XG-Fall 37-feature 모델 파일이 존재하지 않습니다.')
-                elif mode == 'person-feature':
+                if mode == 'person-feature':
                     errors.append('person-feature 파이프라인 준비가 완료되지 않았습니다.')
                 elif mode == 'rf-pipeline':
                     errors.append('RF 파이프라인 모델 파일이 존재하지 않습니다.')
                 elif mode == 'rf-pose':
                     errors.append('RF-Pose 파이프라인 모델 파일이 존재하지 않습니다.')
+                elif mode == 'rf-dual':
+                    errors.append('RF-Dual 모델 준비가 완료되지 않았습니다 (RF 모델 필수).')
                 continue
             try:
                 result = runners[mode]()
@@ -533,10 +627,55 @@ class VideoAnalysis:
     _RF_PROJECT_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-pipeline', 'rf_hitl_model.pkl')
     _RF_PROJECT_SUMMARY_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-pipeline', 'training_summary.json')
     _RF_YOLO_MODEL = 'yolov8n-pose.pt'
-    _RF_TARGET_FPS = 2
+    _RF_YOLO_ONNX_MODEL = 'yolov8n-pose.onnx'
+    _RF_TARGET_FPS = 3
     _RF_CONF_THRES = 0.25
+    _RF_REALTIME_CONF_THRES = 0.18
     _RF_PERSON_CLASS_ID = 0
     _RF_YOLO_IMGSZ = 640
+    _RF_REALTIME_YOLO_IMGSZ = 320
+    _POSTURE_REALTIME_TARGET_FPS = 4
+    _POSTURE_UPLOAD_TARGET_FPS = 8
+    _FACIAL_AUX_MAX_FRAMES = 5
+    _FACIAL_AUX_SCORE_CAP = 0.14
+    _FACIAL_AUX_TRIGGER_MARGIN = 0.12
+    _FACIAL_EMOTION_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'facial-state', 'emotion-ferplus-8.onnx')
+    _FACIAL_AIHUB82_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'facial-state', 'aihub82_facial_emotion_mobilenetv3.pt')
+    _FACIAL_DRIVER_STATE_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'facial-state', 'aihub173_driver_state_mobilenetv3.pt')
+    _FACIAL_EXTERNAL_AIHUB82_WORKSPACE = '/opt/app/models/external/facialemotion/workspace_layer/workspace'
+    _FACIAL_EMOTION_LABELS = ['neutral', 'happiness', 'surprise', 'sadness', 'anger', 'disgust', 'fear', 'contempt']
+    _FACIAL_AIHUB82_LABELS = ['happiness', 'embarrassed', 'anger', 'anxiety', 'hurt', 'sadness', 'neutral']
+    _FACIAL_EXTERNAL_AIHUB82_LABELS_KO = ['기쁨', '당황', '분노', '불안', '상처', '슬픔', '중립']
+    _FACIAL_EXTERNAL_AIHUB82_LABEL_MAP = {
+        '기쁨': 'happiness',
+        '당황': 'embarrassed',
+        '분노': 'anger',
+        '불안': 'anxiety',
+        '상처': 'hurt',
+        '슬픔': 'sadness',
+        '중립': 'neutral',
+    }
+    _FACIAL_DRIVER_STATE_LABELS = ['normal_focus', 'drowsy', 'yawn', 'phone_call', 'smoking']
+    _FACIAL_EMOTION_LABEL_KO = {
+        'neutral': '중립',
+        'happiness': '기쁨',
+        'embarrassed': '당황',
+        'surprise': '놀람',
+        'anxiety': '불안',
+        'hurt': '상처',
+        'sadness': '슬픔',
+        'anger': '분노',
+        'disgust': '불쾌',
+        'fear': '공포',
+        'contempt': '경멸',
+    }
+    _FACIAL_DRIVER_STATE_LABEL_KO = {
+        'normal_focus': '정상/집중',
+        'drowsy': '졸림',
+        'yawn': '하품',
+        'phone_call': '통화',
+        'smoking': '흡연',
+    }
 
     # COCO 17 keypoints index mapping
     _COCO_KEYPOINTS = [
@@ -562,12 +701,67 @@ class VideoAnalysis:
         'delta_y_accel_max',       # v4: 하강 가속도 최대값
         'final_height_ratio',      # v4: 최종 자세 높이 비율
     ]
+    _RF_FALL_V2_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-fall-v2', 'rf_fall_v2_model.pkl')
+    _RF_FALL_V2_SUMMARY_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-fall-v2', 'training_summary.json')
+    _RF_FALL_V2_FEATURE_COLUMNS = [
+        'detection_rate', 'sample_coverage', 'bbox_conf_mean', 'bbox_conf_min',
+        'center_y_mean', 'center_y_std', 'center_y_range', 'center_y_start', 'center_y_end',
+        'center_y_drop', 'center_y_drop_ratio', 'center_y_slope', 'max_down_speed_norm', 'down_motion_ratio',
+        'height_mean', 'height_std', 'height_start', 'height_end', 'height_drop_ratio',
+        'height_min_ratio', 'height_range_ratio', 'width_mean', 'width_std', 'area_mean', 'area_std',
+        'area_start', 'area_end', 'area_drop_ratio', 'area_range_ratio', 'aspect_ratio_mean',
+        'aspect_ratio_std', 'aspect_start', 'aspect_end', 'aspect_rise', 'aspect_max',
+        'delta_y_mean', 'delta_y_max', 'delta_height_mean', 'delta_width_mean', 'delta_area_mean',
+        'delta_y_accel_max', 'final_height_ratio', 'post_peak_stillness', 'tail_stillness',
+        'floor_proximity', 'floor_contact_ratio', 'low_height_floor_score', 'avg_keypoint_conf',
+        'visible_keypoint_ratio', 'lower_body_visibility', 'upper_body_visibility', 'visibility_gap',
+        'occlusion_ratio', 'torso_tilt_mean', 'torso_tilt_max', 'torso_tilt_change',
+        'pose_height_mean', 'pose_height_min', 'pose_width_mean', 'horizontal_pose_score',
+        'lying_skeleton_score', 'standing_skeleton_score', 'pose_height_drop',
+        'fall_kinematic_score', 'occlusion_fall_risk',
+    ]
+    _RF_V3_FEATURE_COLUMNS = [
+        'n_frames',
+        'center_y_mean', 'center_y_std',
+        'height_mean', 'height_std',
+        'width_mean', 'width_std',
+        'area_mean', 'area_std',
+        'aspect_ratio_mean', 'aspect_ratio_std',
+        'delta_y_mean', 'delta_y_max',
+        'delta_height_mean', 'delta_width_mean', 'delta_area_mean',
+    ]
 
     # Class-level model caches (shared across instances for performance)
     _rf_model_cache = None
     _rf_model_mtime = None
     _rf_model_path_cache = None
+    _rf_fall_v2_model_cache = None
+    _rf_fall_v2_model_mtime = None
+    _rf_fall_v2_model_path_cache = None
     _rf_yolo_cache = None
+    _facial_cascade_cache = {}
+    _facial_emotion_session_cache = None
+    _facial_emotion_model_mtime = None
+    _facial_emotion_model_path_cache = None
+    _facial_aihub82_model_cache = None
+    _facial_aihub82_model_mtime = None
+    _facial_aihub82_model_path_cache = None
+    _facial_external_aihub82_model_cache = {}
+    _facial_driver_state_model_cache = None
+    _facial_driver_state_model_mtime = None
+    _facial_driver_state_model_path_cache = None
+    _facial_state_realtime_cache = {}
+    _facial_state_realtime_cache_ts = 0.0
+
+    # Rolling memory: cache last chunk's tail timeseries for inter-chunk continuity
+    _rt_rolling_cache = {}         # {session_id: {'timeseries_tail': [...], 'chunk_id': int, 'ts': float}}
+    _rt_llm_review_cache = {}      # {session_id: {'ts': float, 'review': dict, 'override_label': str, 'confidence': float}}
+    _RT_ROLLING_TAIL_SEC = 1.5     # seconds of tail data to keep from previous chunk
+    _REALTIME_CHUNK_POLICY_VERSION = 'dense-bootstrap-v2'
+    _UPLOAD_CHUNK_POLICY_VERSION = 'common-4s-chunk-v1'
+    _LEGACY_CHUNK_POLICY_VERSION = 'legacy-rf-dual-v1'
+    _REALTIME_STEADY_CHUNK_SEC = 4
+    _REALTIME_STRIDE_SEC = 4
 
     # FN-0004: RF-Pose model (bbox+keypoint combined features)
     _RF_POSE_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-pose', 'rf_pose_model.pkl')
@@ -579,7 +773,8 @@ class VideoAnalysis:
     # ── FN-0009: 3-Level Label System + Data Strategy ──────────────────
     # Level 1 — binary risk labels (fall / nonfall)
     _LABEL_L1_CLASSES = ['Y', 'N']
-    # Level 2 — 6-class posture labels
+    # Level 2 — posture labels. Fall is kept as a legacy label; the active
+    # behavior classifier uses stand/walk/run/sit/lie.
     _LABEL_L2_CLASSES = ['stand', 'walk', 'run', 'sit', 'lie', 'fall']
     # Level 3 — optional metadata tags
     _LABEL_L3_TAGS = ['transition', 'uncertain', 'occluded']
@@ -597,35 +792,336 @@ class VideoAnalysis:
     # L1 → L2 bootstrap mapping (used when posture dirs don't exist)
     _L1_TO_L2_BOOTSTRAP = {'Y': 'fall', 'N': 'stand'}
 
-    # FN-0007: XG-Fall 37-feature XGBoost binary model (unified timeseries)
+    # FN-0007: XG-Fall 37-feature XGBoost binary model
     _XG_FALL_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-fall', 'xg_fall_model.pkl')
     _XG_FALL_SUMMARY_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-fall', 'training_summary.json')
-    _xg_fall_model_cache = None
-    _xg_fall_model_mtime = None
-    _xg_fall_model_path_cache = None
 
     # FN-0008: XG-Posture 37-feature XGBoost multiclass model
     _XG_POSTURE_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-posture', 'xg_posture_model.pkl')
     _XG_POSTURE_SUMMARY_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-posture', 'training_summary.json')
+    _XG_POSTURE_OCCLUSION_AUX_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-posture-occlusion-aux', 'xg_posture_occlusion_aux_model.pkl')
+    _XG_POSTURE_OCCLUSION_AUX_SUMMARY_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'xg-posture-occlusion-aux', 'training_summary.json')
+    _EXTERNAL_POSE_DATASET_ROOT = os.path.join(
+        '/opt/app',
+        '017.행동_분류_및_상호작용_인식용_한국형_비전_데이터',
+        '01-1.정식개방데이터',
+        'Validation',
+        '02.라벨링데이터',
+    )
+    _EXTERNAL_POSE_DATASET_SEARCH_ROOTS = [
+        os.path.join('/opt/app', 'datasets', 'action_behavior', 'aihub_71461'),
+        os.path.join('/opt/app', 'datasets', 'action_behavior', 'aihubs_71461'),
+    ]
+    _AIHUB61_POSE_DATASET_SEARCH_ROOT = os.path.join(
+        '/opt/app',
+        'datasets',
+        'action_behavior',
+        'aihub_61_person_action_2020',
+    )
+    _AIHUB61_POSE_CLASS_TARGETS = {
+        'walk': 300,
+        'run': 300,
+        'sit': 300,
+        'lie': 300,
+    }
+    _EXTERNAL_POSE_DIRECT_ACTION_MAP = {
+        'sit': 'sit',
+        'walk': 'walk',
+        'lie_on': 'lie',
+        'stand_on': 'stand',
+    }
+    _EXTERNAL_POSE_WEAK_ACTIONS = ['no_interaction', 'watch', 'hold', 'straddle']
+    _EXTERNAL_POSE_SIT_OBJECTS = ['chair', 'table']
+    _EXTERNAL_POSE_CLASS_LIMITS = {
+        'stand': 300,
+        'walk': 120,
+        'sit': 150,
+        'lie': 150,
+    }
+    _xg_fall_model_cache = None
+    _xg_fall_model_mtime = None
+    _xg_fall_model_path_cache = None
     _xg_posture_model_cache = None
     _xg_posture_model_mtime = None
     _xg_posture_model_path_cache = None
+    _xg_posture_occlusion_aux_model_cache = None
+    _xg_posture_occlusion_aux_model_mtime = None
+    _xg_posture_occlusion_aux_model_path_cache = None
 
     def _rf_project_model_path(self):
-        return self._project_abspath(self._RF_PROJECT_MODEL_REL_PATH)
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-pipeline', 'rf_hitl_model.pkl'),
+            self._project_abspath(self._RF_PROJECT_MODEL_REL_PATH),
+        )
+
+    def _rf_project_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-pipeline', 'training_summary.json'),
+            self._project_abspath(self._RF_PROJECT_SUMMARY_REL_PATH),
+        )
 
     def _rf_project_summary(self):
-        return self._read_json(self._project_abspath(self._RF_PROJECT_SUMMARY_REL_PATH), default={}) or {}
+        return self._read_json(self._rf_project_summary_path(), default={}) or {}
+
+    def _rf_fall_v2_model_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-fall-v2', 'rf_fall_v2_model.pkl'),
+            self._project_abspath(self._RF_FALL_V2_MODEL_REL_PATH),
+        )
+
+    def _rf_fall_v2_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-fall-v2', 'training_summary.json'),
+            self._project_abspath(self._RF_FALL_V2_SUMMARY_REL_PATH),
+        )
+
+    def _rf_fall_v2_summary(self):
+        return self._read_json(self._rf_fall_v2_summary_path(), default={}) or {}
+
+    def _rf_fall_v2_available(self):
+        summary = self._rf_fall_v2_summary()
+        return bool(os.path.isfile(self._rf_fall_v2_model_path()) and summary.get('ready', True))
+
+    def _get_rf_fall_v2_model(self):
+        import sys as _sys
+        if '/opt/app/my_libs' not in _sys.path:
+            _sys.path.insert(0, '/opt/app/my_libs')
+        import joblib
+        model_path = self._rf_fall_v2_model_path()
+        try:
+            mtime = os.path.getmtime(model_path)
+        except OSError:
+            raise Exception(f'RF-Fall v2 모델 파일을 찾을 수 없습니다: {model_path}')
+        if (
+            self.__class__._rf_fall_v2_model_cache is None
+            or self.__class__._rf_fall_v2_model_mtime != mtime
+            or self.__class__._rf_fall_v2_model_path_cache != model_path
+        ):
+            self.__class__._rf_fall_v2_model_cache = self._limit_inference_threads(joblib.load(model_path))
+            self.__class__._rf_fall_v2_model_mtime = mtime
+            self.__class__._rf_fall_v2_model_path_cache = model_path
+        return self.__class__._rf_fall_v2_model_cache
+
+    def _rf_thresholds(self):
+        summary = self._rf_project_summary()
+        tuned = summary.get('tuned_thresholds', {}) or {}
+        best_config = summary.get('best_config', {}) or {}
+        confirm_source = tuned.get('confirm', best_config.get('threshold', self.fall_decision_threshold))
+        confirm = self._metadata_to_number(confirm_source, self.fall_decision_threshold)
+        suspect_default = max(0.30, confirm - 0.15)
+        suspect = self._metadata_to_number(tuned.get('suspect', suspect_default), suspect_default)
+        high_default = max(0.75, confirm + 0.15)
+        high = self._metadata_to_number(tuned.get('high', high_default), high_default)
+        if suspect >= confirm:
+            suspect = max(0.0, confirm - 0.10)
+        if high < confirm:
+            high = confirm
+        return {
+            'suspect': round(float(suspect), 4),
+            'confirm': round(float(confirm), 4),
+            'high': round(float(high), 4),
+        }
+
+    def _rf_confirm_threshold(self):
+        return float(self._rf_thresholds().get('confirm', self.fall_decision_threshold))
+
+    def _rf_short_clip_threshold_max(self):
+        return max(float(self._SHORT_CLIP_THRESHOLD_MAX), self._rf_confirm_threshold() + 0.13)
 
     # ── XG-Fall / XG-Posture model helpers ──
     def _xg_fall_model_path(self):
-        return self._project_abspath(self._XG_FALL_MODEL_REL_PATH)
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-fall', 'xg_fall_model.pkl'),
+            self._project_abspath(self._XG_FALL_MODEL_REL_PATH),
+        )
+
+    def _xg_fall_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-fall', 'training_summary.json'),
+            self._project_abspath(self._XG_FALL_SUMMARY_REL_PATH),
+        )
 
     def _xg_fall_summary(self):
-        return self._read_json(self._project_abspath(self._XG_FALL_SUMMARY_REL_PATH), default={}) or {}
+        return self._read_json(self._xg_fall_summary_path(), default={}) or {}
 
     def _xg_fall_available(self):
         return os.path.isfile(self._xg_fall_model_path())
+
+    def _xg_fall_thresholds(self):
+        summary = self._xg_fall_summary()
+        tuned = summary.get('tuned_thresholds', {}) or {}
+        confirm = self._metadata_to_number(tuned.get('confirm', self._XG_FALL_THRESHOLD), self._XG_FALL_THRESHOLD)
+        suspect_default = max(0.30, confirm - 0.12)
+        suspect = self._metadata_to_number(tuned.get('suspect', suspect_default), suspect_default)
+        high_default = max(0.75, confirm + 0.12)
+        high = self._metadata_to_number(tuned.get('high', high_default), high_default)
+        if suspect >= confirm:
+            suspect = max(0.0, confirm - 0.10)
+        if high < confirm:
+            high = confirm
+        return {
+            'suspect': round(float(suspect), 4),
+            'confirm': round(float(confirm), 4),
+            'high': round(float(high), 4),
+        }
+
+    def _fall_decision_band(self, score, motion_gate_passed=True, short_clip=False):
+        thresholds = self._xg_fall_thresholds()
+        confirm_thr = thresholds['confirm'] + (0.10 if short_clip else 0.0)
+        suspect_thr = thresholds['suspect']
+        if motion_gate_passed is not True:
+            return 'non-fall'
+        if score >= confirm_thr:
+            return 'confirmed'
+        if score >= suspect_thr:
+            return 'suspected'
+        return 'non-fall'
+
+    def _tune_binary_thresholds(self, y_true, y_prob):
+        import numpy as np
+        from sklearn.metrics import precision_score, recall_score, f1_score
+
+        y_true = np.array(y_true).astype(int)
+        y_prob = np.array(y_prob).astype(float)
+        if len(y_true) == 0:
+            return {
+                'suspect': round(float(max(0.30, self._XG_FALL_THRESHOLD - 0.12)), 4),
+                'confirm': round(float(self._XG_FALL_THRESHOLD), 4),
+                'high': round(float(max(0.75, self._XG_FALL_THRESHOLD + 0.12)), 4),
+                'grid_size': 0,
+                'confirm_metrics': {},
+                'suspect_metrics': {},
+            }
+
+        negatives = max(int(np.sum(y_true == 0)), 1)
+        thresholds = [round(t, 2) for t in np.arange(0.30, 0.81, 0.01)]
+
+        best_confirm = None
+        best_confirm_score = -1e9
+        best_confirm_metrics = {}
+        for thr in thresholds:
+            pred = (y_prob >= thr).astype(int)
+            tp = int(np.sum((pred == 1) & (y_true == 1)))
+            fp = int(np.sum((pred == 1) & (y_true == 0)))
+            rec = float(recall_score(y_true, pred, zero_division=0))
+            prec = float(precision_score(y_true, pred, zero_division=0))
+            f1 = float(f1_score(y_true, pred, zero_division=0))
+            fpr = fp / negatives
+            score = rec * 0.50 + f1 * 0.30 + prec * 0.20 - fpr * 0.35
+            if prec < 0.45:
+                score -= 0.10
+            if score > best_confirm_score:
+                best_confirm_score = score
+                best_confirm = thr
+                best_confirm_metrics = {
+                    'recall': round(rec, 4),
+                    'precision': round(prec, 4),
+                    'f1': round(f1, 4),
+                    'fpr': round(fpr, 4),
+                    'tp': tp,
+                    'fp': fp,
+                }
+
+        confirm_thr = float(best_confirm if best_confirm is not None else self._XG_FALL_THRESHOLD)
+        candidate_suspects = [t for t in thresholds if t < confirm_thr]
+        best_suspect = max(0.30, confirm_thr - 0.12)
+        best_suspect_score = -1e9
+        best_suspect_metrics = {}
+        for thr in candidate_suspects:
+            pred = (y_prob >= thr).astype(int)
+            tp = int(np.sum((pred == 1) & (y_true == 1)))
+            fp = int(np.sum((pred == 1) & (y_true == 0)))
+            rec = float(recall_score(y_true, pred, zero_division=0))
+            prec = float(precision_score(y_true, pred, zero_division=0))
+            f1 = float(f1_score(y_true, pred, zero_division=0))
+            fpr = fp / negatives
+            score = rec * 0.65 + prec * 0.15 + f1 * 0.20 - max(0.0, fpr - 0.25) * 0.50
+            if score > best_suspect_score:
+                best_suspect_score = score
+                best_suspect = thr
+                best_suspect_metrics = {
+                    'recall': round(rec, 4),
+                    'precision': round(prec, 4),
+                    'f1': round(f1, 4),
+                    'fpr': round(fpr, 4),
+                    'tp': tp,
+                    'fp': fp,
+                }
+
+        high_thr = max(0.75, confirm_thr + 0.12)
+        return {
+            'suspect': round(float(best_suspect), 4),
+            'confirm': round(float(confirm_thr), 4),
+            'high': round(float(high_thr), 4),
+            'grid_size': len(thresholds),
+            'confirm_metrics': best_confirm_metrics,
+            'suspect_metrics': best_suspect_metrics,
+        }
+
+    def _classify_failure_case_type(self, video_path, actual_label=None):
+        name = os.path.basename(str(video_path or '')).lower()
+        parent = os.path.basename(os.path.dirname(str(video_path or ''))).lower()
+        text_parts = [name, parent]
+        for suffix in ['.json', '.meta.json']:
+            sidecar = str(video_path or '') + suffix
+            if os.path.isfile(sidecar):
+                try:
+                    meta = self._read_json(sidecar, default={}) or {}
+                    for key in ['note', 'feedback_status', 'actual_label', 'predicted_label', 'source_saved_name']:
+                        val = meta.get(key)
+                        if val is not None:
+                            text_parts.append(str(val).lower())
+                except Exception:
+                    pass
+        text = ' '.join(text_parts)
+        if any(k in text for k in ['침대', 'bed']):
+            return 'bed_fall' if actual_label == 1 else 'bed_nonfall'
+        if any(k in text for k in ['의자', 'chair']):
+            return 'chair_fall' if actual_label == 1 else 'chair_nonfall'
+        if any(k in text for k in ['천천히', 'slow', '미끄', '굴러']):
+            return 'slow_fall' if actual_label == 1 else 'slow_nonfall'
+        if any(k in text for k in ['정면', '후면', '앞', '뒤', 'front', 'back']):
+            return 'front_back_fall' if actual_label == 1 else 'front_back_nonfall'
+        if parent in ['sit', 'stand', 'walk', 'run', 'lie', 'fall']:
+            return parent
+        return 'general_fall' if actual_label == 1 else 'general_nonfall'
+
+    def _build_binary_failure_report(self, cases):
+        false_negatives = [c for c in cases if c.get('actual') == 1 and c.get('predicted') == 0]
+        false_positives = [c for c in cases if c.get('actual') == 0 and c.get('predicted') == 1]
+        suspected_actual_falls = [c for c in cases if c.get('actual') == 1 and c.get('fall_band') == 'suspected']
+        suspected_actual_nonfalls = [c for c in cases if c.get('actual') == 0 and c.get('fall_band') == 'suspected']
+        by_type = {}
+        for case in false_negatives + false_positives:
+            ctype = case.get('case_type', 'unknown')
+            if ctype not in by_type:
+                by_type[ctype] = {'false_negative': 0, 'false_positive': 0}
+            if case.get('actual') == 1:
+                by_type[ctype]['false_negative'] += 1
+            else:
+                by_type[ctype]['false_positive'] += 1
+        motion_gate_failures = {}
+        band_counts = {'non-fall': 0, 'suspected': 0, 'confirmed': 0}
+        for case in cases:
+            band = case.get('fall_band', 'non-fall')
+            if band in band_counts:
+                band_counts[band] += 1
+            if case.get('motion_gate_passed') is False and case.get('actual') == 1:
+                ctype = case.get('case_type', 'unknown')
+                motion_gate_failures[ctype] = motion_gate_failures.get(ctype, 0) + 1
+        return {
+            'false_negative_count': len(false_negatives),
+            'false_positive_count': len(false_positives),
+            'by_type': by_type,
+            'band_counts': band_counts,
+            'motion_gate_failures_by_type': motion_gate_failures,
+            'suspected_actual_fall_count': len(suspected_actual_falls),
+            'suspected_actual_nonfall_count': len(suspected_actual_nonfalls),
+            'suspected_actual_falls': sorted(suspected_actual_falls, key=lambda x: x.get('score', 0.0), reverse=True)[:10],
+            'suspected_actual_nonfalls': sorted(suspected_actual_nonfalls, key=lambda x: x.get('score', 0.0), reverse=True)[:10],
+            'worst_false_negatives': sorted(false_negatives, key=lambda x: x.get('score', 0.0))[:10],
+            'highest_false_positives': sorted(false_positives, key=lambda x: x.get('score', 0.0), reverse=True)[:10],
+        }
 
     def _get_xg_fall_model(self):
         import sys as _sys
@@ -644,13 +1140,754 @@ class VideoAnalysis:
         return self.__class__._xg_fall_model_cache
 
     def _xg_posture_model_path(self):
-        return self._project_abspath(self._XG_POSTURE_MODEL_REL_PATH)
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-posture', 'xg_posture_model.pkl'),
+            self._project_abspath(self._XG_POSTURE_MODEL_REL_PATH),
+        )
+
+    def _xg_posture_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-posture', 'training_summary.json'),
+            self._project_abspath(self._XG_POSTURE_SUMMARY_REL_PATH),
+        )
+
+    def _xg_posture_occlusion_aux_model_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-posture-occlusion-aux', 'xg_posture_occlusion_aux_model.pkl'),
+            self._project_abspath(self._XG_POSTURE_OCCLUSION_AUX_MODEL_REL_PATH),
+        )
+
+    def _xg_posture_occlusion_aux_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('xg-posture-occlusion-aux', 'training_summary.json'),
+            self._project_abspath(self._XG_POSTURE_OCCLUSION_AUX_SUMMARY_REL_PATH),
+        )
 
     def _xg_posture_summary(self):
-        return self._read_json(self._project_abspath(self._XG_POSTURE_SUMMARY_REL_PATH), default={}) or {}
+        return self._read_json(self._xg_posture_summary_path(), default={}) or {}
+
+    def _xg_posture_class_label(self, summary=None):
+        summary = summary if summary is not None else self._xg_posture_summary()
+        n_classes = int(summary.get('n_classes', 0) or len(summary.get('active_classes', []) or []) or 0)
+        return f'{n_classes}-class' if n_classes > 0 else 'multi-class'
+
+    def _xg_posture_cv_accuracy(self, summary=None):
+        summary = summary if summary is not None else self._xg_posture_summary()
+        group_cv = summary.get('group_cv', {}) or {}
+        cv = summary.get('cv', {}) or {}
+        return float(summary.get('cv_accuracy', group_cv.get('accuracy', cv.get('accuracy', 0.0))) or 0.0)
+
+    def _xg_posture_sequence_cv(self, summary=None):
+        summary = summary if summary is not None else self._xg_posture_summary()
+        return summary.get('sequence_group_cv', {}) or {}
 
     def _xg_posture_available(self):
         return os.path.isfile(self._xg_posture_model_path())
+
+    def _xg_posture_occlusion_aux_available(self):
+        return os.path.isfile(self._xg_posture_occlusion_aux_model_path())
+
+    def _external_pose_dataset_root(self):
+        roots = self._external_pose_dataset_roots()
+        return roots[0] if roots else ''
+
+    def _external_pose_dataset_roots(self):
+        direct_path = self._EXTERNAL_POSE_DATASET_ROOT
+        if os.path.isdir(direct_path):
+            return [direct_path]
+
+        candidates = []
+        suffix_names = {'Training', 'Validation'}
+        for search_root in self._EXTERNAL_POSE_DATASET_SEARCH_ROOTS:
+            if not os.path.isdir(search_root):
+                continue
+            for root, dirs, files in os.walk(search_root):
+                root_norm = os.path.normpath(root)
+                parts = root_norm.split(os.sep)
+                if len(parts) >= 2 and parts[-2] in suffix_names and parts[-1] == '02.라벨링데이터':
+                    json_count = len([name for name in files if name.endswith('.json')])
+                    if json_count > 0:
+                        candidates.append((json_count, root_norm))
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return [root for _, root in candidates]
+
+    def _build_external_pose_feature_row(self, label, filename, image_meta, annotation):
+        import math
+        import numpy as np
+
+        width = float((image_meta or {}).get('width', 0) or 0)
+        height = float((image_meta or {}).get('height', 0) or 0)
+        bbox = list((annotation or {}).get('bbox', []) or [])
+        keypoints = list((annotation or {}).get('keypoints', []) or [])
+        if width <= 0 or height <= 0 or len(bbox) < 4 or len(keypoints) < 51:
+            return None
+
+        bx, by, bw, bh = [float(v or 0.0) for v in bbox[:4]]
+        if bw <= 1.0 or bh <= 1.0:
+            return None
+
+        kps = []
+        for idx in range(0, min(len(keypoints), 51), 3):
+            conf = float(keypoints[idx + 2] or 0.0) / 2.0
+            kps.append({
+                'x': float(keypoints[idx] or 0.0) / width,
+                'y': float(keypoints[idx + 1] or 0.0) / height,
+                'conf': conf,
+            })
+        if len(kps) < 17:
+            return None
+
+        def _kp_ok(kp, thr=0.25):
+            return isinstance(kp, dict) and kp.get('conf', 0.0) >= thr and (kp.get('x', 0.0) > 0.0 or kp.get('y', 0.0) > 0.0)
+
+        def _mid(p1, p2):
+            return {'x': (p1['x'] + p2['x']) / 2.0, 'y': (p1['y'] + p2['y']) / 2.0}
+
+        def _angle_vert(p1, p2):
+            dx = abs(float(p2['x']) - float(p1['x']))
+            dy = abs(float(p2['y']) - float(p1['y']))
+            if dx < 1e-9 and dy < 1e-9:
+                return 0.0
+            return math.degrees(math.atan2(dx, dy + 1e-9))
+
+        def _angle3(p1, p2, p3):
+            v1 = [float(p1['x']) - float(p2['x']), float(p1['y']) - float(p2['y'])]
+            v2 = [float(p3['x']) - float(p2['x']), float(p3['y']) - float(p2['y'])]
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            m1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
+            m2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
+            if m1 < 1e-9 or m2 < 1e-9:
+                return 180.0
+            cs = max(-1.0, min(1.0, dot / (m1 * m2)))
+            return math.degrees(math.acos(cs))
+
+        ls, rs = kps[5], kps[6]
+        lh, rh = kps[11], kps[12]
+        lk, rk = kps[13], kps[14]
+        la, ra = kps[15], kps[16]
+        nose = kps[0]
+
+        pose_tilt = 0.0
+        center_y = min(1.0, max(0.0, (by + bh / 2.0) / height))
+        if _kp_ok(ls) and _kp_ok(rs) and _kp_ok(lh) and _kp_ok(rh):
+            sh_mid = _mid(ls, rs)
+            hp_mid = _mid(lh, rh)
+            pose_tilt = _angle_vert(hp_mid, sh_mid)
+            center_y = min(1.0, max(0.0, (sh_mid['y'] + hp_mid['y']) / 2.0))
+
+        foot_y = None
+        if _kp_ok(la) and _kp_ok(ra):
+            foot_y = max(la['y'], ra['y'])
+        elif _kp_ok(la):
+            foot_y = la['y']
+        elif _kp_ok(ra):
+            foot_y = ra['y']
+
+        pose_hr = bh / height
+        if _kp_ok(nose) and foot_y is not None:
+            pose_hr = abs(float(nose['y']) - float(foot_y))
+
+        knee_angles = []
+        knee_supports = []
+        if _kp_ok(lh) and _kp_ok(lk) and _kp_ok(la):
+            knee_angles.append(_angle3(lh, lk, la))
+        if _kp_ok(rh) and _kp_ok(rk) and _kp_ok(ra):
+            knee_angles.append(_angle3(rh, rk, ra))
+        if knee_angles:
+            knee_supports.extend(knee_angles)
+        pose_knee = float(min(knee_angles)) if knee_angles else 180.0
+        pose_knee_support = float(max(knee_supports)) if knee_supports else 180.0
+
+        valid_xs = [kp['x'] for kp in kps if _kp_ok(kp)]
+        pose_spread = float(np.std(valid_xs)) if len(valid_xs) >= 3 else max((bw / width) * 0.18, 0.0)
+        upper_pts = [kp for kp in [kps[5], kps[6], kps[7], kps[8]] if _kp_ok(kp)]
+        upper_body_motion = float(np.std([p['y'] for p in upper_pts])) if len(upper_pts) >= 2 else 0.0
+        visible = [kp['conf'] for kp in kps if _kp_ok(kp, 0.01)]
+        avg_conf = float(np.mean(visible)) if visible else 0.0
+        n_points = len(visible)
+        floor_prox = min(1.0, max(0.0, (by + bh) / height))
+        vert_horiz_ratio = (bh / max(bw, 1.0))
+        floor_contact_ratio = 1.0 if center_y >= 0.78 else 0.0
+        post_floor_stability = floor_contact_ratio
+        spread_after = pose_spread
+        tilt_height_collapse = pose_tilt * max(0.0, 0.30 - pose_hr)
+        shoulder_width = abs(ls['x'] - rs['x']) if _kp_ok(ls) and _kp_ok(rs) else 0.0
+        hip_width = abs(lh['x'] - rh['x']) if _kp_ok(lh) and _kp_ok(rh) else 0.0
+        ankle_width = abs(la['x'] - ra['x']) if _kp_ok(la) and _kp_ok(ra) else 0.0
+        knee_width = abs(lk['x'] - rk['x']) if _kp_ok(lk) and _kp_ok(rk) else 0.0
+        wrist_width = abs(kps[9]['x'] - kps[10]['x']) if _kp_ok(kps[9]) and _kp_ok(kps[10]) else 0.0
+        foot_y_diff = abs(la['y'] - ra['y']) if _kp_ok(la) and _kp_ok(ra) else 0.0
+        shoulder_hip_ratio = shoulder_width / (hip_width + 1e-9) if hip_width > 0 else 0.0
+        ankle_hip_ratio = ankle_width / (hip_width + 1e-9) if hip_width > 0 else 0.0
+        wrist_shoulder_ratio = wrist_width / (shoulder_width + 1e-9) if shoulder_width > 0 else 0.0
+        limb_extension_ratio = ankle_width / (pose_hr + 1e-9) if pose_hr > 0 else 0.0
+        body_compactness = (pose_spread + hip_width + shoulder_width) / (pose_hr + 1e-9) if pose_hr > 0 else 0.0
+        knee_asymmetry = abs(knee_angles[0] - knee_angles[1]) if len(knee_angles) >= 2 else 0.0
+        elbow_angles = []
+        if _kp_ok(ls) and _kp_ok(kps[7]) and _kp_ok(kps[9]):
+            elbow_angles.append(_angle3(ls, kps[7], kps[9]))
+        if _kp_ok(rs) and _kp_ok(kps[8]) and _kp_ok(kps[10]):
+            elbow_angles.append(_angle3(rs, kps[8], kps[10]))
+        elbow_bend_mean = float(np.mean(elbow_angles)) if elbow_angles else 180.0
+        arm_extension_ratio = elbow_bend_mean / 180.0
+        lower_body_visibility = 1.0 if knee_angles else 0.0
+        straight_leg_ratio = 1.0 if pose_knee >= 150.0 else 0.0
+        support_leg_ratio = 1.0 if pose_knee_support >= 150.0 else 0.0
+        bent_leg_ratio = 1.0 if pose_knee <= 125.0 else 0.0
+
+        row = {
+            'video': filename,
+            'posture': label,
+            'source': 'external-image',
+            'center_dy': 0.0,
+            'height_ratio': float(bh / height),
+            'aspect_change': 0.0,
+            'stillness': 1.0,
+            'floor_proximity': float(floor_prox),
+            'area_change': 0.0,
+            'vert_horiz_ratio': float(vert_horiz_ratio),
+            'max_down_speed': 0.0,
+            'avg_conf': float(avg_conf),
+            'n_points': float(n_points),
+            'pose_tilt_mean': float(pose_tilt),
+            'pose_tilt_max': float(pose_tilt),
+            'pose_height_ratio_mean': float(pose_hr),
+            'pose_height_ratio_min': float(pose_hr),
+            'pose_knee_bend_mean': float(pose_knee),
+            'pose_knee_bend_min': float(pose_knee),
+            'pose_knee_support_mean': float(pose_knee_support),
+            'pose_knee_support_min': float(pose_knee_support),
+            'lower_body_visibility': float(lower_body_visibility),
+            'straight_leg_ratio': float(straight_leg_ratio),
+            'support_leg_ratio': float(support_leg_ratio),
+            'bent_leg_ratio': float(bent_leg_ratio),
+            'pose_spread_mean': float(pose_spread),
+            'pose_spread_max': float(pose_spread),
+            'shoulder_width': float(shoulder_width),
+            'hip_width': float(hip_width),
+            'ankle_width': float(ankle_width),
+            'wrist_width': float(wrist_width),
+            'knee_width': float(knee_width),
+            'foot_y_diff': float(foot_y_diff),
+            'shoulder_hip_ratio': float(shoulder_hip_ratio),
+            'ankle_hip_ratio': float(ankle_hip_ratio),
+            'wrist_shoulder_ratio': float(wrist_shoulder_ratio),
+            'limb_extension_ratio': float(limb_extension_ratio),
+            'body_compactness': float(body_compactness),
+            'knee_asymmetry': float(knee_asymmetry),
+            'elbow_bend_mean': float(elbow_bend_mean),
+            'arm_extension_ratio': float(arm_extension_ratio),
+            'pose_descent_mean': 0.0,
+            'pose_descent_max': 0.0,
+            'pose_change_mean': 0.0,
+            'pose_change_max': 0.0,
+            'descent_duration': 0.0,
+            'oscillation_count': 0.0,
+            'speed_std': 0.0,
+            'post_descent_stillness': 1.0,
+            'upper_body_motion': float(upper_body_motion),
+            'time_to_max_down_speed': 0.0,
+            'time_from_peak_to_stillness': 0.0,
+            'pre_descent_stillness': 1.0,
+            'post_peak_recovery_ratio': 0.0,
+            'step_period_est': 0.0,
+            'knee_angle_cycle_strength': 0.0,
+            'center_y_periodicity': 0.0,
+            'tilt_change_duration': 0.0,
+            'spread_after_descent': float(spread_after),
+            'floor_proximity_slope': 0.0,
+            'floor_contact_ratio': float(floor_contact_ratio),
+            'height_drop_persistence': 0.0,
+            'collapse_impulse': 0.0,
+            'post_floor_stability': float(post_floor_stability),
+            'slow_descent_ratio': 0.0,
+            'tilt_height_collapse': float(tilt_height_collapse),
+        }
+        return self._augment_xg_behavior_features(row)
+
+    def _aihub61_label_from_zip_name(self, zip_path):
+        name = os.path.basename(str(zip_path or ''))
+        if '걷기' in name:
+            return 'walk'
+        if '뛰기' in name:
+            return 'run'
+        if '앉기' in name:
+            return 'sit'
+        if '눕기' in name:
+            return 'lie'
+        return ''
+
+    def _aihub61_label_zip_paths(self):
+        search_root = self._AIHUB61_POSE_DATASET_SEARCH_ROOT
+        if not os.path.isdir(search_root):
+            return []
+        wanted = ('걷기', '뛰기', '앉기', '눕기')
+        found = []
+        for root, dirs, files in os.walk(search_root):
+            for file_name in files:
+                if not file_name.endswith('.zip'):
+                    continue
+                if not any(token in file_name for token in wanted):
+                    continue
+                label = self._aihub61_label_from_zip_name(file_name)
+                if label:
+                    found.append((label, os.path.join(root, file_name)))
+        found.sort(key=lambda item: (
+            item[0],
+            -int(os.path.getsize(item[1]) if os.path.exists(item[1]) else 0),
+            item[1],
+        ))
+        return found
+
+    def _aihub61_convert_keypoints_to_coco17(self, raw_keypoints, invisible_keys=None):
+        invisible = {str(key) for key in (invisible_keys or [])}
+        points = []
+        if isinstance(raw_keypoints, dict):
+            for idx in range(27):
+                value = raw_keypoints.get(str(idx), [0, 0])
+                try:
+                    x = float((value or [0, 0])[0] or 0.0)
+                    y = float((value or [0, 0])[1] or 0.0)
+                except Exception:
+                    x, y = 0.0, 0.0
+                conf = 0.0 if str(idx) in invisible or (x == 0.0 and y == 0.0) else 2.0
+                points.append((x, y, conf))
+        else:
+            flat = list(raw_keypoints or [])
+            if len(flat) < 81:
+                return []
+            for idx in range(27):
+                base = idx * 3
+                try:
+                    x = float(flat[base] or 0.0)
+                    y = float(flat[base + 1] or 0.0)
+                    conf = float(flat[base + 2] or 0.0)
+                except Exception:
+                    x, y, conf = 0.0, 0.0, 0.0
+                if str(idx) in invisible:
+                    conf = 0.0
+                points.append((x, y, conf))
+
+        # AI-Hub 61 has 27 joints. Convert the subset needed by the existing
+        # COCO-17 feature builder; ears are unavailable and marked invisible.
+        mapping = {
+            0: 24,  # nose
+            1: 25,  # left eye
+            2: 26,  # right eye
+            5: 14,  # left shoulder
+            6: 19,  # right shoulder
+            7: 15,  # left elbow
+            8: 20,  # right elbow
+            9: 16,  # left wrist
+            10: 21,  # right wrist
+            11: 1,  # left hip
+            12: 6,  # right hip
+            13: 2,  # left knee
+            14: 7,  # right knee
+            15: 3,  # left ankle
+            16: 8,  # right ankle
+        }
+        coco = []
+        for coco_idx in range(17):
+            src_idx = mapping.get(coco_idx)
+            if src_idx is None or src_idx >= len(points):
+                coco.extend([0.0, 0.0, 0.0])
+                continue
+            x, y, conf = points[src_idx]
+            coco.extend([x, y, conf])
+        return coco
+
+    def _aihub61_infer_bbox_from_keypoints(self, coco_keypoints, width, height):
+        xs = []
+        ys = []
+        for idx in range(0, len(coco_keypoints), 3):
+            try:
+                x = float(coco_keypoints[idx] or 0.0)
+                y = float(coco_keypoints[idx + 1] or 0.0)
+                conf = float(coco_keypoints[idx + 2] or 0.0)
+            except Exception:
+                continue
+            if conf > 0.0 and (x > 0.0 or y > 0.0):
+                xs.append(x)
+                ys.append(y)
+        if not xs or not ys:
+            return []
+        pad_x = max(8.0, (max(xs) - min(xs)) * 0.10)
+        pad_y = max(8.0, (max(ys) - min(ys)) * 0.10)
+        x1 = max(0.0, min(xs) - pad_x)
+        y1 = max(0.0, min(ys) - pad_y)
+        x2 = min(float(width), max(xs) + pad_x)
+        y2 = min(float(height), max(ys) + pad_y)
+        return [x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)]
+
+    def _build_aihub61_pose_feature_row(self, label, filename, data):
+        image_meta = {}
+        if isinstance(data.get('images'), list) and data.get('images'):
+            image_meta = dict(data.get('images')[0] or {})
+        elif isinstance(data.get('metadata'), dict):
+            image_meta = dict(data.get('metadata') or {})
+        elif isinstance(data.get('videos'), list) and data.get('videos'):
+            image_meta = dict(data.get('videos')[0] or {})
+        width = float(image_meta.get('width', 0) or 0)
+        height = float(image_meta.get('height', 0) or 0)
+        if width <= 0 or height <= 0:
+            return None
+
+        candidates = []
+        for ann in data.get('annotations', []) or []:
+            raw_keypoints = ann.get('keypoints')
+            coco = self._aihub61_convert_keypoints_to_coco17(raw_keypoints, ann.get('invisible_keys', []))
+            if len(coco) < 51:
+                continue
+            bbox = list(ann.get('bbox', []) or [])
+            if len(bbox) < 4:
+                bbox = self._aihub61_infer_bbox_from_keypoints(coco, width, height)
+            if len(bbox) < 4:
+                continue
+            try:
+                area = float(bbox[2] or 0.0) * float(bbox[3] or 0.0)
+            except Exception:
+                area = 0.0
+            candidates.append({
+                'area': area,
+                'annotation': {
+                    'bbox': bbox,
+                    'keypoints': coco,
+                },
+            })
+        if not candidates:
+            return None
+        selected = max(candidates, key=lambda item: item.get('area', 0.0))['annotation']
+        return self._build_external_pose_feature_row(label, filename, image_meta, selected)
+
+    def _load_aihub61_pose_training_rows(self, feature_cols, class_limits=None):
+        import collections
+        import json
+        import zipfile
+
+        limits = dict(class_limits or self._AIHUB61_POSE_CLASS_TARGETS)
+        result = {
+            'rows': [],
+            'counts': {},
+            'scanned_files': 0,
+            'used_files': 0,
+            'zip_files': [],
+            'skipped_files': [],
+            'selected_examples': {},
+            'rule_distribution': {},
+            'action_distribution': {},
+        }
+        counts = collections.Counter()
+        rule_counts = collections.Counter()
+        action_counts = collections.Counter()
+        seen_clips = collections.defaultdict(set)
+
+        for label, zip_path in self._aihub61_label_zip_paths():
+            limit = int(limits.get(label, 0) or 0)
+            if limit <= 0:
+                continue
+            result['zip_files'].append(zip_path)
+            try:
+                with zipfile.ZipFile(zip_path) as archive:
+                    names = [
+                        name for name in archive.namelist()
+                        if name.endswith('.json') and '/._' not in name and not os.path.basename(name).startswith('._')
+                    ]
+                    names.sort(key=lambda name: (name.endswith('.jpg.json'), name))
+                    for name in names:
+                        if counts[label] >= limit:
+                            break
+                        clip_id = os.path.dirname(name)
+                        if clip_id in seen_clips[label]:
+                            continue
+                        result['scanned_files'] += 1
+                        try:
+                            with archive.open(name) as file:
+                                data = json.loads(file.read().decode('utf-8'))
+                        except Exception:
+                            result['skipped_files'].append({'file': name, 'reason': 'json-read-failed'})
+                            continue
+                        row = self._build_aihub61_pose_feature_row(label, name, data)
+                        if row is None:
+                            result['skipped_files'].append({'file': name, 'reason': 'feature-build-failed'})
+                            continue
+                        normalized = {
+                            'video': f'aihub61:{name}',
+                            'posture': label,
+                            'source': 'external-aihub61-label',
+                        }
+                        for col in feature_cols:
+                            normalized[col] = float(row.get(col, 0.0) or 0.0)
+                        result['rows'].append(normalized)
+                        counts[label] += 1
+                        result['used_files'] += 1
+                        seen_clips[label].add(clip_id)
+                        rule_counts[f'aihub61:{label}'] += 1
+                        action_counts[label] += 1
+                        result['selected_examples'].setdefault(label, [])
+                        if len(result['selected_examples'][label]) < 5:
+                            result['selected_examples'][label].append({
+                                'file': name,
+                                'action': label,
+                                'object': '',
+                                'rule': f'aihub61:{label}',
+                                'confidence': 1.0,
+                            })
+            except Exception as exc:
+                result['skipped_files'].append({'file': zip_path, 'reason': str(exc)})
+
+        result['counts'] = {key: int(val) for key, val in counts.items() if val > 0}
+        result['rule_distribution'] = dict(sorted(rule_counts.items(), key=lambda item: (-item[1], item[0])))
+        result['action_distribution'] = dict(sorted(action_counts.items(), key=lambda item: (-item[1], item[0])))
+        if len(result['skipped_files']) > 20:
+            result['skipped_files'] = result['skipped_files'][:20]
+        return result
+
+    def _score_external_pose_label(self, action_name, object_name, row):
+        action_name = str(action_name or '').strip().lower()
+        object_name = str(object_name or '').strip().lower()
+        if len(action_name) == 0 or not isinstance(row, dict):
+            return None
+
+        direct_label = self._EXTERNAL_POSE_DIRECT_ACTION_MAP.get(action_name)
+        if direct_label:
+            direct_conf = {
+                'sit': 1.0,
+                'walk': 1.0,
+                'lie': 0.99,
+                'stand': 0.97,
+            }.get(direct_label, 0.95)
+            return {
+                'label': direct_label,
+                'rule': f'direct:{action_name}',
+                'confidence': direct_conf,
+            }
+
+        if action_name not in self._EXTERNAL_POSE_WEAK_ACTIONS:
+            return None
+
+        pose_tilt = float(row.get('pose_tilt_mean', 0.0) or 0.0)
+        pose_hr = float(row.get('pose_height_ratio_mean', 0.0) or 0.0)
+        pose_knee = float(row.get('pose_knee_bend_mean', 180.0) or 180.0)
+        vert_horiz = float(row.get('vert_horiz_ratio', 0.0) or 0.0)
+        floor_prox = float(row.get('floor_proximity', 0.0) or 0.0)
+
+        if object_name in self._EXTERNAL_POSE_SIT_OBJECTS:
+            if pose_knee <= 135.0 and pose_tilt <= 30.0 and pose_hr <= 0.62 and vert_horiz <= 2.45:
+                sit_conf = 0.72
+                sit_conf += max(0.0, min((135.0 - pose_knee) / 55.0, 0.14))
+                sit_conf += max(0.0, min((0.62 - pose_hr) / 0.24, 0.08))
+                sit_conf += max(0.0, min((30.0 - pose_tilt) / 30.0, 0.06))
+                if action_name == 'straddle':
+                    sit_conf += 0.03
+                return {
+                    'label': 'sit',
+                    'rule': 'weak:sit-object-pose',
+                    'confidence': round(min(sit_conf, 0.94), 4),
+                }
+
+        return None
+
+    def _load_external_pose_training_rows(self, feature_cols):
+        import collections
+
+        dataset_roots = self._external_pose_dataset_roots()
+        dataset_root = dataset_roots[0] if dataset_roots else ''
+        result = {
+            'rows': [],
+            'counts': {},
+            'scanned_files': 0,
+            'used_files': 0,
+            'skipped_files': [],
+            'dataset_root': dataset_root,
+            'rule_distribution': {},
+            'action_distribution': {},
+            'selected_examples': {},
+            'dataset_roots': dataset_roots,
+        }
+        if len(dataset_roots) == 0:
+            return result
+
+        counts = collections.Counter()
+        rule_counts = collections.Counter()
+        action_counts = collections.Counter()
+        limits = dict(self._EXTERNAL_POSE_CLASS_LIMITS)
+        all_candidates = []
+        json_paths = []
+        for scan_root in dataset_roots:
+            for root, dirs, files in os.walk(scan_root):
+                for file_name in files:
+                    if file_name.endswith('.json'):
+                        json_paths.append((scan_root, os.path.join(root, file_name)))
+        for scan_root, path in sorted(json_paths, key=lambda item: item[1]):
+            name = os.path.relpath(path, scan_root)
+            result['scanned_files'] += 1
+            try:
+                data = self._read_json(path, default={}) or {}
+            except Exception:
+                continue
+            action_map = {}
+            for item in data.get('action_categories', []) or []:
+                try:
+                    action_map[int(item.get('id'))] = str(item.get('name', '')).strip().lower()
+                except Exception:
+                    continue
+            target_center = None
+            target_actions = []
+            for action in data.get('actions', []) or []:
+                try:
+                    action_name = action_map.get(int(action.get('name', -1)), '')
+                except Exception:
+                    action_name = ''
+                object_name = ''
+                try:
+                    object_id = int(action.get('object', -1))
+                except Exception:
+                    object_id = -1
+                for category in data.get('Categories', []) or []:
+                    try:
+                        if int(category.get('id', -1)) == object_id:
+                            object_name = str(category.get('name', '')).strip().lower()
+                            break
+                    except Exception:
+                        continue
+                if len(action_name) == 0:
+                    continue
+                target_actions.append({'action': action_name, 'object': object_name})
+                boxes_h = list(action.get('boxes_h', []) or [])
+                if target_center is None and len(boxes_h) >= 2:
+                    try:
+                        width = float(((data.get('images', [{}]) or [{}])[0]).get('width', 0) or 0)
+                        height = float(((data.get('images', [{}]) or [{}])[0]).get('height', 0) or 0)
+                        if width > 0 and height > 0:
+                            target_center = (float(boxes_h[0]) / width, float(boxes_h[1]) / height)
+                    except Exception:
+                        target_center = None
+            if len(target_actions) == 0:
+                continue
+
+            ann_candidates = []
+            for ann in data.get('annotations', []) or []:
+                if int(ann.get('category_id', -1) or -1) != 1:
+                    continue
+                keypoints = list(ann.get('keypoints', []) or [])
+                if len(keypoints) < 51:
+                    continue
+                bbox = list(ann.get('bbox', []) or [])
+                if len(bbox) < 4:
+                    continue
+                bx, by, bw, bh = [float(v or 0.0) for v in bbox[:4]]
+                cx = bx + bw / 2.0
+                cy = by + bh / 2.0
+                ann_candidates.append({'annotation': ann, 'cx': cx, 'cy': cy})
+            if len(ann_candidates) == 0:
+                result['skipped_files'].append({'file': name, 'reason': 'no-person-keypoints'})
+                continue
+
+            selected = ann_candidates[0]['annotation']
+            if target_center is not None:
+                width = float(((data.get('images', [{}]) or [{}])[0]).get('width', 0) or 0)
+                height = float(((data.get('images', [{}]) or [{}])[0]).get('height', 0) or 0)
+                if width > 0 and height > 0:
+                    selected = min(
+                        ann_candidates,
+                        key=lambda item: (item['cx'] / width - target_center[0]) ** 2 + (item['cy'] / height - target_center[1]) ** 2,
+                    )['annotation']
+
+            image_meta = ((data.get('images', [{}]) or [{}])[0]) if data.get('images') else {}
+            row = self._build_external_pose_feature_row('external', name, image_meta, selected)
+            if row is None:
+                result['skipped_files'].append({'file': name, 'reason': 'feature-build-failed'})
+                continue
+            best_match = None
+            for action_info in target_actions:
+                scored = self._score_external_pose_label(action_info.get('action', ''), action_info.get('object', ''), row)
+                if scored is None:
+                    continue
+                if best_match is None or float(scored.get('confidence', 0.0) or 0.0) > float(best_match.get('confidence', 0.0) or 0.0):
+                    best_match = {
+                        **scored,
+                        'action': action_info.get('action', ''),
+                        'object': action_info.get('object', ''),
+                    }
+            if best_match is None:
+                continue
+
+            normalized = {
+                'video': row['video'],
+                'posture': best_match['label'],
+                'source': f"external-image:{best_match['rule']}",
+            }
+            for col in feature_cols:
+                normalized[col] = float(row.get(col, 0.0) or 0.0)
+            all_candidates.append({
+                'row': normalized,
+                'file': name,
+                'label': best_match['label'],
+                'action': best_match['action'],
+                'object': best_match['object'],
+                'rule': best_match['rule'],
+                'confidence': float(best_match.get('confidence', 0.0) or 0.0),
+            })
+
+        selected_rows = []
+        for label, limit in limits.items():
+            label_candidates = [item for item in all_candidates if item.get('label') == label]
+            label_candidates.sort(key=lambda item: (-float(item.get('confidence', 0.0) or 0.0), str(item.get('file', ''))))
+            chosen = label_candidates[:max(int(limit or 0), 0)] if int(limit or 0) > 0 else []
+            for item in chosen:
+                selected_rows.append(item['row'])
+                counts[label] += 1
+                rule_counts[item.get('rule', 'unknown')] += 1
+                action_counts[item.get('action', 'unknown')] += 1
+                result['used_files'] += 1
+                result['selected_examples'].setdefault(label, [])
+                if len(result['selected_examples'][label]) < 5:
+                    result['selected_examples'][label].append({
+                        'file': item.get('file', ''),
+                        'action': item.get('action', ''),
+                        'object': item.get('object', ''),
+                        'rule': item.get('rule', ''),
+                        'confidence': round(float(item.get('confidence', 0.0) or 0.0), 4),
+                    })
+
+        remaining_aihub61_limits = {}
+        for label, target in self._AIHUB61_POSE_CLASS_TARGETS.items():
+            remaining_aihub61_limits[label] = max(int(target or 0) - int(counts.get(label, 0) or 0), 0)
+        aihub61_pose = self._load_aihub61_pose_training_rows(feature_cols, remaining_aihub61_limits)
+        if aihub61_pose.get('rows'):
+            selected_rows.extend(aihub61_pose.get('rows', []))
+            for label, value in (aihub61_pose.get('counts') or {}).items():
+                counts[label] += int(value or 0)
+            for rule, value in (aihub61_pose.get('rule_distribution') or {}).items():
+                rule_counts[rule] += int(value or 0)
+            for action, value in (aihub61_pose.get('action_distribution') or {}).items():
+                action_counts[action] += int(value or 0)
+            result['used_files'] += int(aihub61_pose.get('used_files', 0) or 0)
+            for label, examples in (aihub61_pose.get('selected_examples') or {}).items():
+                result['selected_examples'].setdefault(label, [])
+                for example in examples:
+                    if len(result['selected_examples'][label]) >= 5:
+                        break
+                    result['selected_examples'][label].append(example)
+        result['aihub61_dataset'] = {
+            'search_root': self._AIHUB61_POSE_DATASET_SEARCH_ROOT,
+            'class_targets': dict(self._AIHUB61_POSE_CLASS_TARGETS),
+            'remaining_limits': remaining_aihub61_limits,
+            'zip_files': aihub61_pose.get('zip_files', []),
+            'class_distribution': aihub61_pose.get('counts', {}),
+            'used_files': int(aihub61_pose.get('used_files', 0) or 0),
+            'scanned_files': int(aihub61_pose.get('scanned_files', 0) or 0),
+            'skipped_files': aihub61_pose.get('skipped_files', []),
+        }
+
+        result['rows'] = selected_rows
+        result['counts'] = {key: int(val) for key, val in counts.items() if val > 0}
+        result['rule_distribution'] = dict(sorted(rule_counts.items(), key=lambda item: (-item[1], item[0])))
+        result['action_distribution'] = dict(sorted(action_counts.items(), key=lambda item: (-item[1], item[0])))
+        if len(result['skipped_files']) > 20:
+            result['skipped_files'] = result['skipped_files'][:20]
+        return result
 
     def _get_xg_posture_model(self):
         import sys as _sys
@@ -663,10 +1900,30 @@ class VideoAnalysis:
         except OSError:
             raise Exception(f'XG-Posture 모델 파일을 찾을 수 없습니다: {model_path}')
         if self.__class__._xg_posture_model_cache is None or self.__class__._xg_posture_model_mtime != mtime or self.__class__._xg_posture_model_path_cache != model_path:
-            self.__class__._xg_posture_model_cache = joblib.load(model_path)
+            self.__class__._xg_posture_model_cache = self._limit_inference_threads(joblib.load(model_path))
             self.__class__._xg_posture_model_mtime = mtime
             self.__class__._xg_posture_model_path_cache = model_path
         return self.__class__._xg_posture_model_cache
+
+    def _get_xg_posture_occlusion_aux_model(self):
+        import sys as _sys
+        if '/opt/app/my_libs' not in _sys.path:
+            _sys.path.insert(0, '/opt/app/my_libs')
+        import joblib
+        model_path = self._xg_posture_occlusion_aux_model_path()
+        try:
+            mtime = os.path.getmtime(model_path)
+        except OSError:
+            raise Exception(f'XG-Posture 하체 가림 보조 모델 파일을 찾을 수 없습니다: {model_path}')
+        if (
+            self.__class__._xg_posture_occlusion_aux_model_cache is None
+            or self.__class__._xg_posture_occlusion_aux_model_mtime != mtime
+            or self.__class__._xg_posture_occlusion_aux_model_path_cache != model_path
+        ):
+            self.__class__._xg_posture_occlusion_aux_model_cache = self._limit_inference_threads(joblib.load(model_path))
+            self.__class__._xg_posture_occlusion_aux_model_mtime = mtime
+            self.__class__._xg_posture_occlusion_aux_model_path_cache = model_path
+        return self.__class__._xg_posture_occlusion_aux_model_cache
 
     # ── FN-0009: Intake directory helpers for 3-Level label system ────
     def _intake_base_dir(self):
@@ -740,20 +1997,25 @@ class VideoAnalysis:
         except OSError:
             raise Exception(f'RF 모델 파일을 찾을 수 없습니다: {model_path}')
         if self.__class__._rf_model_cache is None or self.__class__._rf_model_mtime != mtime or self.__class__._rf_model_path_cache != model_path:
-            self.__class__._rf_model_cache = joblib.load(model_path)
+            self.__class__._rf_model_cache = self._limit_inference_threads(joblib.load(model_path))
             self.__class__._rf_model_mtime = mtime
             self.__class__._rf_model_path_cache = model_path
         return self.__class__._rf_model_cache
 
     @classmethod
     def _get_rf_yolo_model(cls):
-        """Load YOLO model once and cache at class level."""
+        """Load YOLO model once and cache at class level. Prefers ONNX for faster CPU inference."""
         if cls._rf_yolo_cache is None:
             import sys as _sys
             if '/opt/app/my_libs' not in _sys.path:
                 _sys.path.insert(0, '/opt/app/my_libs')
             from ultralytics import YOLO
-            cls._rf_yolo_cache = YOLO(cls._RF_YOLO_MODEL)
+            # Prefer ONNX model for ~30% faster CPU inference
+            onnx_path = cls._RF_YOLO_ONNX_MODEL
+            if os.path.isfile(onnx_path):
+                cls._rf_yolo_cache = YOLO(onnx_path, task='pose')
+            else:
+                cls._rf_yolo_cache = YOLO(cls._RF_YOLO_MODEL)
         return cls._rf_yolo_cache
 
     @classmethod
@@ -773,10 +2035,19 @@ class VideoAnalysis:
 
     # FN-0004: RF-Pose pipeline methods
     def _rf_pose_model_path(self):
-        return self._project_abspath(self._RF_POSE_MODEL_REL_PATH)
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-pose', 'rf_pose_model.pkl'),
+            self._project_abspath(self._RF_POSE_MODEL_REL_PATH),
+        )
+
+    def _rf_pose_summary_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('rf-pose', 'training_summary.json'),
+            self._project_abspath(self._RF_POSE_SUMMARY_REL_PATH),
+        )
 
     def _rf_pose_summary(self):
-        return self._read_json(self._project_abspath(self._RF_POSE_SUMMARY_REL_PATH), default={}) or {}
+        return self._read_json(self._rf_pose_summary_path(), default={}) or {}
 
     def _rf_pose_pipeline_available(self):
         return os.path.isfile(self._rf_pose_model_path())
@@ -907,11 +2178,13 @@ class VideoAnalysis:
         score = fall_prob if fall_prob is not None else float(pred)
 
         # Adaptive threshold
-        _effective_threshold = self.fall_decision_threshold
+        _rf_confirm_threshold = self._rf_confirm_threshold()
+        _short_clip_threshold_max = self._rf_short_clip_threshold_max()
+        _effective_threshold = _rf_confirm_threshold
         if _is_short_clip and _n_det_frames >= self._SHORT_CLIP_MIN_FRAMES:
             _range = self._SHORT_CLIP_N_FRAMES - self._SHORT_CLIP_MIN_FRAMES
             _ratio = (_n_det_frames - self._SHORT_CLIP_MIN_FRAMES) / max(_range, 1)
-            _effective_threshold = self._SHORT_CLIP_THRESHOLD_MAX - _ratio * (self._SHORT_CLIP_THRESHOLD_MAX - self.fall_decision_threshold)
+            _effective_threshold = _short_clip_threshold_max - _ratio * (_short_clip_threshold_max - _rf_confirm_threshold)
             _confidence_level = 'medium' if _n_det_frames >= 5 else 'low'
 
         fall_detected = score >= _effective_threshold
@@ -986,7 +2259,11 @@ class VideoAnalysis:
             pred = 0
         risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
 
-        behavior = self._predict_behavior_from_runtime(None, fall_detected, allow_fallback=False)
+        behavior = self._predict_behavior_from_runtime(
+            {'fall_probability': round(score, 4), 'features': combined_feat},
+            fall_detected,
+            allow_fallback=False,
+        )
         if behavior is not None:
             behavior_class, behavior_label = behavior.get('code', 'non-fall'), behavior.get('label', '비낙상')
         elif fall_detected:
@@ -1043,7 +2320,7 @@ class VideoAnalysis:
                 'device': _device_used,
                 'extracted_frames': len(frames),
                 'detected_person_frames': len(det_rows),
-                'features': {k: round(float(v), 4) if isinstance(v, float) else v for k, v in combined_feat.items()},
+                'features': {k: (None if (lambda fv: fv != fv or fv == float('inf') or fv == float('-inf'))(float(v)) else round(float(v), 4)) if isinstance(v, (int, float)) else v for k, v in combined_feat.items()},
                 'pose_features': pose_feat,
                 'motion_guard': {'applied': _motion_guard_applied, 'is_stationary': _is_stationary, 'checks': _motion_checks},
                 'short_clip': {'is_short_clip': _is_short_clip, 'n_det_frames': _n_det_frames, 'effective_threshold': round(_effective_threshold, 4), 'confidence_level': _confidence_level, 'is_realtime': _is_realtime},
@@ -1154,23 +2431,1438 @@ class VideoAnalysis:
         mean_diff = float(np.mean(diffs))
         return mean_diff < threshold
 
+    def _finite_float(self, value, default=0.0):
+        try:
+            import math
+            val = float(value)
+            return val if math.isfinite(val) else float(default)
+        except Exception:
+            return float(default)
+
+    def _facial_aux_default(self, reason='not_checked', description='표정 분석을 실행하지 않았습니다.'):
+        return {
+            'enabled': os.environ.get('FACIAL_AUX_DISABLE', '').lower() not in ('1', 'true', 'yes'),
+            'model': 'emotion-ferplus-8+opencv-face',
+            'emotion_model': 'emotion-ferplus-8.onnx',
+            'emotion_model_source': 'ONNX Model Zoo FER+ pretrained emotion classifier',
+            'available': False,
+            'applied': False,
+            'state': 'unavailable',
+            'label': '표정 분석 불가',
+            'reason': reason,
+            'description': description,
+            'face_detected': False,
+            'facial_emotion': 'unavailable',
+            'facial_confidence': 0.0,
+            'emotion_top': 'unavailable',
+            'emotion_top_label': '분석 불가',
+            'emotion_confidence': 0.0,
+            'emotion_probs': {},
+            'distress_score': 0.0,
+            'driver_state_model': 'aihub173_driver_state_mobilenetv3.pt',
+            'driver_state_available': False,
+            'driver_state_top': 'unavailable',
+            'driver_state_top_label': '상태 분석 불가',
+            'driver_state_confidence': 0.0,
+            'driver_state_probs': {},
+            'driver_state_risk': 0.0,
+            'driver_state_available_count': 0,
+            'eye_closed': None,
+            'support_score': 0.0,
+            'score_cap': self._FACIAL_AUX_SCORE_CAP,
+            'score_policy': 'positive_only_auxiliary',
+            'checked_frames': 0,
+            'detections': 0,
+        }
+
+    def _facial_aux_available(self):
+        if cv2 is None:
+            return False
+        face = self._get_facial_cascade('haarcascade_frontalface_alt2.xml')
+        if face is None:
+            face = self._get_facial_cascade('haarcascade_frontalface_default.xml')
+        return face is not None
+
+    def _facial_emotion_model_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('facial-state', 'emotion-ferplus-8.onnx'),
+            self._project_abspath(self._FACIAL_EMOTION_MODEL_REL_PATH),
+        )
+
+    def _get_facial_emotion_session(self):
+        model_path = self._facial_emotion_model_path()
+        if not os.path.isfile(model_path):
+            return None
+        try:
+            mtime = os.path.getmtime(model_path)
+        except Exception:
+            mtime = None
+        if (
+            self.__class__._facial_emotion_session_cache is not None
+            and self.__class__._facial_emotion_model_path_cache == model_path
+            and self.__class__._facial_emotion_model_mtime == mtime
+        ):
+            return self.__class__._facial_emotion_session_cache
+        try:
+            import onnxruntime as ort
+            sess = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            self.__class__._facial_emotion_session_cache = sess
+            self.__class__._facial_emotion_model_mtime = mtime
+            self.__class__._facial_emotion_model_path_cache = model_path
+            return sess
+        except Exception:
+            self.__class__._facial_emotion_session_cache = None
+            self.__class__._facial_emotion_model_mtime = None
+            self.__class__._facial_emotion_model_path_cache = None
+            return None
+
+    def _facial_emotion_distress_score(self, probs):
+        if not probs:
+            return 0.0
+        weights = {
+            'fear': 1.00,
+            'anxiety': 1.00,
+            'hurt': 0.90,
+            'sadness': 0.90,
+            'anger': 0.75,
+            'disgust': 0.65,
+            'embarrassed': 0.45,
+            'contempt': 0.35,
+            'surprise': 0.35,
+        }
+        score = 0.0
+        for label, weight in weights.items():
+            score += self._finite_float(probs.get(label), 0.0) * weight
+        return max(0.0, min(1.0, score))
+
+    def _facial_emotion_labels_for_probs(self, detections):
+        labels = []
+        preferred = list(self._FACIAL_EMOTION_LABELS)
+        for det in detections or []:
+            probs = (det or {}).get('emotion_probs') or {}
+            if any(label in probs for label in self._FACIAL_AIHUB82_LABELS):
+                preferred = list(self._FACIAL_AIHUB82_LABELS)
+                break
+        for label in preferred:
+            if label not in labels:
+                labels.append(label)
+        for det in detections or []:
+            for label in ((det or {}).get('emotion_probs') or {}).keys():
+                if label not in labels:
+                    labels.append(label)
+        return labels
+
+    def _facial_emotion_quality(self, probs, avg_face_conf=0.0, head_roi_ratio=0.0, consistency=1.0):
+        probs = {str(k): self._finite_float(v, 0.0) for k, v in (probs or {}).items()}
+        ranked = sorted(probs.items(), key=lambda item: item[1], reverse=True)
+        if not ranked:
+            return {
+                'quality': 'unavailable',
+                'reliable': False,
+                'top_label': 'unavailable',
+                'top_score': 0.0,
+                'margin': 0.0,
+                'entropy': 1.0,
+                'top_emotions': [],
+                'display_label': '분석 불가',
+            }
+        top_label, top_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        margin = max(0.0, float(top_score) - float(second_score))
+        positive = [max(0.0, float(v)) for _, v in ranked]
+        total = sum(positive)
+        if total > 0:
+            normalized = [v / total for v in positive if v > 0]
+            entropy = -sum(v * math.log(v + 1e-12) for v in normalized) / max(math.log(len(ranked)), 1e-9)
+        else:
+            entropy = 1.0
+        face_conf = self._finite_float(avg_face_conf, 0.0)
+        head_ratio = self._finite_float(head_roi_ratio, 0.0)
+        frame_consistency = max(0.0, min(1.0, self._finite_float(consistency, 1.0)))
+        reliable_medium = top_score >= 0.30 and margin >= 0.035 and face_conf >= 0.32 and entropy <= 0.94 and frame_consistency >= 0.50
+        reliable_high = top_score >= 0.42 and margin >= 0.090 and face_conf >= 0.42 and entropy <= 0.86 and frame_consistency >= 0.67
+        if head_ratio >= 0.50:
+            reliable_medium = reliable_medium and top_score >= 0.34 and margin >= 0.050
+            reliable_high = reliable_high and top_score >= 0.48 and margin >= 0.100
+        if reliable_high:
+            quality = 'high'
+        elif reliable_medium:
+            quality = 'medium'
+        else:
+            quality = 'low'
+        if quality == 'low':
+            display_label = '확신 낮음'
+        else:
+            display_label = self._FACIAL_EMOTION_LABEL_KO.get(top_label, top_label)
+        return {
+            'quality': quality,
+            'reliable': quality in ('medium', 'high'),
+            'top_label': top_label,
+            'top_score': round(float(top_score), 4),
+            'margin': round(float(margin), 4),
+            'entropy': round(float(entropy), 4),
+            'consistency': round(float(frame_consistency), 4),
+            'top_emotions': [
+                {
+                    'label': label,
+                    'label_ko': self._FACIAL_EMOTION_LABEL_KO.get(label, label),
+                    'score': round(float(score), 4),
+                }
+                for label, score in ranked[:3]
+            ],
+            'display_label': display_label,
+        }
+
+    def _facial_evidence_lines(self, *, quality, distress_score, trusted_distress_score, driver_top_label, driver_top_score,
+                               driver_risk_score, avg_conf, det_count, checked, eye_closed_ratio,
+                               mouth_ratio, tension_ratio, head_roi_ratio, actual_face_ratio, driver_reliable):
+        lines = []
+        if quality.get('reliable'):
+            lines.append(
+                f"감정 top {quality.get('display_label')} {quality.get('top_score', 0.0):.2f}, "
+                f"2순위와 차이 {quality.get('margin', 0.0):.2f}, 프레임일치 {quality.get('consistency', 0.0):.2f}"
+            )
+        elif actual_face_ratio <= 0.0:
+            lines.append("실제 얼굴 검출 실패: 감정 라벨은 판단에 사용하지 않음")
+        else:
+            lines.append(
+                f"감정 확신 낮음: top {self._FACIAL_EMOTION_LABEL_KO.get(quality.get('top_label'), quality.get('top_label'))} "
+                f"{quality.get('top_score', 0.0):.2f}, margin {quality.get('margin', 0.0):.2f}, "
+                f"프레임일치 {quality.get('consistency', 0.0):.2f}"
+            )
+        lines.append(
+            f"불편군 raw {distress_score:.2f} → 신뢰보정 {trusted_distress_score:.2f}, "
+            f"얼굴검출 {actual_face_ratio:.2f}, pose대체 {head_roi_ratio:.2f}"
+        )
+        lines.append(f"얼굴 검출 신뢰 {avg_conf:.2f}, 검출 {det_count}/{max(checked, 1)}프레임")
+        if driver_top_label and driver_top_label != 'unavailable':
+            driver_note = '상태 보조' if driver_reliable else '상태 보조 저신뢰'
+            lines.append(f"{driver_note} {driver_top_label} {driver_top_score:.2f}, 주의저하 위험 {driver_risk_score:.2f}")
+        micro = []
+        if eye_closed_ratio >= 0.50:
+            micro.append(f"눈감김 {eye_closed_ratio:.2f}")
+        if mouth_ratio >= 0.40:
+            micro.append(f"입/하안면 변화 {mouth_ratio:.2f}")
+        if tension_ratio >= 0.50:
+            micro.append(f"상안면 tension {tension_ratio:.2f}")
+        if head_roi_ratio >= 0.50:
+            micro.append(f"pose ROI 대체 {head_roi_ratio:.2f}")
+        if micro:
+            lines.append("영상 근거: " + ", ".join(micro))
+        return lines
+
+    def _facial_aihub82_model_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('facial-state', 'aihub82_facial_emotion_mobilenetv3.pt'),
+            self._project_abspath(self._FACIAL_AIHUB82_MODEL_REL_PATH),
+        )
+
+    def _facial_driver_state_model_path(self):
+        return self._promote_model_asset(
+            self._persistent_model_path('facial-state', 'aihub173_driver_state_mobilenetv3.pt'),
+            self._project_abspath(self._FACIAL_DRIVER_STATE_MODEL_REL_PATH),
+        )
+
+    def _make_torchvision_mobilenet(self, tv_models, torch, model_type, num_classes):
+        model_type = str(model_type or 'mobilenet_v3_small').strip().lower()
+        if model_type == 'mobilenet_v3_large':
+            model = tv_models.mobilenet_v3_large(weights=None)
+        else:
+            model = tv_models.mobilenet_v3_small(weights=None)
+            model_type = 'mobilenet_v3_small'
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = torch.nn.Linear(in_features, num_classes)
+        return model, model_type
+
+    def _external_aihub82_workspace(self):
+        return os.environ.get('FACIAL_EXTERNAL_AIHUB82_WORKSPACE', self._FACIAL_EXTERNAL_AIHUB82_WORKSPACE)
+
+    def _external_aihub82_provider_config(self, provider='emotionnet'):
+        provider = str(provider or 'emotionnet').strip().lower().replace('_', '-')
+        workspace = self._external_aihub82_workspace()
+        if provider in ('efficientnet', 'efficientnet-b5', 'external-efficientnet', 'external-efficientnet-b5'):
+            return {
+                'provider': 'efficientnet-b5',
+                'model_name': 'efficientnet-b5',
+                'model_file': os.path.join(workspace, 'model_eff.pth'),
+                'image_size': 224,
+                'channels': 3,
+                'runtime_label': 'external_aihub82_efficientnet_b5_model_eff.pth',
+            }
+        return {
+            'provider': 'emotionnet',
+            'model_name': 'emotionnet',
+            'model_file': os.path.join(workspace, 'model.pth'),
+            'image_size': 48,
+            'channels': 1,
+            'runtime_label': 'external_aihub82_emotionnet_model.pth',
+        }
+
+    def _get_external_aihub82_train_module(self, workspace):
+        module_key = '_external_aihub82_train_module'
+        cached = self.__class__._facial_external_aihub82_model_cache.get(module_key)
+        train_path = os.path.join(workspace, 'train.py')
+        if cached and cached.get('path') == train_path and cached.get('module') is not None:
+            return cached.get('module')
+        if not os.path.isfile(train_path):
+            return None
+        old_path = list(sys.path)
+        try:
+            if workspace not in sys.path:
+                sys.path.insert(0, workspace)
+            spec = importlib.util.spec_from_file_location('external_aihub82_facial_train', train_path)
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.__class__._facial_external_aihub82_model_cache[module_key] = {
+                'path': train_path,
+                'module': module,
+            }
+            return module
+        except Exception:
+            self.__class__._facial_external_aihub82_model_cache.pop(module_key, None)
+            return None
+        finally:
+            sys.path = old_path
+
+    def _get_external_facial_aihub82_model(self, provider='emotionnet'):
+        cfg = self._external_aihub82_provider_config(provider)
+        model_path = cfg.get('model_file')
+        workspace = self._external_aihub82_workspace()
+        if not os.path.isfile(model_path):
+            return None
+        try:
+            mtime = os.path.getmtime(model_path)
+        except Exception:
+            mtime = None
+        cache_key = f"external:{cfg.get('provider')}"
+        cached = self.__class__._facial_external_aihub82_model_cache.get(cache_key)
+        if cached and cached.get('path') == model_path and cached.get('mtime') == mtime:
+            return cached
+        try:
+            import torch
+            try:
+                torch.set_num_threads(max(1, int(os.environ.get('FACIAL_TORCH_THREADS', '1') or 1)))
+            except Exception:
+                pass
+            train_module = self._get_external_aihub82_train_module(workspace)
+            if train_module is None or not hasattr(train_module, 'getModel'):
+                return None
+            _stdout = None
+            try:
+                _stdout = sys.stdout
+                with open(os.devnull, 'w') as _devnull:
+                    sys.stdout = _devnull
+                    model = train_module.getModel(cfg.get('model_name'))
+            finally:
+                if _stdout is not None:
+                    sys.stdout = _stdout
+            ckpt = torch.load(model_path, map_location='cpu')
+            state = ckpt.get('model', ckpt) if isinstance(ckpt, dict) else ckpt
+            model.load_state_dict(state)
+            model.eval()
+            bundle = {
+                'model': model,
+                'torch': torch,
+                'provider': cfg.get('provider'),
+                'class_names_ko': list(self._FACIAL_EXTERNAL_AIHUB82_LABELS_KO),
+                'image_size': int(cfg.get('image_size') or 48),
+                'channels': int(cfg.get('channels') or 1),
+                'path': model_path,
+                'mtime': mtime,
+                'runtime_label': cfg.get('runtime_label'),
+                'model_source': 'External AI-Hub 82 Docker image workspace',
+            }
+            self.__class__._facial_external_aihub82_model_cache[cache_key] = bundle
+            return bundle
+        except Exception:
+            self.__class__._facial_external_aihub82_model_cache.pop(cache_key, None)
+            return None
+
+    def _classify_facial_emotion_external_aihub82(self, face_img, provider='emotionnet'):
+        bundle = self._get_external_facial_aihub82_model(provider)
+        if bundle is None:
+            return None
+        try:
+            import numpy as np
+            torch = bundle['torch']
+            img = face_img
+            if img is None or getattr(img, 'size', 0) == 0:
+                return None
+            size = int(bundle.get('image_size') or 48)
+            channels = int(bundle.get('channels') or 1)
+            if len(img.shape) == 2:
+                gray = img
+            else:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+            if channels == 3:
+                arr = np.stack([gray, gray, gray], axis=0).astype('float32') / 255.0
+            else:
+                arr = gray.reshape(1, size, size).astype('float32') / 255.0
+            tensor = torch.from_numpy(arr).unsqueeze(0)
+            with torch.no_grad():
+                logits = bundle['model'](tensor)
+                probs_tensor = torch.softmax(logits, dim=1).cpu().numpy().reshape(-1)
+            probs = {}
+            for idx, ko_label in enumerate(bundle.get('class_names_ko') or []):
+                if idx >= len(probs_tensor):
+                    continue
+                internal = self._FACIAL_EXTERNAL_AIHUB82_LABEL_MAP.get(ko_label, ko_label)
+                probs[internal] = round(float(probs_tensor[idx]), 4)
+            if not probs:
+                return None
+            top_label = max(probs, key=lambda key: probs.get(key, 0.0))
+            distress = self._facial_emotion_distress_score(probs)
+            return {
+                'available': True,
+                'model': bundle.get('runtime_label') or 'external_aihub82_emotion_model',
+                'model_path': bundle.get('path'),
+                'model_source': bundle.get('model_source'),
+                'labels': list(probs.keys()),
+                'probs': probs,
+                'top_label': top_label,
+                'top_label_ko': self._FACIAL_EMOTION_LABEL_KO.get(top_label, top_label),
+                'top_score': round(float(probs.get(top_label, 0.0)), 4),
+                'distress_score': round(float(distress), 4),
+            }
+        except Exception as e:
+            return {
+                'available': False,
+                'reason': 'external_aihub82_emotion_inference_error',
+                'message': str(e),
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '분석 불가',
+                'top_score': 0.0,
+                'distress_score': 0.0,
+            }
+
+    def _get_facial_aihub82_model(self):
+        model_path = self._facial_aihub82_model_path()
+        if not os.path.isfile(model_path):
+            return None
+        try:
+            mtime = os.path.getmtime(model_path)
+        except Exception:
+            mtime = None
+        if (
+            self.__class__._facial_aihub82_model_cache is not None
+            and self.__class__._facial_aihub82_model_path_cache == model_path
+            and self.__class__._facial_aihub82_model_mtime == mtime
+        ):
+            return self.__class__._facial_aihub82_model_cache
+        try:
+            import torch
+            try:
+                torch.set_num_threads(max(1, int(os.environ.get('FACIAL_TORCH_THREADS', '1') or 1)))
+            except Exception:
+                pass
+            try:
+                torch.set_num_interop_threads(max(1, int(os.environ.get('FACIAL_TORCH_INTEROP_THREADS', '1') or 1)))
+            except Exception:
+                pass
+            from torchvision import models as _tv_models
+            ckpt = torch.load(model_path, map_location='cpu')
+            class_names = list(ckpt.get('class_names') or self._FACIAL_AIHUB82_LABELS)
+            model, model_type = self._make_torchvision_mobilenet(_tv_models, torch, ckpt.get('model_type'), len(class_names))
+            model.load_state_dict(ckpt.get('state_dict') or ckpt)
+            model.eval()
+            bundle = {
+                'model': model,
+                'torch': torch,
+                'model_type': model_type,
+                'class_names': class_names,
+                'image_size': int(ckpt.get('image_size') or 160),
+                'path': model_path,
+                'metrics': ckpt.get('metrics') or {},
+            }
+            self.__class__._facial_aihub82_model_cache = bundle
+            self.__class__._facial_aihub82_model_mtime = mtime
+            self.__class__._facial_aihub82_model_path_cache = model_path
+            return bundle
+        except Exception:
+            self.__class__._facial_aihub82_model_cache = None
+            self.__class__._facial_aihub82_model_mtime = None
+            self.__class__._facial_aihub82_model_path_cache = None
+            return None
+
+    def _classify_facial_emotion_aihub82(self, face_img):
+        bundle = self._get_facial_aihub82_model()
+        if bundle is None:
+            return None
+        try:
+            import numpy as np
+            torch = bundle['torch']
+            img = face_img
+            if img is None or getattr(img, 'size', 0) == 0:
+                return None
+            if len(img.shape) == 2:
+                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            else:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            size = int(bundle.get('image_size') or 160)
+            rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
+            arr = rgb.astype('float32') / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype='float32')
+            std = np.array([0.229, 0.224, 0.225], dtype='float32')
+            arr = (arr - mean) / std
+            tensor = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)
+            with torch.no_grad():
+                logits = bundle['model'](tensor)
+                probs_tensor = torch.softmax(logits, dim=1).cpu().numpy().reshape(-1)
+            class_names = bundle.get('class_names') or self._FACIAL_AIHUB82_LABELS
+            probs = {
+                label: round(float(probs_tensor[idx]), 4)
+                for idx, label in enumerate(class_names)
+                if idx < len(probs_tensor)
+            }
+            top_label = max(probs, key=lambda key: probs.get(key, 0.0))
+            distress = self._facial_emotion_distress_score(probs)
+            return {
+                'available': True,
+                'model': 'aihub82_facial_emotion_mobilenetv3.pt',
+                'model_path': bundle.get('path'),
+                'model_source': 'AI-Hub 82 Korean facial emotion fine-tune',
+                'labels': list(class_names),
+                'probs': probs,
+                'top_label': top_label,
+                'top_label_ko': self._FACIAL_EMOTION_LABEL_KO.get(top_label, top_label),
+                'top_score': round(float(probs.get(top_label, 0.0)), 4),
+                'distress_score': round(float(distress), 4),
+            }
+        except Exception as e:
+            return {
+                'available': False,
+                'reason': 'aihub82_emotion_inference_error',
+                'message': str(e),
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '분석 불가',
+                'top_score': 0.0,
+                'distress_score': 0.0,
+            }
+
+    def _get_facial_driver_state_model(self):
+        model_path = self._facial_driver_state_model_path()
+        if not os.path.isfile(model_path):
+            return None
+        try:
+            mtime = os.path.getmtime(model_path)
+        except Exception:
+            mtime = None
+        if (
+            self.__class__._facial_driver_state_model_cache is not None
+            and self.__class__._facial_driver_state_model_path_cache == model_path
+            and self.__class__._facial_driver_state_model_mtime == mtime
+        ):
+            return self.__class__._facial_driver_state_model_cache
+        try:
+            import torch
+            try:
+                torch.set_num_threads(max(1, int(os.environ.get('FACIAL_TORCH_THREADS', '1') or 1)))
+            except Exception:
+                pass
+            try:
+                torch.set_num_interop_threads(max(1, int(os.environ.get('FACIAL_TORCH_INTEROP_THREADS', '1') or 1)))
+            except Exception:
+                pass
+            from torchvision import models as _tv_models
+            ckpt = torch.load(model_path, map_location='cpu')
+            class_names = list(ckpt.get('class_names') or self._FACIAL_DRIVER_STATE_LABELS)
+            model, model_type = self._make_torchvision_mobilenet(_tv_models, torch, ckpt.get('model_type'), len(class_names))
+            model.load_state_dict(ckpt.get('state_dict') or ckpt)
+            model.eval()
+            bundle = {
+                'model': model,
+                'torch': torch,
+                'model_type': model_type,
+                'class_names': class_names,
+                'image_size': int(ckpt.get('image_size') or 160),
+                'path': model_path,
+                'metrics': ckpt.get('metrics') or {},
+            }
+            self.__class__._facial_driver_state_model_cache = bundle
+            self.__class__._facial_driver_state_model_mtime = mtime
+            self.__class__._facial_driver_state_model_path_cache = model_path
+            return bundle
+        except Exception:
+            self.__class__._facial_driver_state_model_cache = None
+            self.__class__._facial_driver_state_model_mtime = None
+            self.__class__._facial_driver_state_model_path_cache = None
+            return None
+
+    def _facial_driver_state_risk_score(self, probs):
+        if not probs:
+            return 0.0
+        weights = {
+            'drowsy': 1.00,
+            'yawn': 0.65,
+            'phone_call': 0.20,
+            'smoking': 0.15,
+            'normal_focus': 0.0,
+        }
+        score = 0.0
+        for label, weight in weights.items():
+            score += self._finite_float(probs.get(label), 0.0) * weight
+        return max(0.0, min(1.0, score))
+
+    def _classify_facial_driver_state(self, face_img):
+        bundle = self._get_facial_driver_state_model()
+        if bundle is None:
+            return None
+        try:
+            import numpy as np
+            torch = bundle['torch']
+            img = face_img
+            if img is None or getattr(img, 'size', 0) == 0:
+                return None
+            if len(img.shape) == 2:
+                rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            else:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            size = int(bundle.get('image_size') or 160)
+            rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
+            arr = rgb.astype('float32') / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype='float32')
+            std = np.array([0.229, 0.224, 0.225], dtype='float32')
+            arr = (arr - mean) / std
+            tensor = torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)
+            with torch.no_grad():
+                logits = bundle['model'](tensor)
+                probs_tensor = torch.softmax(logits, dim=1).cpu().numpy().reshape(-1)
+            class_names = bundle.get('class_names') or self._FACIAL_DRIVER_STATE_LABELS
+            probs = {
+                label: round(float(probs_tensor[idx]), 4)
+                for idx, label in enumerate(class_names)
+                if idx < len(probs_tensor)
+            }
+            top_label = max(probs, key=lambda key: probs.get(key, 0.0))
+            risk = self._facial_driver_state_risk_score(probs)
+            return {
+                'available': True,
+                'model': 'aihub173_driver_state_mobilenetv3.pt',
+                'model_source': 'AI-Hub 173 driver state auxiliary fine-tune',
+                'labels': list(class_names),
+                'probs': probs,
+                'top_label': top_label,
+                'top_label_ko': self._FACIAL_DRIVER_STATE_LABEL_KO.get(top_label, top_label),
+                'top_score': round(float(probs.get(top_label, 0.0)), 4),
+                'risk_score': round(float(risk), 4),
+            }
+        except Exception as e:
+            return {
+                'available': False,
+                'reason': 'driver_state_inference_error',
+                'message': str(e),
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '상태 분석 불가',
+                'top_score': 0.0,
+                'risk_score': 0.0,
+            }
+
+    def _classify_facial_emotion(self, face_gray):
+        provider = str(os.environ.get('FACIAL_EMOTION_PROVIDER', 'auto') or 'auto').strip().lower().replace('_', '-')
+        if provider in ('auto', 'external', 'external-emotionnet', 'emotionnet'):
+            external = self._classify_facial_emotion_external_aihub82(face_gray, 'emotionnet')
+            if external is not None:
+                return external
+        if provider in ('external-efficientnet', 'external-efficientnet-b5', 'efficientnet', 'efficientnet-b5'):
+            external = self._classify_facial_emotion_external_aihub82(face_gray, 'efficientnet-b5')
+            if external is not None:
+                return external
+        aihub = None if provider in ('external-only', 'external-emotionnet-only', 'external-efficientnet-only') else self._classify_facial_emotion_aihub82(face_gray)
+        if aihub is not None:
+            return aihub
+        if face_gray is not None and len(getattr(face_gray, 'shape', [])) == 3:
+            face_gray = cv2.cvtColor(face_gray, cv2.COLOR_BGR2GRAY)
+        sess = self._get_facial_emotion_session()
+        if sess is None:
+            return {
+                'available': False,
+                'reason': 'emotion_model_unavailable',
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '분석 불가',
+                'top_score': 0.0,
+                'distress_score': 0.0,
+            }
+        try:
+            import numpy as np
+            face = cv2.resize(face_gray, (64, 64), interpolation=cv2.INTER_AREA)
+            face = cv2.equalizeHist(face)
+            arr = face.astype('float32').reshape(1, 1, 64, 64)
+            input_name = sess.get_inputs()[0].name
+            logits = sess.run(None, {input_name: arr})[0]
+            logits = np.asarray(logits, dtype='float32').reshape(-1)
+            if logits.size < len(self._FACIAL_EMOTION_LABELS):
+                return {
+                    'available': False,
+                    'reason': 'emotion_output_invalid',
+                    'probs': {},
+                    'top_label': 'unavailable',
+                    'top_label_ko': '분석 불가',
+                    'top_score': 0.0,
+                    'distress_score': 0.0,
+                }
+            logits = logits[:len(self._FACIAL_EMOTION_LABELS)]
+            exp = np.exp(logits - float(np.max(logits)))
+            denom = float(np.sum(exp)) or 1.0
+            values = exp / denom
+            probs = {
+                label: round(float(values[idx]), 4)
+                for idx, label in enumerate(self._FACIAL_EMOTION_LABELS)
+            }
+            top_label = max(probs, key=lambda key: probs.get(key, 0.0))
+            distress = self._facial_emotion_distress_score(probs)
+            return {
+                'available': True,
+                'model': 'emotion-ferplus-8.onnx',
+                'model_source': 'ONNX Model Zoo FER+',
+                'labels': list(self._FACIAL_EMOTION_LABELS),
+                'probs': probs,
+                'top_label': top_label,
+                'top_label_ko': self._FACIAL_EMOTION_LABEL_KO.get(top_label, top_label),
+                'top_score': round(float(probs.get(top_label, 0.0)), 4),
+                'distress_score': round(float(distress), 4),
+            }
+        except Exception as e:
+            return {
+                'available': False,
+                'reason': 'emotion_inference_error',
+                'message': str(e),
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '분석 불가',
+                'top_score': 0.0,
+                'distress_score': 0.0,
+            }
+
+    def _get_facial_cascade(self, name):
+        if cv2 is None:
+            return None
+        cache = self.__class__._facial_cascade_cache
+        if name in cache:
+            return cache.get(name)
+        cascade = None
+        try:
+            haar_root = getattr(getattr(cv2, 'data', None), 'haarcascades', '')
+            path = os.path.join(haar_root, name)
+            if os.path.exists(path):
+                candidate = cv2.CascadeClassifier(path)
+                if candidate is not None and not candidate.empty():
+                    cascade = candidate
+        except Exception:
+            cascade = None
+        cache[name] = cascade
+        self.__class__._facial_cascade_cache = cache
+        return cascade
+
+    def _facial_roi_from_timeseries_entry(self, entry, frame_w, frame_h):
+        def _clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        bbox = (entry or {}).get('bbox') or {}
+        cx = self._finite_float(bbox.get('cx'), 0.5) * frame_w
+        cy = self._finite_float(bbox.get('cy'), 0.5) * frame_h
+        bw = self._finite_float(bbox.get('w'), 0.0) * frame_w
+        bh = self._finite_float(bbox.get('h'), 0.0) * frame_h
+        if bw <= 0 or bh <= 0:
+            bw, bh = frame_w * 0.45, frame_h * 0.70
+        bx1, by1 = cx - bw / 2.0, cy - bh / 2.0
+        bx2, by2 = cx + bw / 2.0, cy + bh / 2.0
+
+        kps = (entry or {}).get('keypoints') or []
+        head_points = []
+        for idx in [0, 1, 2, 3, 4]:
+            if idx < len(kps):
+                kp = kps[idx] or {}
+                if self._finite_float(kp.get('conf'), 0.0) >= 0.12:
+                    head_points.append((
+                        self._finite_float(kp.get('x'), 0.5) * frame_w,
+                        self._finite_float(kp.get('y'), 0.2) * frame_h,
+                    ))
+        if head_points:
+            hx = sum(p[0] for p in head_points) / len(head_points)
+            hy = sum(p[1] for p in head_points) / len(head_points)
+            shoulder_width = 0.0
+            if len(kps) > 6:
+                ls, rs = kps[5] or {}, kps[6] or {}
+                if self._finite_float(ls.get('conf'), 0.0) >= 0.10 and self._finite_float(rs.get('conf'), 0.0) >= 0.10:
+                    shoulder_width = abs(self._finite_float(ls.get('x'), 0.5) - self._finite_float(rs.get('x'), 0.5)) * frame_w
+            roi_w = max(shoulder_width * 0.85, bw * 0.30, 48.0)
+            roi_h = max(roi_w * 1.25, bh * 0.22, 56.0)
+            x1, y1 = hx - roi_w / 2.0, hy - roi_h * 0.48
+            x2, y2 = hx + roi_w / 2.0, hy + roi_h * 0.72
+        else:
+            x1 = bx1 + bw * 0.12
+            x2 = bx2 - bw * 0.12
+            y1 = by1
+            y2 = by1 + bh * 0.46
+
+        pad_x = max((x2 - x1) * 0.15, 10.0)
+        pad_y = max((y2 - y1) * 0.12, 8.0)
+        x1 = int(_clamp(x1 - pad_x, 0, max(frame_w - 1, 1)))
+        y1 = int(_clamp(y1 - pad_y, 0, max(frame_h - 1, 1)))
+        x2 = int(_clamp(x2 + pad_x, x1 + 1, frame_w))
+        y2 = int(_clamp(y2 + pad_y, y1 + 1, frame_h))
+        if (x2 - x1) < 24 or (y2 - y1) < 24:
+            return None
+        return x1, y1, x2, y2
+
+    def _detect_broad_facial_roi(self, frame, entry, face_cascade, profile_cascade):
+        """Fallback face search when the pose-derived head crop misses the actual face."""
+        if frame is None or getattr(frame, 'size', 0) == 0:
+            return None
+        try:
+            h, w = frame.shape[:2]
+        except Exception:
+            return None
+        if h <= 0 or w <= 0:
+            return None
+
+        def _clamp_int(value, lo, hi):
+            return int(max(lo, min(hi, value)))
+
+        bbox = (entry or {}).get('bbox') or {}
+        cx = self._finite_float(bbox.get('cx'), 0.5) * w
+        cy = self._finite_float(bbox.get('cy'), 0.5) * h
+        bw = self._finite_float(bbox.get('w'), 0.0) * w
+        bh = self._finite_float(bbox.get('h'), 0.0) * h
+        has_bbox = bool(bw > 4 and bh > 4)
+        if not has_bbox:
+            cx, cy, bw, bh = w / 2.0, h / 2.0, w * 0.9, h * 0.9
+        bx1, by1 = cx - bw / 2.0, cy - bh / 2.0
+        bx2, by2 = cx + bw / 2.0, cy + bh / 2.0
+        person_gate = (
+            _clamp_int(bx1 - bw * 0.25, 0, w - 1),
+            _clamp_int(by1 - bh * 0.18, 0, h - 1),
+            _clamp_int(bx2 + bw * 0.25, 1, w),
+            _clamp_int(by2 + bh * 0.12, 1, h),
+        )
+        candidates = []
+        upper_person = (
+            _clamp_int(bx1 - bw * 0.18, 0, w - 1),
+            _clamp_int(by1 - bh * 0.12, 0, h - 1),
+            _clamp_int(bx2 + bw * 0.18, 1, w),
+            _clamp_int(by1 + bh * 0.68, 1, h),
+            'upper_body_face',
+        )
+        if upper_person[2] - upper_person[0] >= 36 and upper_person[3] - upper_person[1] >= 36:
+            candidates.append(upper_person)
+        candidates.extend([
+            (0, 0, w, max(1, int(h * 0.68)), 'upper_frame_face'),
+            (0, 0, w, h, 'full_frame_face'),
+        ])
+
+        best = None
+        for rx1, ry1, rx2, ry2, source in candidates:
+            roi = frame[ry1:ry2, rx1:rx2]
+            if roi is None or roi.size == 0:
+                continue
+            try:
+                gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                continue
+            gray = cv2.equalizeHist(gray)
+            min_face = max(18, min(gray.shape[:2]) // 12)
+            scans = []
+            if face_cascade is not None:
+                scans.append(('frontal', face_cascade, False))
+            if profile_cascade is not None:
+                scans.append(('profile', profile_cascade, False))
+                scans.append(('profile_flipped', profile_cascade, True))
+            for cascade_name, cascade, flipped in scans:
+                scan_gray = cv2.flip(gray, 1) if flipped else gray
+                faces = []
+                for neighbors in (3, 2):
+                    try:
+                        faces = cascade.detectMultiScale(
+                            scan_gray,
+                            scaleFactor=1.05,
+                            minNeighbors=neighbors,
+                            minSize=(min_face, min_face),
+                        )
+                    except Exception:
+                        faces = []
+                    if faces is not None and len(faces) > 0:
+                        break
+                if faces is None or len(faces) == 0:
+                    continue
+                for fx, fy, fw, fh in faces:
+                    fx, fy, fw, fh = int(fx), int(fy), int(fw), int(fh)
+                    if flipped:
+                        fx = int(gray.shape[1] - fx - fw)
+                    gx1, gy1 = rx1 + fx, ry1 + fy
+                    gx2, gy2 = gx1 + fw, gy1 + fh
+                    gcx, gcy = gx1 + fw / 2.0, gy1 + fh / 2.0
+                    if has_bbox and source != 'upper_body_face':
+                        if not (person_gate[0] <= gcx <= person_gate[2] and person_gate[1] <= gcy <= person_gate[3]):
+                            continue
+                    area_ratio = float(fw * fh) / max(float(w * h), 1.0)
+                    if area_ratio < 0.00018:
+                        continue
+                    score = area_ratio * (1.15 if source == 'upper_body_face' else 1.0) * (1.0 if neighbors >= 3 else 0.82)
+                    if best is None or score > best['score']:
+                        best = {
+                            'score': score,
+                            'source': f'{source}:{cascade_name}',
+                            'bbox': (
+                                _clamp_int(gx1, 0, w - 1),
+                                _clamp_int(gy1, 0, h - 1),
+                                _clamp_int(gx2, 1, w),
+                                _clamp_int(gy2, 1, h),
+                            ),
+                            'neighbors': int(neighbors),
+                        }
+        if not best:
+            return None
+        x1, y1, x2, y2 = best['bbox']
+        face_color = frame[y1:y2, x1:x2]
+        if face_color is None or face_color.size == 0:
+            return None
+        try:
+            face_gray = cv2.cvtColor(face_color, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return None
+        face_gray = cv2.equalizeHist(face_gray)
+        return {
+            'source': best['source'],
+            'face_gray': face_gray,
+            'face_color': face_color,
+            'fw': int(x2 - x1),
+            'fh': int(y2 - y1),
+            'neighbors': int(best.get('neighbors') or 0),
+        }
+
+    def _analyze_facial_state_aux(self, raw_frames, timeseries, vid_meta, fall_score,
+                                  fall_detected=False, suspect_threshold=None,
+                                  effective_threshold=None, is_realtime=False,
+                                  realtime_context=None):
+        """Lightweight positive-only facial-state auxiliary model."""
+        if os.environ.get('FACIAL_AUX_DISABLE', '').lower() in ('1', 'true', 'yes'):
+            return self._facial_aux_default('disabled', 'FACIAL_AUX_DISABLE 설정으로 표정 보조 분석을 건너뛰었습니다.')
+        if cv2 is None:
+            return self._facial_aux_default('opencv_unavailable', 'OpenCV를 사용할 수 없어 표정 보조 분석을 건너뛰었습니다.')
+        if not raw_frames or not timeseries:
+            return self._facial_aux_default('no_frames', '공유 추출 프레임이 없어 표정 보조 분석을 건너뛰었습니다.')
+
+        score = self._finite_float(fall_score, 0.0)
+        confirm = self._finite_float(effective_threshold, self.fall_decision_threshold)
+        suspect = suspect_threshold
+        if suspect is None:
+            suspect = max(0.15, confirm - self._FACIAL_AUX_TRIGGER_MARGIN)
+        suspect = self._finite_float(suspect, max(0.15, confirm - self._FACIAL_AUX_TRIGGER_MARGIN))
+        body_suspected = bool(fall_detected) or score >= suspect
+        _rt_ctx = realtime_context or {}
+        _force_refresh = bool(_rt_ctx.get('force_facial_refresh') or _rt_ctx.get('upload_chunk'))
+        _upload_chunk = bool(_rt_ctx.get('upload_chunk'))
+        session_key = str(_rt_ctx.get('session_id') or 'default').strip() or 'default'
+        cache_map = self.__class__._facial_state_realtime_cache
+        if not isinstance(cache_map, dict):
+            cache_map = {}
+            self.__class__._facial_state_realtime_cache = cache_map
+        cached_entry = cache_map.get(session_key)
+        cached_ts = self._finite_float((cached_entry or {}).get('_cached_at'), 0.0)
+        cache_age = time.time() - cached_ts if cached_ts > 0 else 9999.0
+        monitor_interval = max(2.0, self._finite_float(os.environ.get('FACIAL_AUX_REALTIME_ANALYSIS_SEC'), 8.0))
+        driver_interval = max(monitor_interval, self._finite_float(os.environ.get('FACIAL_AUX_REALTIME_DRIVER_SEC'), 24.0))
+        should_refresh_realtime = bool(
+            body_suspected
+            or _force_refresh
+            or not is_realtime
+            or cached_entry is None
+            or cache_age >= monitor_interval
+        )
+        if _upload_chunk:
+            analysis_mode = 'upload_chunk_replay'
+        else:
+            analysis_mode = 'auxiliary_score' if body_suspected else ('precursor_monitor' if should_refresh_realtime else 'precursor_monitor_cached')
+        if is_realtime and not body_suspected and not should_refresh_realtime and not _force_refresh and cached_entry is not None:
+            cached = copy.deepcopy(cached_entry)
+            cached.pop('_cached_at', None)
+            cached['reason'] = 'realtime_periodic_cache'
+            cached['description'] = '낙상 전 상태 변화를 보기 위해 표정 분석 결과를 주기적으로 갱신하고, 그 사이 청크는 최근 표정 상태를 재사용합니다.'
+            cached['analysis_mode'] = analysis_mode
+            cached['body_score'] = round(score, 4)
+            cached['body_suspected'] = body_suspected
+            cached['cache_age_sec'] = round(cache_age, 3)
+            cached['realtime_monitor_interval_sec'] = round(monitor_interval, 2)
+            return cached
+
+        face_cascade = self._get_facial_cascade('haarcascade_frontalface_alt2.xml') or self._get_facial_cascade('haarcascade_frontalface_default.xml')
+        profile_cascade = self._get_facial_cascade('haarcascade_profileface.xml')
+        eye_cascade = self._get_facial_cascade('haarcascade_eye.xml')
+        smile_cascade = self._get_facial_cascade('haarcascade_smile.xml')
+        if face_cascade is None and profile_cascade is None:
+            return self._facial_aux_default('cascade_unavailable', 'OpenCV 얼굴 cascade 파일을 찾지 못했습니다.')
+
+        frames_by_idx = {int(idx): frame for idx, frame in raw_frames if frame is not None}
+        frame_keys = sorted(frames_by_idx.keys())
+        if not frame_keys:
+            return self._facial_aux_default('no_frame_map', '표정 보조 분석에 사용할 프레임 매핑이 없습니다.')
+
+        clean_ts = [e for e in (timeseries or []) if not e.get('_from_rolling')]
+        if not clean_ts:
+            clean_ts = list(timeseries or [])
+        clean_ts = sorted(clean_ts, key=lambda e: int(e.get('frame_idx', 0) or 0))
+        realtime_precise_frames = max(1, int(os.environ.get('FACIAL_AUX_REALTIME_PRECISE_FRAMES', '2') or 2))
+        realtime_monitor_frames = max(1, int(os.environ.get('FACIAL_AUX_REALTIME_MONITOR_FRAMES', '2') or 2))
+        upload_chunk_frames = max(1, int(os.environ.get('FACIAL_AUX_UPLOAD_CHUNK_FRAMES', '2') or 2))
+        if is_realtime:
+            if _upload_chunk:
+                frame_limit = min(self._FACIAL_AUX_MAX_FRAMES, upload_chunk_frames)
+            elif body_suspected:
+                frame_limit = min(self._FACIAL_AUX_MAX_FRAMES, realtime_precise_frames)
+            elif should_refresh_realtime:
+                frame_limit = min(self._FACIAL_AUX_MAX_FRAMES, realtime_monitor_frames)
+            else:
+                frame_limit = 1
+        else:
+            frame_limit = self._FACIAL_AUX_MAX_FRAMES if body_suspected else 4
+        candidate_entries = clean_ts[-frame_limit:]
+        run_facial_models = bool(body_suspected or not is_realtime or should_refresh_realtime)
+        realtime_driver_enabled = os.environ.get('FACIAL_AUX_REALTIME_DRIVER', 'true').lower() not in ('0', 'false', 'no')
+        run_driver_model = bool(
+            run_facial_models
+            and (
+                not is_realtime
+                or body_suspected
+                or _force_refresh
+                or (realtime_driver_enabled and (cached_entry is None or cache_age >= driver_interval))
+            )
+        )
+
+        detections = []
+        checked = 0
+        for entry in candidate_entries:
+            try:
+                fidx = int(entry.get('frame_idx', 0) or 0)
+            except Exception:
+                fidx = 0
+            if fidx in frames_by_idx:
+                frame = frames_by_idx[fidx]
+            else:
+                nearest = min(frame_keys, key=lambda k: abs(k - fidx))
+                frame = frames_by_idx.get(nearest)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            roi = self._facial_roi_from_timeseries_entry(entry, w, h)
+            if roi is None:
+                continue
+            checked += 1
+            x1, y1, x2, y2 = roi
+            crop = frame[y1:y2, x1:x2]
+            if crop is None or crop.size == 0:
+                continue
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            min_face = max(24, min(gray.shape[:2]) // 5)
+            faces = []
+            if face_cascade is not None:
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=4, minSize=(min_face, min_face))
+            source = 'frontal'
+            if (faces is None or len(faces) == 0) and profile_cascade is not None:
+                faces = profile_cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=4, minSize=(min_face, min_face))
+                source = 'profile'
+            if (faces is None or len(faces) == 0) and profile_cascade is not None:
+                flipped = cv2.flip(gray, 1)
+                faces = profile_cascade.detectMultiScale(flipped, scaleFactor=1.08, minNeighbors=4, minSize=(min_face, min_face))
+                source = 'profile_flipped'
+            broad_face = None
+            if faces is None or len(faces) == 0:
+                broad_face = self._detect_broad_facial_roi(frame, entry, face_cascade, profile_cascade)
+            if broad_face is not None:
+                face = broad_face.get('face_gray')
+                face_color = broad_face.get('face_color')
+                source = broad_face.get('source') or 'broad_face'
+                fw = int(broad_face.get('fw') or 0)
+                fh = int(broad_face.get('fh') or 0)
+            else:
+                if faces is None or len(faces) == 0:
+                    if min(gray.shape[:2]) < 32:
+                        continue
+                    # When the face detector fails on small/side-view frames, keep pose-head
+                    # inference as display-only evidence. It must not become strong scoring input.
+                    faces = [(0, 0, gray.shape[1], gray.shape[0])]
+                    source = 'pose_head_roi'
+                fx, fy, fw, fh = max(faces, key=lambda r: int(r[2]) * int(r[3]))
+                face = gray[fy:fy + fh, fx:fx + fw]
+                if face is None or face.size == 0:
+                    continue
+                face_color = crop[fy:fy + fh, fx:fx + fw] if crop is not None and crop.size > 0 else face
+            if face is None or getattr(face, 'size', 0) == 0 or face_color is None or getattr(face_color, 'size', 0) == 0:
+                continue
+            if run_facial_models:
+                emotion = self._classify_facial_emotion(face_color)
+            else:
+                emotion = {
+                    'available': False,
+                    'reason': 'realtime_speed_guard',
+                    'probs': {},
+                    'top_label': 'unavailable',
+                    'top_label_ko': '속도 보호',
+                    'top_score': 0.0,
+                    'distress_score': 0.0,
+                }
+            driver_state = self._classify_facial_driver_state(face_color) if run_driver_model else None
+            upper = face[:max(1, int(fh * 0.55)), :]
+            lower = face[int(fh * 0.55):, :]
+            eyes = []
+            if eye_cascade is not None and upper.size > 0:
+                eyes = eye_cascade.detectMultiScale(
+                    upper,
+                    scaleFactor=1.08,
+                    minNeighbors=4,
+                    minSize=(max(8, fw // 9), max(8, fh // 12)),
+                )
+            smiles = []
+            if smile_cascade is not None and lower.size > 0:
+                smiles = smile_cascade.detectMultiScale(
+                    lower,
+                    scaleFactor=1.15,
+                    minNeighbors=14,
+                    minSize=(max(12, fw // 5), max(8, fh // 12)),
+                )
+            lower_edges = 0.0
+            lower_dark = 0.0
+            upper_edges = 0.0
+            if lower.size > 0:
+                lower_edges = float((cv2.Canny(lower, 60, 130) > 0).mean())
+                lower_dark = float((lower < 55).mean())
+            if upper.size > 0:
+                upper_edges = float((cv2.Canny(upper, 70, 140) > 0).mean())
+            area_ratio = float(fw * fh) / max(float(w * h), 1.0)
+            face_conf = 0.35 + min(area_ratio / 0.018, 1.0) * 0.25 + min(float(fw) / 96.0, 1.0) * 0.20
+            if len(eyes) > 0:
+                face_conf += 0.12
+            if source != 'frontal':
+                face_conf -= 0.05
+            if source == 'pose_head_roi':
+                face_conf = min(face_conf, 0.38)
+            face_conf = max(0.0, min(0.98, face_conf))
+            eye_closed = len(eyes) == 0 and face_conf >= 0.45
+            mouth_open = (len(smiles) > 0) or (lower_dark >= 0.080 and lower_edges >= 0.018)
+            detections.append({
+                'frame_idx': fidx,
+                'time_sec': round(self._finite_float(entry.get('time_sec'), 0.0), 3),
+                'source': source,
+                'confidence': round(face_conf, 4),
+                'face_area_ratio': round(area_ratio, 5),
+                'eyes': int(len(eyes)),
+                'eye_closed': bool(eye_closed),
+                'mouth_open_proxy': bool(mouth_open),
+                'upper_tension_proxy': bool(upper_edges >= 0.075),
+                'lower_dark_ratio': round(lower_dark, 4),
+                'lower_edge_density': round(lower_edges, 4),
+                'upper_edge_density': round(upper_edges, 4),
+                'emotion_available': bool(emotion.get('available')),
+                'emotion_model': emotion.get('model') or 'unavailable',
+                'emotion_model_path': emotion.get('model_path') or '',
+                'emotion_top': emotion.get('top_label') or 'unavailable',
+                'emotion_top_label': emotion.get('top_label_ko') or '분석 불가',
+                'emotion_score': round(self._finite_float(emotion.get('top_score'), 0.0), 4),
+                'emotion_probs': emotion.get('probs') or {},
+                'distress_score': round(self._finite_float(emotion.get('distress_score'), 0.0), 4),
+                'driver_state_available': bool(driver_state and driver_state.get('available')),
+                'driver_state_model': (driver_state or {}).get('model') or 'unavailable',
+                'driver_state_top': (driver_state or {}).get('top_label') or 'unavailable',
+                'driver_state_top_label': (driver_state or {}).get('top_label_ko') or '상태 분석 불가',
+                'driver_state_score': round(self._finite_float((driver_state or {}).get('top_score'), 0.0), 4),
+                'driver_state_probs': (driver_state or {}).get('probs') or {},
+                'driver_state_risk': round(self._finite_float((driver_state or {}).get('risk_score'), 0.0), 4),
+            })
+
+        if not detections:
+            res = self._facial_aux_default('face_not_detected', '낙상 후보 프레임에서 얼굴을 안정적으로 검출하지 못했습니다.')
+            res.update({
+                'checked_frames': checked,
+                'trigger_threshold': round(suspect, 4),
+                'body_score': round(score, 4),
+                'analysis_mode': analysis_mode,
+                'body_suspected': body_suspected,
+            })
+            return res
+
+        det_count = len(detections)
+        avg_conf = sum(d['confidence'] for d in detections) / max(det_count, 1)
+        actual_face_detections = [d for d in detections if d.get('source') != 'pose_head_roi']
+        actual_face_count = len(actual_face_detections)
+        actual_face_ratio = actual_face_count / max(det_count, 1)
+        micro_base = actual_face_detections or detections
+        micro_den = max(len(micro_base), 1)
+        eye_closed_ratio = sum(1 for d in micro_base if d['eye_closed']) / micro_den
+        mouth_ratio = sum(1 for d in micro_base if d['mouth_open_proxy']) / micro_den
+        tension_ratio = sum(1 for d in micro_base if d['upper_tension_proxy']) / micro_den
+        emotion_detections = [d for d in detections if d.get('emotion_available') and d.get('emotion_probs')]
+        emotion_available_count = len(emotion_detections)
+        emotion_probs = {}
+        if emotion_available_count:
+            for label in self._facial_emotion_labels_for_probs(emotion_detections):
+                emotion_probs[label] = round(
+                    sum(self._finite_float((d.get('emotion_probs') or {}).get(label), 0.0) for d in emotion_detections)
+                    / max(emotion_available_count, 1),
+                    4,
+                )
+        top_emotion = max(emotion_probs, key=lambda key: emotion_probs.get(key, 0.0)) if emotion_probs else 'unavailable'
+        top_emotion_label = self._FACIAL_EMOTION_LABEL_KO.get(top_emotion, '분석 불가')
+        top_emotion_score = self._finite_float(emotion_probs.get(top_emotion), 0.0) if emotion_probs else 0.0
+        distress_score = self._facial_emotion_distress_score(emotion_probs)
+        active_emotion_model = emotion_detections[-1].get('emotion_model') if emotion_detections else 'unavailable'
+        active_emotion_model_path = emotion_detections[-1].get('emotion_model_path') if emotion_detections else ''
+        head_roi_ratio = sum(1 for d in detections if d.get('source') == 'pose_head_roi') / max(det_count, 1)
+        emotion_consistency = 0.0
+        if emotion_available_count and top_emotion != 'unavailable':
+            emotion_consistency = sum(1 for d in emotion_detections if d.get('emotion_top') == top_emotion) / max(emotion_available_count, 1)
+        emotion_quality = self._facial_emotion_quality(emotion_probs, avg_conf, head_roi_ratio, emotion_consistency or 1.0)
+        emotion_reliable = bool(emotion_quality.get('reliable'))
+        display_emotion_label = emotion_quality.get('display_label') or top_emotion_label
+        driver_detections = [d for d in detections if d.get('driver_state_available') and d.get('driver_state_probs')]
+        driver_available_count = len(driver_detections)
+        driver_probs = {}
+        if driver_available_count:
+            labels = list(self._FACIAL_DRIVER_STATE_LABELS)
+            for label in labels:
+                driver_probs[label] = round(
+                    sum(self._finite_float((d.get('driver_state_probs') or {}).get(label), 0.0) for d in driver_detections)
+                    / max(driver_available_count, 1),
+                    4,
+                )
+        driver_top = max(driver_probs, key=lambda key: driver_probs.get(key, 0.0)) if driver_probs else 'unavailable'
+        driver_top_label = self._FACIAL_DRIVER_STATE_LABEL_KO.get(driver_top, '상태 분석 불가')
+        driver_top_score = self._finite_float(driver_probs.get(driver_top), 0.0) if driver_probs else 0.0
+        driver_risk_score = self._facial_driver_state_risk_score(driver_probs)
+        active_driver_model = driver_detections[-1].get('driver_state_model') if driver_detections else 'unavailable'
+        driver_reliable = bool(driver_available_count and actual_face_ratio >= 0.50 and avg_conf >= 0.42 and driver_top_score >= 0.45)
+
+        quality_gate = 1.0 if emotion_reliable else 0.25
+        if head_roi_ratio >= 0.50:
+            quality_gate *= 0.40
+        if avg_conf < 0.42:
+            quality_gate *= 0.70
+        if actual_face_ratio < 0.50:
+            quality_gate *= 0.60
+        trusted_distress_score = max(0.0, min(1.0, distress_score * quality_gate))
+
+        support = 0.0
+        near_miss_floor = max(0.28, confirm - 0.14)
+        near_miss_rescue_candidate = False
+        distress_apply_threshold = 0.30 if head_roi_ratio >= 0.50 or avg_conf < 0.42 else 0.20
+        facial_micro_evidence = bool(
+            (avg_conf >= 0.42 and eye_closed_ratio >= 0.50)
+            or (actual_face_ratio >= 0.50 and mouth_ratio >= 0.40)
+            or (actual_face_ratio >= 0.50 and tension_ratio >= 0.50)
+        )
+        if emotion_available_count:
+            emotion_weight = 0.085 * (0.55 if head_roi_ratio >= 0.50 or avg_conf < 0.42 else 1.0)
+            emotion_support_allowed = emotion_reliable or (facial_micro_evidence and trusted_distress_score >= 0.20)
+            if trusted_distress_score >= distress_apply_threshold and emotion_support_allowed:
+                support += trusted_distress_score * emotion_weight
+            if avg_conf >= 0.42 and eye_closed_ratio >= 0.50 and trusted_distress_score >= distress_apply_threshold:
+                support += 0.010
+            if actual_face_ratio >= 0.50 and mouth_ratio >= 0.40 and trusted_distress_score >= distress_apply_threshold:
+                support += 0.008
+            if actual_face_ratio >= 0.50 and tension_ratio >= 0.50 and trusted_distress_score >= distress_apply_threshold:
+                support += 0.008
+        else:
+            # No emotion model output: keep face detection visible, but do not alter fall score.
+            support = 0.0
+        if driver_reliable and driver_risk_score >= 0.35:
+            driver_weight = 0.030 * (0.55 if head_roi_ratio >= 0.50 or avg_conf < 0.42 else 1.0)
+            support += driver_risk_score * driver_weight
+        near_miss_rescue_candidate = bool(
+            score >= near_miss_floor
+            and score < confirm
+            and actual_face_ratio >= 0.75
+            and avg_conf >= 0.50
+            and driver_reliable
+            and driver_risk_score >= 0.55
+            and (
+                eye_closed_ratio >= 0.50
+                or mouth_ratio >= 0.50
+                or tension_ratio >= 0.50
+                or trusted_distress_score >= 0.14
+            )
+        )
+        if near_miss_rescue_candidate:
+            rescue_support = max(
+                support,
+                driver_risk_score * 0.12 + min(0.025, trusted_distress_score * 0.10),
+            )
+            gap_to_confirm = max(0.0, confirm - score)
+            if gap_to_confirm <= self._FACIAL_AUX_SCORE_CAP:
+                rescue_support = max(rescue_support, gap_to_confirm + 0.010)
+            support = max(support, rescue_support)
+        support = min(self._FACIAL_AUX_SCORE_CAP, max(0.0, support))
+
+        if not emotion_available_count and driver_reliable and driver_risk_score >= 0.45 and driver_top in ('drowsy', 'yawn'):
+            state = 'reduced_alertness_possible'
+            label = f'{driver_top_label} 기반 주의저하 가능'
+        elif is_realtime and not body_suspected and not run_facial_models:
+            state = 'realtime_periodic_cache'
+            label = '표정 주기 갱신 대기'
+        elif actual_face_count <= 0:
+            state = 'face_not_visible'
+            label = '얼굴/표정 미검출'
+        elif not emotion_available_count:
+            state = 'emotion_model_unavailable'
+            label = '얼굴 검출/표정모델 없음'
+        elif emotion_reliable and top_emotion == 'neutral' and trusted_distress_score < 0.20 and driver_risk_score < 0.35:
+            state = 'neutral_face'
+            label = '표정 이상 없음'
+        elif emotion_reliable and trusted_distress_score < 0.20 and driver_risk_score < 0.35:
+            state = 'neutral_or_low_risk_face'
+            label = '표정 이상 없음'
+        elif emotion_reliable and trusted_distress_score >= 0.45 and top_emotion in ('fear', 'anxiety', 'hurt', 'sadness', 'anger', 'disgust', 'contempt'):
+            state = 'distress_possible'
+            label = f'{display_emotion_label} 기반 불편 가능'
+        elif emotion_reliable and top_emotion == 'surprise' and top_emotion_score >= 0.35:
+            state = 'surprise_possible'
+            label = '놀람 가능'
+        elif eye_closed_ratio >= 0.50 and avg_conf >= 0.42 and trusted_distress_score >= 0.20:
+            state = 'eyes_closed_possible'
+            label = '눈 감김 가능'
+        elif trusted_distress_score >= 0.30 and (emotion_reliable or facial_micro_evidence):
+            state = 'weak_distress_possible'
+            label = '약한 불편 신호'
+        elif driver_reliable and driver_risk_score >= 0.45 and driver_top in ('drowsy', 'yawn'):
+            state = 'reduced_alertness_possible'
+            label = f'{driver_top_label} 기반 주의저하 가능'
+        else:
+            state = 'neutral_or_unclear'
+            label = '표정 근거 약함' if not emotion_reliable else f'{display_emotion_label} / 낙상 근거 약함'
+
+        evidence_lines = self._facial_evidence_lines(
+            quality=emotion_quality,
+            distress_score=float(distress_score),
+            trusted_distress_score=float(trusted_distress_score),
+            driver_top_label=driver_top_label,
+            driver_top_score=float(driver_top_score),
+            driver_risk_score=float(driver_risk_score),
+            avg_conf=float(avg_conf),
+            det_count=int(det_count),
+            checked=int(checked),
+            eye_closed_ratio=float(eye_closed_ratio),
+            mouth_ratio=float(mouth_ratio),
+            tension_ratio=float(tension_ratio),
+            head_roi_ratio=float(head_roi_ratio),
+            actual_face_ratio=float(actual_face_ratio),
+            driver_reliable=bool(driver_reliable),
+        )
+
+        result = {
+            'enabled': True,
+            'model': 'facial-emotion+opencv-face',
+            'emotion_model': active_emotion_model,
+            'driver_state_model': active_driver_model,
+            'emotion_model_path': active_emotion_model_path or (self._facial_aihub82_model_path() if os.path.isfile(self._facial_aihub82_model_path()) else self._facial_emotion_model_path()),
+            'driver_state_model_path': self._facial_driver_state_model_path(),
+            'emotion_model_source': 'External AI-Hub 82 EmotionNet if available, otherwise local AI-Hub 82/FER+ fallback',
+            'driver_state_model_source': 'AI-Hub 173 fine-tuned driver-state auxiliary classifier',
+            'available': True,
+            'applied': False,
+            'state': state,
+            'label': label,
+            'reason': 'analyzed',
+            'description': 'OpenCV 얼굴 검출 후 AI-Hub 82 학습 모델을 우선 사용하고, 없으면 FER+ ONNX 모델로 감정 확률을 계산합니다. 최종 낙상 점수 반영은 낙상 의심 구간에서만 수행합니다.',
+            'face_detected': bool(actual_face_count > 0),
+            'face_visible': bool(actual_face_count > 0),
+            'facial_emotion': state,
+            'facial_confidence': round(avg_conf, 4),
+            'emotion_top': top_emotion,
+            'emotion_top_label': top_emotion_label,
+            'emotion_display_label': display_emotion_label,
+            'emotion_confidence': round(top_emotion_score, 4),
+            'emotion_margin': emotion_quality.get('margin', 0.0),
+            'emotion_entropy': emotion_quality.get('entropy', 1.0),
+            'emotion_consistency': emotion_quality.get('consistency', 0.0),
+            'emotion_quality': emotion_quality.get('quality', 'unavailable'),
+            'emotion_reliable': bool(emotion_reliable),
+            'emotion_top3': emotion_quality.get('top_emotions', []),
+            'emotion_probs': emotion_probs,
+            'emotion_available_count': emotion_available_count,
+            'distress_score': round(float(distress_score), 4),
+            'trusted_distress_score': round(float(trusted_distress_score), 4),
+            'distress_apply_threshold': round(float(distress_apply_threshold), 4),
+            'driver_state_top': driver_top,
+            'driver_state_top_label': driver_top_label,
+            'driver_state_confidence': round(float(driver_top_score), 4),
+            'driver_state_probs': driver_probs,
+            'driver_state_risk': round(float(driver_risk_score), 4),
+            'driver_state_reliable': bool(driver_reliable),
+            'driver_state_available_count': driver_available_count,
+            'eye_closed': bool(eye_closed_ratio >= 0.50 and avg_conf >= 0.42),
+            'support_score': round(support, 4),
+            'near_miss_rescue_candidate': bool(near_miss_rescue_candidate),
+            'near_miss_floor': round(float(near_miss_floor), 4),
+            'score_cap': self._FACIAL_AUX_SCORE_CAP,
+            'score_policy': 'positive_only_auxiliary',
+            'checked_frames': checked,
+            'detections': det_count,
+            'detection_rate': round(det_count / max(checked, 1), 4),
+            'actual_face_detections': actual_face_count,
+            'actual_face_ratio': round(float(actual_face_ratio), 4),
+            'eye_closed_ratio': round(eye_closed_ratio, 4),
+            'mouth_open_ratio': round(mouth_ratio, 4),
+            'upper_tension_ratio': round(tension_ratio, 4),
+            'pose_head_roi_ratio': round(head_roi_ratio, 4),
+            'trigger_threshold': round(suspect, 4),
+            'body_score': round(score, 4),
+            'analysis_mode': analysis_mode,
+            'body_suspected': body_suspected,
+            'realtime_monitor_interval_sec': round(monitor_interval, 2) if is_realtime else 0,
+            'realtime_driver_interval_sec': round(driver_interval, 2) if is_realtime else 0,
+            'evidence_summary': evidence_lines,
+            'evidence': detections[-3:],
+        }
+        if is_realtime and not body_suspected and not _upload_chunk:
+            cached_result = copy.deepcopy(result)
+            cached_result['_cached_at'] = time.time()
+            cache_map[session_key] = cached_result
+            if len(cache_map) > 16:
+                oldest = sorted(cache_map.items(), key=lambda item: self._finite_float((item[1] or {}).get('_cached_at'), 0.0))[:4]
+                for key, _ in oldest:
+                    cache_map.pop(key, None)
+            self.__class__._facial_state_realtime_cache = cache_map
+            self.__class__._facial_state_realtime_cache_ts = cached_result['_cached_at']
+        return result
+
     # ── FN-20260406-0006: Unified person timeseries extractor ──────────
     # Combines bbox + keypoint + time data into a single normalized timeseries
     # per track/frame, then builds sliding-window feature vectors.
 
-    # Full 37-feature column list for XG-Fall / XG-Posture
+    # Full feature column list for XG-Fall / XG-Posture
     _XG_FEATURE_COLUMNS = [
         # === Original XGBoost 10 (bbox-derived, window-level) ===
         'center_dy', 'height_ratio', 'aspect_change', 'stillness',
         'floor_proximity', 'area_change', 'vert_horiz_ratio',
+        'center_dx_abs_mean', 'center_x_span',
         'max_down_speed', 'avg_conf', 'n_points',
         # === Pose-derived 12 (from RF-Pose, normalized) ===
         'pose_tilt_mean', 'pose_tilt_max',
         'pose_height_ratio_mean', 'pose_height_ratio_min',
         'pose_knee_bend_mean', 'pose_knee_bend_min',
+        'pose_knee_support_mean', 'pose_knee_support_min',
+        'lower_body_visibility', 'straight_leg_ratio',
+        'support_leg_ratio', 'bent_leg_ratio',
         'pose_spread_mean', 'pose_spread_max',
         'pose_descent_mean', 'pose_descent_max',
         'pose_change_mean', 'pose_change_max',
+        # === Pose geometry for behavior classification ===
+        'shoulder_width', 'hip_width', 'ankle_width', 'wrist_width',
+        'knee_width', 'foot_y_diff', 'shoulder_hip_ratio',
+        'ankle_hip_ratio', 'wrist_shoulder_ratio', 'limb_extension_ratio',
+        'body_compactness', 'knee_asymmetry', 'elbow_bend_mean',
+        'arm_extension_ratio',
+        # === Upper/lower skeleton bbox geometry ===
+        'full_skeleton_aspect', 'full_skeleton_height',
+        'upper_body_aspect', 'lower_body_aspect',
+        'upper_lower_height_ratio', 'upper_lower_center_gap',
+        'upper_lower_width_ratio', 'torso_verticality',
+        'leg_verticality', 'lower_body_extension',
         # === Temporal / transition 5 ===
         'descent_duration', 'oscillation_count', 'speed_std',
         'post_descent_stillness', 'upper_body_motion',
@@ -1181,9 +3873,174 @@ class VideoAnalysis:
         'step_period_est', 'knee_angle_cycle_strength', 'center_y_periodicity',
         # === Lie/fall discrimination 3 ===
         'tilt_change_duration', 'spread_after_descent', 'floor_proximity_slope',
+        # === Fall-specialized 6 ===
+        'floor_contact_ratio', 'height_drop_persistence', 'collapse_impulse', 'post_floor_stability',
+        'slow_descent_ratio', 'tilt_height_collapse',
+        # === Behavior-disambiguation derived features ===
+        'horizontal_motion_energy', 'vertical_motion_energy', 'total_motion_energy',
+        'gait_dynamic_score', 'run_stride_score', 'sit_geometry_score',
+        'lie_geometry_score', 'upright_geometry_score', 'knee_bend_intensity',
+        'stationary_bent_score', 'flatness_score', 'support_stability_score',
+        'pose_compactness_score', 'dynamic_pose_ratio',
+        'low_height_floor_score', 'floor_height_ratio', 'horizontal_pose_score',
+        'lie_stand_separation_score',
+        # === 3D-pose-inspired proxy features ===
+        'torso_width_ratio', 'lower_upper_width_ratio', 'apparent_depth_score',
+        'horizontal_flat_pose_score', 'low_flat_still_score',
+        'sit_lie_depth_contrast', 'width_height_volume_proxy',
+        'pose_width_variability', 'pose_height_variability', 'apparent_depth_motion',
+        'standing_skeleton_score', 'lying_skeleton_score', 'sitting_skeleton_score',
     ]
 
-    def _extract_unified_timeseries(self, video_path, input_source='upload', duration_hint=0):
+    def _walk_displacement_signal(self, center_span, center_dx, speed_std=0.0, lower_body_visibility=1.0):
+        center_span = self._metadata_to_number(center_span, 0.0)
+        center_dx = self._metadata_to_number(center_dx, 0.0)
+        speed_std = self._metadata_to_number(speed_std, 0.0)
+        lower_body_visibility = self._metadata_to_number(lower_body_visibility, 1.0)
+        if lower_body_visibility < 0.25:
+            return (center_span >= 0.120 and center_dx >= 0.018) or center_span >= 0.180
+        return (
+            center_span >= 0.070
+            or center_dx >= 0.026
+            or (center_span >= 0.060 and center_dx >= 0.022 and speed_std >= 0.010)
+        )
+
+    def _augment_xg_behavior_features(self, row):
+        def _num(key, default=0.0):
+            try:
+                return float(row.get(key, default) or default)
+            except Exception:
+                return float(default)
+
+        center_dy = _num('center_dy')
+        center_dx = _num('center_dx_abs_mean')
+        center_x_span = _num('center_x_span')
+        max_down_speed = _num('max_down_speed')
+        stillness = max(0.0, min(1.0, _num('stillness')))
+        speed_std = _num('speed_std')
+        pose_change = _num('pose_change_mean')
+        periodicity = _num('center_y_periodicity')
+        knee_cycle = _num('knee_angle_cycle_strength')
+        floor_prox = _num('floor_proximity')
+        floor_contact = _num('floor_contact_ratio')
+        pose_tilt = _num('pose_tilt_mean')
+        pose_height = _num('pose_height_ratio_mean')
+        pose_height_min = _num('pose_height_ratio_min')
+        pose_knee = max(0.0, min(180.0, _num('pose_knee_bend_mean', 180.0)))
+        support_leg = max(0.0, min(1.0, _num('support_leg_ratio')))
+        straight_leg = max(0.0, min(1.0, _num('straight_leg_ratio')))
+        bent_leg = max(0.0, min(1.0, _num('bent_leg_ratio')))
+        lower_vis = max(0.0, min(1.0, _num('lower_body_visibility')))
+        pose_spread = _num('pose_spread_mean')
+        pose_spread_max = _num('pose_spread_max')
+        shoulder_width = _num('shoulder_width')
+        hip_width = _num('hip_width')
+        ankle_width = _num('ankle_width')
+        wrist_width = _num('wrist_width')
+        knee_width = _num('knee_width')
+        limb_extension = _num('limb_extension_ratio')
+        body_compactness = _num('body_compactness')
+        upper_body_motion = _num('upper_body_motion')
+        upper_temporal_motion = _num('upper_body_temporal_motion')
+        upper_center_x_span = _num('upper_center_x_span')
+        upper_center_dx = _num('upper_center_dx_abs_mean')
+        upper_center_y_std = _num('upper_center_y_std')
+        shoulder_center_x_span = _num('shoulder_center_x_span')
+        shoulder_center_dx = _num('shoulder_center_dx_abs_mean')
+        torso_tilt_std = _num('torso_tilt_std')
+        post_still = max(0.0, min(1.0, _num('post_descent_stillness')))
+        pre_still = max(0.0, min(1.0, _num('pre_descent_stillness')))
+        pose_width_std = _num('pose_width_std')
+        pose_height_std = _num('pose_height_std')
+        torso_width_std = _num('torso_width_std')
+        full_skel_aspect = _num('full_skeleton_aspect')
+        full_skel_height = _num('full_skeleton_height')
+        upper_body_aspect = _num('upper_body_aspect')
+        lower_body_aspect = _num('lower_body_aspect')
+        upper_lower_gap = _num('upper_lower_center_gap')
+        upper_lower_height_ratio = _num('upper_lower_height_ratio')
+        upper_lower_width_ratio = _num('upper_lower_width_ratio')
+        torso_verticality = _num('torso_verticality')
+        leg_verticality = _num('leg_verticality')
+        lower_body_extension = _num('lower_body_extension')
+
+        horizontal_energy = center_dx + center_x_span
+        vertical_energy = abs(center_dy) + max_down_speed + speed_std
+        upper_motion_energy = (
+            upper_temporal_motion
+            + upper_center_dx
+            + upper_center_x_span * 0.35
+            + upper_center_y_std * 0.25
+            + shoulder_center_dx
+            + shoulder_center_x_span * 0.25
+            + min(torso_tilt_std / 90.0, 1.0) * 0.08
+        )
+        knee_bend = (180.0 - pose_knee) / 180.0
+        low_height_floor = floor_prox * (1.0 - min(1.0, pose_height_min)) * stillness
+        floor_height_ratio = (floor_prox + 0.01) / (pose_height_min + 0.08)
+        horizontal_pose = (pose_spread + pose_spread_max) / (pose_height_min + 0.08)
+        torso_width_ratio = shoulder_width / (hip_width + 0.015)
+        lower_upper_width_ratio = (ankle_width + knee_width) / (shoulder_width + hip_width + 0.02)
+        apparent_depth_score = (
+            abs(torso_width_ratio - 1.0) * 0.35
+            + abs(_num('ankle_hip_ratio') - 1.0) * 0.22
+            + min(2.0, _num('wrist_shoulder_ratio')) * 0.15
+            + (torso_width_std + pose_width_std) * 1.5
+        )
+        horizontal_flat_pose = horizontal_pose + limb_extension * 0.25 + lower_upper_width_ratio * 0.12
+        low_flat_still = low_height_floor * (horizontal_flat_pose + 0.2) * (stillness + 0.2)
+        sit_lie_depth_contrast = horizontal_flat_pose - bent_leg * 0.55 - support_leg * 0.18
+        width_height_volume = (shoulder_width + hip_width + ankle_width + wrist_width + knee_width) / (pose_height_min + 0.08)
+        vertical_skeleton = max(0.0, min(1.0, (1.0 - min(full_skel_aspect, 1.4) / 1.4))) + torso_verticality + leg_verticality
+        horizontal_skeleton = max(0.0, min(1.0, (full_skel_aspect - 0.65) / 1.10)) + max(0.0, 1.0 - torso_verticality) + max(0.0, 1.0 - leg_verticality)
+        standing_skeleton_score = vertical_skeleton * 0.45 + support_leg * 0.35 + straight_leg * 0.30 + full_skel_height * 0.55
+        lying_skeleton_score = horizontal_skeleton * 0.45 + horizontal_pose * 0.35 + low_flat_still * 0.35 - support_leg * 0.25
+        sitting_skeleton_score = bent_leg * 0.55 + knee_bend * 0.45 + torso_verticality * 0.25 + max(0.0, 0.40 - lower_body_extension) * 0.45
+        body_translation_signal = center_x_span >= 0.070 or center_dx >= 0.018 or (speed_std >= 0.012 and center_x_span >= 0.045)
+        weak_body_translation_signal = center_x_span >= 0.045 or center_dx >= 0.012 or (speed_std >= 0.008 and center_x_span >= 0.030)
+        walk_displacement_signal = self._walk_displacement_signal(center_x_span, center_dx, speed_std, lower_vis)
+        upper_gait_support = upper_motion_energy if walk_displacement_signal else upper_motion_energy * 0.20
+        row.update({
+            'horizontal_motion_energy': horizontal_energy,
+            'vertical_motion_energy': vertical_energy,
+            'total_motion_energy': horizontal_energy + vertical_energy + pose_change * 3.0 + upper_body_motion + upper_motion_energy,
+            'upper_motion_energy': upper_motion_energy,
+            'body_translation_signal': 1.0 if body_translation_signal else 0.0,
+            'weak_body_translation_signal': 1.0 if weak_body_translation_signal else 0.0,
+            'walk_displacement_signal': 1.0 if walk_displacement_signal else 0.0,
+            'gait_dynamic_score': (center_x_span + center_dx * 2.2 + upper_gait_support * 0.55) * (1.0 - stillness) + periodicity * 0.22 + knee_cycle * 0.16,
+            'run_stride_score': (center_x_span + center_dx * 3.2 + speed_std * 2.0 + upper_gait_support * 0.45) / (stillness + 0.25),
+            'sit_geometry_score': bent_leg * 1.6 + knee_bend * 1.2 + floor_prox * 0.35 + stillness * 0.55 - center_x_span * 0.9,
+            'lie_geometry_score': (pose_spread + pose_spread_max) / (pose_height_min + 0.05) + floor_contact * 0.7 + min(pose_tilt, 90.0) / 120.0,
+            'upright_geometry_score': support_leg * 0.7 + straight_leg * 0.6 + pose_height * 0.8 - min(pose_tilt, 90.0) / 90.0,
+            'knee_bend_intensity': knee_bend,
+            'stationary_bent_score': stillness * bent_leg * lower_vis,
+            'flatness_score': pose_spread / (pose_height + 0.05) + min(pose_tilt, 90.0) / 90.0,
+            'support_stability_score': lower_vis * (support_leg + straight_leg) * 0.5 + post_still * 0.25 + pre_still * 0.15,
+            'pose_compactness_score': body_compactness / (limb_extension + 0.15),
+            'dynamic_pose_ratio': pose_change / (horizontal_energy + vertical_energy + 0.01),
+            'low_height_floor_score': low_height_floor,
+            'floor_height_ratio': floor_height_ratio,
+            'horizontal_pose_score': horizontal_pose,
+            'lie_stand_separation_score': low_height_floor + horizontal_pose * 0.35 - support_leg * 0.12,
+            'torso_width_ratio': torso_width_ratio,
+            'lower_upper_width_ratio': lower_upper_width_ratio,
+            'apparent_depth_score': apparent_depth_score,
+            'horizontal_flat_pose_score': horizontal_flat_pose,
+            'low_flat_still_score': low_flat_still,
+            'sit_lie_depth_contrast': sit_lie_depth_contrast,
+            'width_height_volume_proxy': width_height_volume,
+            'pose_width_variability': pose_width_std,
+            'pose_height_variability': pose_height_std,
+            'apparent_depth_motion': torso_width_std + pose_width_std + pose_height_std * 0.5,
+            'standing_skeleton_score': standing_skeleton_score,
+            'lying_skeleton_score': lying_skeleton_score,
+            'sitting_skeleton_score': sitting_skeleton_score,
+        })
+        return row
+
+    def _extract_unified_timeseries(self, video_path, input_source='upload', duration_hint=0,
+                                     target_fps_override=None, max_frames_override=None):
         """Extract unified per-frame bbox + keypoint timeseries (all normalized coords).
 
         Returns dict with:
@@ -1192,6 +4049,10 @@ class VideoAnalysis:
             - 'detection_frames': raw detection data for visualization
             - 'perf': timing dict
             - 'raw_frames': sampled frames (for backward compat)
+
+        Optional overrides for RF-Dual single-pass:
+            - target_fps_override: override default target_fps
+            - max_frames_override: override default max_frames cap
         """
         import numpy as np
         import time as _time
@@ -1216,17 +4077,190 @@ class VideoAnalysis:
         vid_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         vid_duration = round(total_frames_raw / orig_fps, 2) if orig_fps > 0 else 0.0
 
-        target_fps = 8 if _is_realtime else self._RF_TARGET_FPS   # FN-0021: 3→8fps for more frames per window
-        max_frames = 40 if _is_realtime else 0                      # FN-0021: 12→40 (5s×8fps=40)
-        yolo_imgsz = 480 if _is_realtime else self._RF_YOLO_IMGSZ
+        # FN-0003: allow callers (e.g. rf-dual single-pass) to override fps/max_frames
+        target_fps = target_fps_override or (self._POSTURE_REALTIME_TARGET_FPS if _is_realtime else self._RF_TARGET_FPS)
+        max_frames = max_frames_override if max_frames_override is not None else (int(4 * self._POSTURE_REALTIME_TARGET_FPS) if _is_realtime else 0)
+        yolo_imgsz = self._RF_REALTIME_YOLO_IMGSZ if _is_realtime else self._RF_YOLO_IMGSZ
         step = max(int(round(orig_fps / target_fps)), 1)
+        expected_sampled_frames = 0
+        if total_frames_raw > 0:
+            expected_sampled_frames = len(range(0, total_frames_raw, step))
+            if max_frames > 0:
+                expected_sampled_frames = min(expected_sampled_frames, max_frames)
+
+        def _sample_video_frames(step_value, max_frames_value):
+            local_cap = cv2.VideoCapture(str(video_path))
+            if not local_cap.isOpened():
+                raise Exception(f'영상 열기 실패: {video_path}')
+            sampled_frames = []
+            if total_frames_raw > 0 and step_value > 1:
+                target_indices = list(range(0, total_frames_raw, step_value))
+                if max_frames_value > 0:
+                    target_indices = target_indices[:max_frames_value]
+                target_set = set(target_indices)
+                frame_idx = 0
+                while target_indices and frame_idx <= target_indices[-1]:
+                    ret = local_cap.grab()
+                    if not ret:
+                        break
+                    if frame_idx in target_set:
+                        ret2, frame = local_cap.retrieve()
+                        if ret2:
+                            if _resize_to is not None:
+                                frame = cv2.resize(frame, _resize_to)
+                            sampled_frames.append((frame_idx, frame))
+                            if max_frames_value > 0 and len(sampled_frames) >= max_frames_value:
+                                break
+                    frame_idx += 1
+            else:
+                frame_idx = 0
+                while True:
+                    ret = local_cap.grab()
+                    if not ret:
+                        break
+                    if frame_idx % step_value == 0:
+                        ret2, frame = local_cap.retrieve()
+                        if ret2:
+                            if _resize_to is not None:
+                                frame = cv2.resize(frame, _resize_to)
+                            sampled_frames.append((frame_idx, frame))
+                            if max_frames_value > 0 and len(sampled_frames) >= max_frames_value:
+                                break
+                    frame_idx += 1
+            local_cap.release()
+            return sampled_frames
+
+        def _sample_video_frames_by_seek(step_value, max_frames_value):
+            local_cap = cv2.VideoCapture(str(video_path))
+            if not local_cap.isOpened():
+                raise Exception(f'영상 열기 실패: {video_path}')
+            sampled_frames = []
+            if total_frames_raw > 0:
+                target_indices = list(range(0, total_frames_raw, max(int(step_value or 1), 1)))
+            else:
+                target_indices = []
+            if max_frames_value > 0:
+                target_indices = target_indices[:max_frames_value]
+            for frame_idx in target_indices:
+                try:
+                    local_cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                    ret, frame = local_cap.read()
+                except Exception:
+                    ret, frame = False, None
+                if ret and frame is not None:
+                    if _resize_to is not None:
+                        frame = cv2.resize(frame, _resize_to)
+                    sampled_frames.append((int(frame_idx), frame))
+            local_cap.release()
+            return sampled_frames
+
+        def _build_unified_timeseries(frame_indices, frame_images, batch_results):
+            _norm_w = max(vid_width, 1)
+            _norm_h = max(vid_height, 1)
+            _coord_sx = vid_width / _resize_to[0] if _resize_to else 1.0
+            _coord_sy = vid_height / _resize_to[1] if _resize_to else 1.0
+
+            local_timeseries = []
+            local_detection_frames_vis = []
+
+            for i, r in enumerate(batch_results):
+                fidx = frame_indices[i]
+                boxes = r.boxes
+                kpts = getattr(r, 'keypoints', None)
+                if boxes is None or len(boxes) == 0:
+                    continue
+
+                best_idx, best_area = -1, -1
+                for bi, b in enumerate(boxes):
+                    if int(b.cls.item()) != self._RF_PERSON_CLASS_ID:
+                        continue
+                    x1, y1, x2, y2 = b.xyxy[0].tolist()
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > best_area:
+                        best_area = area
+                        best_idx = bi
+
+                if best_idx < 0:
+                    continue
+
+                b = boxes[best_idx]
+                x1, y1, x2, y2 = b.xyxy[0].tolist()
+                ox1, oy1 = x1 * _coord_sx, y1 * _coord_sy
+                ox2, oy2 = x2 * _coord_sx, y2 * _coord_sy
+                bw, bh = ox2 - ox1, oy2 - oy1
+                cx, cy = (ox1 + ox2) / 2 / _norm_w, (oy1 + oy2) / 2 / _norm_h
+                nw, nh = bw / _norm_w, bh / _norm_h
+
+                entry = {
+                    'frame_idx': fidx,
+                    'time_sec': round(fidx / orig_fps, 4) if orig_fps > 0 else 0,
+                    'bbox': {
+                        'cx': cx, 'cy': cy,
+                        'w': nw, 'h': nh,
+                        'aspect_ratio': nw / (nh + 1e-9),
+                        'area': nw * nh,
+                        'conf': float(b.conf.item()),
+                    },
+                    'keypoints': None,
+                }
+
+                if kpts is not None and best_idx < len(kpts.data):
+                    kp_data = kpts.data[best_idx].cpu().numpy()
+                    kp_norm = []
+                    for kp in kp_data:
+                        kp_norm.append({
+                            'x': float(kp[0]) * _coord_sx / _norm_w,
+                            'y': float(kp[1]) * _coord_sy / _norm_h,
+                            'conf': float(kp[2]),
+                        })
+                    entry['keypoints'] = kp_norm
+
+                local_timeseries.append(entry)
+
+                vis_dets = []
+                for bi2, b2 in enumerate(boxes):
+                    if int(b2.cls.item()) != self._RF_PERSON_CLASS_ID:
+                        continue
+                    vx1, vy1, vx2, vy2 = b2.xyxy[0].tolist()
+                    det_vis = {
+                        'x1': round(vx1 * _coord_sx, 1), 'y1': round(vy1 * _coord_sy, 1),
+                        'x2': round(vx2 * _coord_sx, 1), 'y2': round(vy2 * _coord_sy, 1),
+                        'conf': round(float(b2.conf.item()), 3),
+                    }
+                    if kpts is not None and bi2 < len(kpts.data):
+                        kp_raw = kpts.data[bi2].cpu().numpy()
+                        kp_s = []
+                        for kp in kp_raw:
+                            kp_s.append([
+                                round(float(kp[0]) * _coord_sx, 1),
+                                round(float(kp[1]) * _coord_sy, 1),
+                                round(float(kp[2]), 3),
+                            ])
+                        det_vis['keypoints'] = kp_s
+                    vis_dets.append(det_vis)
+                if vis_dets:
+                    local_detection_frames_vis.append({
+                        'frame_idx': fidx,
+                        'time_sec': round(fidx / orig_fps, 2) if orig_fps > 0 else 0,
+                        'detections': vis_dets,
+                    })
+
+            return local_timeseries, local_detection_frames_vis
 
         # FN-0021: webm fps correction — webm often reports 0 or 1000fps
         if _is_realtime and total_frames_raw > 0 and duration_hint > 0:
             corrected_fps = total_frames_raw / duration_hint
-            if corrected_fps > 1.0 and abs(corrected_fps - orig_fps) / max(orig_fps, 1) > 0.3:
+            if corrected_fps > 1.0 and corrected_fps <= 90.0 and abs(corrected_fps - orig_fps) / max(orig_fps, 1) > 0.3:
                 orig_fps = corrected_fps
                 step = max(int(round(orig_fps / target_fps)), 1)
+            elif corrected_fps > 90.0:
+                _perf['fps_correction_skipped'] = {
+                    'reason': 'implausible_realtime_fps',
+                    'metadata_frames': total_frames_raw,
+                    'duration_hint': round(float(duration_hint or 0), 3),
+                    'computed_fps': round(float(corrected_fps), 3),
+                    'kept_fps': round(float(orig_fps), 3),
+                }
 
         # -- Frame sampling --
         _t = _time.time()
@@ -1277,8 +4311,59 @@ class VideoAnalysis:
         cap.release()
         _perf['frame_extract'] = round(_time.time() - _t, 3)
 
+        if (
+            _is_realtime
+            and expected_sampled_frames >= 4
+            and len(frames) < 3
+        ):
+            _t_seek = _time.time()
+            seek_frames = _sample_video_frames_by_seek(step, max_frames)
+            _perf['frame_extract_seek_recovery'] = {
+                'elapsed_sec': round(_time.time() - _t_seek, 3),
+                'before_frames': len(frames),
+                'after_frames': len(seek_frames),
+            }
+            if len(seek_frames) > len(frames):
+                frames = seek_frames
+
         if len(frames) == 0:
             raise Exception('영상에서 프레임을 추출할 수 없습니다.')
+
+        if (
+            not _is_realtime
+            and max_frames == 0
+            and expected_sampled_frames >= 10
+            and len(frames) < max(6, int(expected_sampled_frames * 0.50))
+        ):
+            _t_seek = _time.time()
+            seek_frames = _sample_video_frames_by_seek(step, max_frames)
+            _perf['frame_extract_seek_recovery'] = {
+                'elapsed_sec': round(_time.time() - _t_seek, 3),
+                'before_frames': len(frames),
+                'after_frames': len(seek_frames),
+            }
+            if len(seek_frames) > len(frames):
+                frames = seek_frames
+
+        last_sampled_frame = int(frames[-1][0]) if frames else -1
+        decode_warning = None
+        if (
+            not _is_realtime
+            and max_frames == 0
+            and expected_sampled_frames >= 10
+            and len(frames) < max(6, int(expected_sampled_frames * 0.50))
+        ):
+            decode_warning = {
+                'severity': 'warn',
+                'title': '입력 영상 일부만 디코딩되었습니다.',
+                'description': (
+                    f'영상 메타데이터 기준 약 {expected_sampled_frames}프레임을 샘플링해야 하지만 '
+                    f'{len(frames)}프레임만 읽혔습니다. 파일이 부분 손상되었거나 브라우저/코덱이 '
+                    '중간 프레임을 읽지 못해 실제 낙상 구간이 분석에서 빠졌을 수 있습니다.'
+                ),
+                'action': '원본 파일 무결성을 확인하거나 mp4로 재인코딩한 뒤 다시 업로드해 주세요.',
+            }
+            _perf['decode_warning'] = decode_warning
 
         # -- YOLO-Pose detection --
         _t = _time.time()
@@ -1293,103 +4378,65 @@ class VideoAnalysis:
 
         # -- Build unified timeseries (normalized coordinates) --
         _t = _time.time()
-        _norm_w = max(vid_width, 1)
-        _norm_h = max(vid_height, 1)
-        _coord_sx = vid_width / _resize_to[0] if _resize_to else 1.0
-        _coord_sy = vid_height / _resize_to[1] if _resize_to else 1.0
-
-        timeseries = []
-        detection_frames_vis = []
-
-        for i, r in enumerate(batch_results):
-            fidx = frame_indices[i]
-            boxes = r.boxes
-            kpts = getattr(r, 'keypoints', None)
-            if boxes is None or len(boxes) == 0:
-                continue
-
-            # Select largest-area person
-            best_idx, best_area = -1, -1
-            for bi, b in enumerate(boxes):
-                if int(b.cls.item()) != self._RF_PERSON_CLASS_ID:
-                    continue
-                x1, y1, x2, y2 = b.xyxy[0].tolist()
-                area = (x2 - x1) * (y2 - y1)
-                if area > best_area:
-                    best_area = area
-                    best_idx = bi
-
-            if best_idx < 0:
-                continue
-
-            b = boxes[best_idx]
-            x1, y1, x2, y2 = b.xyxy[0].tolist()
-            # Scale back to original coords, then normalize to [0,1]
-            ox1, oy1 = x1 * _coord_sx, y1 * _coord_sy
-            ox2, oy2 = x2 * _coord_sx, y2 * _coord_sy
-            bw, bh = ox2 - ox1, oy2 - oy1
-            cx, cy = (ox1 + ox2) / 2 / _norm_w, (oy1 + oy2) / 2 / _norm_h
-            nw, nh = bw / _norm_w, bh / _norm_h
-
-            entry = {
-                'frame_idx': fidx,
-                'time_sec': round(fidx / orig_fps, 4) if orig_fps > 0 else 0,
-                'bbox': {
-                    'cx': cx, 'cy': cy,
-                    'w': nw, 'h': nh,
-                    'aspect_ratio': nw / (nh + 1e-9),
-                    'area': nw * nh,
-                    'conf': float(b.conf.item()),
-                },
-                'keypoints': None,
-            }
-
-            # Keypoints (normalized)
-            if kpts is not None and best_idx < len(kpts.data):
-                kp_data = kpts.data[best_idx].cpu().numpy()  # (17, 3)
-                kp_norm = []
-                for kp in kp_data:
-                    kp_norm.append({
-                        'x': float(kp[0]) * _coord_sx / _norm_w,
-                        'y': float(kp[1]) * _coord_sy / _norm_h,
-                        'conf': float(kp[2]),
-                    })
-                entry['keypoints'] = kp_norm
-
-            timeseries.append(entry)
-
-            # Build detection_frames for visualization (original pixel coords)
-            vis_dets = []
-            for bi2, b2 in enumerate(boxes):
-                if int(b2.cls.item()) != self._RF_PERSON_CLASS_ID:
-                    continue
-                vx1, vy1, vx2, vy2 = b2.xyxy[0].tolist()
-                det_vis = {
-                    'x1': round(vx1 * _coord_sx, 1), 'y1': round(vy1 * _coord_sy, 1),
-                    'x2': round(vx2 * _coord_sx, 1), 'y2': round(vy2 * _coord_sy, 1),
-                    'conf': round(float(b2.conf.item()), 3),
-                }
-                if kpts is not None and bi2 < len(kpts.data):
-                    kp_raw = kpts.data[bi2].cpu().numpy()
-                    kp_s = []
-                    for kp in kp_raw:
-                        kp_s.append([
-                            round(float(kp[0]) * _coord_sx, 1),
-                            round(float(kp[1]) * _coord_sy, 1),
-                            round(float(kp[2]), 3),
-                        ])
-                    det_vis['keypoints'] = kp_s
-                vis_dets.append(det_vis)
-            if vis_dets:
-                detection_frames_vis.append({
-                    'frame_idx': fidx,
-                    'time_sec': round(fidx / orig_fps, 2) if orig_fps > 0 else 0,
-                    'detections': vis_dets,
-                })
-
-        _perf['timeseries_build'] = round(_time.time() - _t, 3)
+        timeseries, detection_frames_vis = _build_unified_timeseries(frame_indices, frame_images, batch_results)
 
         _min_det = 1 if _is_realtime else 2
+        retry_info = []
+        if len(timeseries) < _min_det:
+            retry_candidates = []
+            if _is_realtime:
+                retry_candidates.append({
+                    'conf': 0.10,
+                    'imgsz': max(yolo_imgsz, 384),
+                    'step': step,
+                    'max_frames': min(max(max_frames, 8) if max_frames > 0 else 8, 12),
+                })
+            else:
+                retry_candidates.extend([
+                    {'conf': 0.10, 'imgsz': max(yolo_imgsz, 640), 'step': max(step // 2, 1), 'max_frames': max(max_frames, 0)},
+                    {'conf': 0.05, 'imgsz': 960, 'step': max(step // 2, 1), 'max_frames': min(max(len(frames) * 2, 12), 48)},
+                ])
+
+            best_timeseries = timeseries
+            best_detection_frames_vis = detection_frames_vis
+            best_frames = frames
+            for retry in retry_candidates:
+                retry_frames = _sample_video_frames(retry['step'], retry['max_frames'])
+                if len(retry_frames) == 0:
+                    continue
+                retry_indices = [fidx for fidx, _ in retry_frames]
+                retry_images = [frame for _, frame in retry_frames]
+                retry_results = yolo_model.predict(
+                    source=retry_images,
+                    conf=retry['conf'],
+                    verbose=False,
+                    imgsz=retry['imgsz'],
+                    device=self._get_yolo_device()
+                )
+                retry_timeseries, retry_detection_frames_vis = _build_unified_timeseries(retry_indices, retry_images, retry_results)
+                retry_info.append({
+                    'conf': retry['conf'],
+                    'imgsz': retry['imgsz'],
+                    'step': retry['step'],
+                    'sampled_frames': len(retry_frames),
+                    'detected_frames': len(retry_timeseries),
+                })
+                if len(retry_timeseries) > len(best_timeseries):
+                    best_timeseries = retry_timeseries
+                    best_detection_frames_vis = retry_detection_frames_vis
+                    best_frames = retry_frames
+                if len(best_timeseries) >= _min_det:
+                    break
+
+            timeseries = best_timeseries
+            detection_frames_vis = best_detection_frames_vis
+            frames = best_frames
+            frame_indices = [fidx for fidx, _ in frames]
+
+        _perf['timeseries_build'] = round(_time.time() - _t, 3)
+        if retry_info:
+            _perf['pose_retry'] = retry_info
+
         if len(timeseries) < _min_det:
             raise Exception(f'사람 bbox 검출이 부족합니다 (검출 프레임: {len(timeseries)}). 최소 {_min_det}프레임이 필요합니다.')
 
@@ -1404,6 +4451,15 @@ class VideoAnalysis:
             'perf': _perf,
             'raw_frames': frames,
             'total_sampled': len(frames),
+            'frame_sampling': {
+                'target_fps': target_fps,
+                'step': step,
+                'expected_sampled_frames': expected_sampled_frames,
+                'actual_sampled_frames': len(frames),
+                'last_sampled_frame': last_sampled_frame,
+                'total_frames': total_frames_raw,
+            },
+            'decode_warning': decode_warning,
         }
 
     def _build_xg_feature_windows(self, timeseries, vid_meta, window_sec=1.0, stride_sec=0.5):
@@ -1427,6 +4483,18 @@ class VideoAnalysis:
         fps = vid_meta.get('fps', 30.0)
         if fps <= 0:
             fps = 30.0
+        # Runtime inference samples frames (currently 6fps for upload/realtime)
+        # regardless of the source video's native fps. Temporal features must use
+        # the effective sampled cadence, otherwise upload tests and live chunks
+        # get different gait/stillness scaling.
+        try:
+            _ts_times = sorted([float(e.get('time_sec', 0.0) or 0.0) for e in timeseries])
+            _dts = [_ts_times[i + 1] - _ts_times[i] for i in range(len(_ts_times) - 1)]
+            _dts = [dt for dt in _dts if dt > 1e-4]
+            if _dts:
+                fps = max(1.0, min(30.0, 1.0 / float(np.median(_dts))))
+        except Exception:
+            pass
 
         KP_CONF_MIN = 0.3
 
@@ -1453,6 +4521,32 @@ class VideoAnalysis:
                 return 180.0
             cos_a = max(-1.0, min(1.0, dot / (m1 * m2)))
             return math.degrees(math.acos(cos_a))
+
+        def _kp_bbox(points):
+            pts = [p for p in points if _kp_ok(p)]
+            if len(pts) < 2:
+                return None
+            xs = [p['x'] for p in pts]
+            ys = [p['y'] for p in pts]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            w = max(0.0, x_max - x_min)
+            h = max(0.0, y_max - y_min)
+            return {
+                'w': w,
+                'h': h,
+                'aspect': w / (h + 1e-9),
+                'cx': (x_min + x_max) / 2.0,
+                'cy': (y_min + y_max) / 2.0,
+            }
+
+        def _axis_verticality(a, b):
+            dx = float(b['x'] - a['x'])
+            dy = float(b['y'] - a['y'])
+            length = math.sqrt(dx * dx + dy * dy)
+            if length < 1e-9:
+                return 0.0
+            return abs(dy) / length
 
         def _fft_dominant_period(signal):
             """Estimate dominant period from signal using FFT."""
@@ -1507,6 +4601,8 @@ class VideoAnalysis:
             floor_prox = float(np.max(cys)) if cys else 0.0
             area_change = (areas[-1] - areas[0]) / (areas[0] + 1e-9) if len(areas) >= 2 else 0.0
             dx_list = [cxs[i+1] - cxs[i] for i in range(len(cxs)-1)]
+            center_dx_abs_mean = float(np.mean(np.abs(dx_list))) if dx_list else 0.0
+            center_x_span = float(np.max(cxs) - np.min(cxs)) if cxs else 0.0
             vert_sum = sum(abs(d) for d in dy_list) if dy_list else 0.0
             horiz_sum = sum(abs(d) for d in dx_list) if dx_list else 0.0
             vh_ratio = vert_sum / (horiz_sum + 1e-9) if horiz_sum > 0 else vert_sum
@@ -1514,10 +4610,37 @@ class VideoAnalysis:
             avg_conf = float(np.mean(confs)) if confs else 0.0
             n_pts = len(w_frames)
 
+            # Calculate mean valid target keypoints for later stabilization checks
+            target_kps = [5, 6, 11, 12, 13, 14, 15, 16]
+            _valid_kp_counts = []
+            for tmp_f in w_frames:
+                _kc = 0
+                kps = tmp_f.get('keypoints')
+                if kps is not None:
+                    for j in target_kps:
+                        if len(kps) > j and _kp_ok(kps[j]):
+                            _kc += 1
+                _valid_kp_counts.append(_kc)
+            _mean_valid = float(np.mean(_valid_kp_counts)) if _valid_kp_counts else 0.0
+
             # ── Pose-derived features (12) ──
-            tilts, p_hrs, knees, spreads, p_cys = [], [], [], [], []
+            tilts, p_hrs, knees, knee_supports, spreads, p_cys = [], [], [], [], [], []
+            shoulder_widths, hip_widths, ankle_widths, wrist_widths, knee_widths = [], [], [], [], []
+            foot_y_diffs, shoulder_hip_ratios, ankle_hip_ratios, wrist_shoulder_ratios = [], [], [], []
+            limb_extension_ratios, body_compactnesses, knee_asymmetries = [], [], []
+            elbow_bends, arm_extension_ratios = [], []
+            full_skel_aspects, full_skel_heights = [], []
+            upper_body_aspects, lower_body_aspects = [], []
+            upper_lower_height_ratios, upper_lower_center_gaps, upper_lower_width_ratios = [], [], []
+            torso_verticalities, leg_verticalities, lower_body_extensions = [], [], []
+            upper_body_center_xs, upper_body_center_ys = [], []
+            shoulder_center_xs, shoulder_center_ys = [], []
             pose_vecs = []
             upper_motions = []
+            lower_body_visible_frames = 0
+            straight_leg_frames = 0
+            support_leg_frames = 0
+            bent_leg_frames = 0
             for f in w_frames:
                 kps = f.get('keypoints')
                 if kps is None or len(kps) < 17:
@@ -1526,13 +4649,27 @@ class VideoAnalysis:
                 lh, rh = kps[11], kps[12]
                 lk, rk = kps[13], kps[14]
                 la, ra = kps[15], kps[16]
+                le, re = kps[7], kps[8]
+                lw, rw = kps[9], kps[10]
                 nose = kps[0]
+
+                if _kp_ok(ls) and _kp_ok(rs):
+                    sh_mid_for_motion = _mid(ls, rs)
+                    shoulder_center_xs.append(float(sh_mid_for_motion['x']))
+                    shoulder_center_ys.append(float(sh_mid_for_motion['y']))
 
                 if _kp_ok(ls) and _kp_ok(rs) and _kp_ok(lh) and _kp_ok(rh):
                     sh_mid = _mid(ls, rs)
                     hp_mid = _mid(lh, rh)
                     tilts.append(_angle_vert(hp_mid, sh_mid))
+                    torso_verticalities.append(_axis_verticality(sh_mid, hp_mid))
                     p_cys.append((sh_mid['y'] + hp_mid['y']) / 2)
+
+                    ankle_pts = [p for p in (la, ra) if _kp_ok(p)]
+                    if ankle_pts:
+                        ankle_mid = {'x': float(np.mean([p['x'] for p in ankle_pts])), 'y': float(np.mean([p['y'] for p in ankle_pts]))}
+                        leg_verticalities.append(_axis_verticality(hp_mid, ankle_mid))
+                        lower_body_extensions.append(abs(ankle_mid['y'] - hp_mid['y']))
 
                 foot_y = None
                 if _kp_ok(la) and _kp_ok(ra):
@@ -1550,11 +4687,79 @@ class VideoAnalysis:
                 if _kp_ok(rh) and _kp_ok(rk) and _kp_ok(ra):
                     k_angles.append(_angle3(rh, rk, ra))
                 if k_angles:
-                    knees.append(min(k_angles))
+                    knee_angle = min(k_angles)
+                    knee_support = max(k_angles)
+                    knees.append(knee_angle)
+                    knee_supports.append(knee_support)
+                    if len(k_angles) >= 2:
+                        knee_asymmetries.append(abs(k_angles[0] - k_angles[1]))
+                    lower_body_visible_frames += 1
+                    if knee_angle >= 150.0:
+                        straight_leg_frames += 1
+                    if knee_support >= 150.0:
+                        support_leg_frames += 1
+                    if knee_angle <= 125.0:
+                        bent_leg_frames += 1
 
                 valid_xs = [kps[j]['x'] for j in range(17) if _kp_ok(kps[j])]
                 if len(valid_xs) >= 3:
                     spreads.append(float(np.std(valid_xs)))
+
+                shoulder_width = abs(ls['x'] - rs['x']) if _kp_ok(ls) and _kp_ok(rs) else 0.0
+                hip_width = abs(lh['x'] - rh['x']) if _kp_ok(lh) and _kp_ok(rh) else 0.0
+                ankle_width = abs(la['x'] - ra['x']) if _kp_ok(la) and _kp_ok(ra) else 0.0
+                wrist_width = abs(lw['x'] - rw['x']) if _kp_ok(lw) and _kp_ok(rw) else 0.0
+                knee_width = abs(lk['x'] - rk['x']) if _kp_ok(lk) and _kp_ok(rk) else 0.0
+                if shoulder_width > 0:
+                    shoulder_widths.append(shoulder_width)
+                if hip_width > 0:
+                    hip_widths.append(hip_width)
+                    if shoulder_width > 0:
+                        shoulder_hip_ratios.append(shoulder_width / (hip_width + 1e-9))
+                    if ankle_width > 0:
+                        ankle_hip_ratios.append(ankle_width / (hip_width + 1e-9))
+                if ankle_width > 0:
+                    ankle_widths.append(ankle_width)
+                if wrist_width > 0:
+                    wrist_widths.append(wrist_width)
+                    if shoulder_width > 0:
+                        wrist_shoulder_ratios.append(wrist_width / (shoulder_width + 1e-9))
+                if knee_width > 0:
+                    knee_widths.append(knee_width)
+                if _kp_ok(la) and _kp_ok(ra):
+                    foot_y_diffs.append(abs(la['y'] - ra['y']))
+                if p_hrs:
+                    cur_pose_hr = p_hrs[-1]
+                    if ankle_width > 0 and cur_pose_hr > 0:
+                        limb_extension_ratios.append(ankle_width / (cur_pose_hr + 1e-9))
+                    if len(valid_xs) >= 3 and cur_pose_hr > 0:
+                        body_compactnesses.append((float(np.std(valid_xs)) + hip_width + shoulder_width) / (cur_pose_hr + 1e-9))
+                elbow_angles = []
+                if _kp_ok(ls) and _kp_ok(le) and _kp_ok(lw):
+                    elbow_angles.append(_angle3(ls, le, lw))
+                if _kp_ok(rs) and _kp_ok(re) and _kp_ok(rw):
+                    elbow_angles.append(_angle3(rs, re, rw))
+                if elbow_angles:
+                    elbow_bend = float(np.mean(elbow_angles))
+                    elbow_bends.append(elbow_bend)
+                    arm_extension_ratios.append(elbow_bend / 180.0)
+
+                full_bbox = _kp_bbox([kps[j] for j in range(17)])
+                upper_bbox = _kp_bbox([nose, ls, rs, le, re, lw, rw, lh, rh])
+                lower_bbox = _kp_bbox([lh, rh, lk, rk, la, ra])
+                if full_bbox is not None:
+                    full_skel_aspects.append(full_bbox['aspect'])
+                    full_skel_heights.append(full_bbox['h'])
+                if upper_bbox is not None:
+                    upper_body_aspects.append(upper_bbox['aspect'])
+                    upper_body_center_xs.append(float(upper_bbox['cx']))
+                    upper_body_center_ys.append(float(upper_bbox['cy']))
+                if lower_bbox is not None:
+                    lower_body_aspects.append(lower_bbox['aspect'])
+                if upper_bbox is not None and lower_bbox is not None:
+                    upper_lower_height_ratios.append(upper_bbox['h'] / (lower_bbox['h'] + 1e-9))
+                    upper_lower_center_gaps.append(lower_bbox['cy'] - upper_bbox['cy'])
+                    upper_lower_width_ratios.append(lower_bbox['w'] / (upper_bbox['w'] + 1e-9))
 
                 vec = []
                 for j in range(17):
@@ -1576,8 +4781,76 @@ class VideoAnalysis:
             pose_hr_min = float(np.min(p_hrs)) if p_hrs else 0.0
             pose_kb_mean = float(np.mean(knees)) if knees else 180.0
             pose_kb_min = float(np.min(knees)) if knees else 180.0
+            pose_kb_support_mean = float(np.mean(knee_supports)) if knee_supports else 180.0
+            pose_kb_support_min = float(np.min(knee_supports)) if knee_supports else 180.0
             pose_sp_mean = float(np.mean(spreads)) if spreads else 0.0
             pose_sp_max = float(np.max(spreads)) if spreads else 0.0
+            lower_body_visibility = lower_body_visible_frames / max(len(w_frames), 1)
+            straight_leg_ratio = straight_leg_frames / max(lower_body_visible_frames, 1)
+            support_leg_ratio = support_leg_frames / max(lower_body_visible_frames, 1)
+            bent_leg_ratio = bent_leg_frames / max(lower_body_visible_frames, 1)
+            shoulder_width_mean = float(np.mean(shoulder_widths)) if shoulder_widths else 0.0
+            hip_width_mean = float(np.mean(hip_widths)) if hip_widths else 0.0
+            ankle_width_mean = float(np.mean(ankle_widths)) if ankle_widths else 0.0
+            wrist_width_mean = float(np.mean(wrist_widths)) if wrist_widths else 0.0
+            knee_width_mean = float(np.mean(knee_widths)) if knee_widths else 0.0
+            foot_y_diff_mean = float(np.mean(foot_y_diffs)) if foot_y_diffs else 0.0
+            shoulder_hip_ratio = float(np.mean(shoulder_hip_ratios)) if shoulder_hip_ratios else 0.0
+            ankle_hip_ratio = float(np.mean(ankle_hip_ratios)) if ankle_hip_ratios else 0.0
+            wrist_shoulder_ratio = float(np.mean(wrist_shoulder_ratios)) if wrist_shoulder_ratios else 0.0
+            limb_extension_ratio = float(np.mean(limb_extension_ratios)) if limb_extension_ratios else 0.0
+            body_compactness = float(np.mean(body_compactnesses)) if body_compactnesses else 0.0
+            knee_asymmetry = float(np.mean(knee_asymmetries)) if knee_asymmetries else 0.0
+            elbow_bend_mean = float(np.mean(elbow_bends)) if elbow_bends else 180.0
+            arm_extension_ratio = float(np.mean(arm_extension_ratios)) if arm_extension_ratios else 1.0
+            full_skel_aspect_mean = float(np.mean(full_skel_aspects)) if full_skel_aspects else 0.0
+            full_skel_height_mean = float(np.mean(full_skel_heights)) if full_skel_heights else 0.0
+            upper_body_aspect_mean = float(np.mean(upper_body_aspects)) if upper_body_aspects else 0.0
+            lower_body_aspect_mean = float(np.mean(lower_body_aspects)) if lower_body_aspects else 0.0
+            upper_lower_height_ratio = float(np.mean(upper_lower_height_ratios)) if upper_lower_height_ratios else 0.0
+            upper_lower_center_gap = float(np.mean(upper_lower_center_gaps)) if upper_lower_center_gaps else 0.0
+            upper_lower_width_ratio = float(np.mean(upper_lower_width_ratios)) if upper_lower_width_ratios else 0.0
+            torso_verticality = float(np.mean(torso_verticalities)) if torso_verticalities else 0.0
+            leg_verticality = float(np.mean(leg_verticalities)) if leg_verticalities else 0.0
+            lower_body_extension = float(np.mean(lower_body_extensions)) if lower_body_extensions else 0.0
+            pose_width_series = [
+                (spreads[i] if i < len(spreads) else 0.0)
+                + (hip_widths[i] if i < len(hip_widths) else 0.0)
+                + (shoulder_widths[i] if i < len(shoulder_widths) else 0.0)
+                for i in range(max(len(spreads), len(hip_widths), len(shoulder_widths)))
+            ]
+            pose_width_std = float(np.std(pose_width_series)) if len(pose_width_series) >= 2 else 0.0
+            pose_height_std = float(np.std(p_hrs)) if len(p_hrs) >= 2 else 0.0
+            torso_width_series = [
+                shoulder_widths[i] / (hip_widths[i] + 0.015)
+                for i in range(min(len(shoulder_widths), len(hip_widths)))
+            ]
+            torso_width_std = float(np.std(torso_width_series)) if len(torso_width_series) >= 2 else 0.0
+            shoulder_width_std = float(np.std(shoulder_widths)) if len(shoulder_widths) >= 2 else 0.0
+            torso_tilt_std = float(np.std(tilts)) if len(tilts) >= 2 else 0.0
+
+            def _mean_abs_delta(vals):
+                if len(vals) < 2:
+                    return 0.0
+                return float(np.mean([abs(vals[i + 1] - vals[i]) for i in range(len(vals) - 1)]))
+
+            upper_center_x_span = float(max(upper_body_center_xs) - min(upper_body_center_xs)) if len(upper_body_center_xs) >= 2 else 0.0
+            upper_center_dx_abs_mean = _mean_abs_delta(upper_body_center_xs)
+            upper_center_y_std = float(np.std(upper_body_center_ys)) if len(upper_body_center_ys) >= 2 else 0.0
+            upper_center_dy_abs_mean = _mean_abs_delta(upper_body_center_ys)
+            shoulder_center_x_span = float(max(shoulder_center_xs) - min(shoulder_center_xs)) if len(shoulder_center_xs) >= 2 else 0.0
+            shoulder_center_dx_abs_mean = _mean_abs_delta(shoulder_center_xs)
+            shoulder_center_y_std = float(np.std(shoulder_center_ys)) if len(shoulder_center_ys) >= 2 else 0.0
+            upper_temporal_motion = (
+                upper_center_dx_abs_mean
+                + upper_center_x_span * 0.45
+                + upper_center_dy_abs_mean * 0.65
+                + upper_center_y_std * 0.25
+                + shoulder_center_dx_abs_mean * 0.45
+                + shoulder_center_x_span * 0.25
+                + shoulder_width_std * 0.35
+                + min(torso_tilt_std / 90.0, 1.0) * 0.12
+            )
 
             p_descents = [max(p_cys[i+1] - p_cys[i], 0) for i in range(len(p_cys)-1)] if len(p_cys) >= 2 else []
             pose_desc_mean = float(np.mean(p_descents)) if p_descents else 0.0
@@ -1673,6 +4946,14 @@ class VideoAnalysis:
                 m = np.polyfit(x_arr, y_arr, 1)[0] if len(x_arr) >= 2 else 0.0
                 fp_slope = float(m)
 
+            floor_contact_ratio = sum(1 for cy in cys if cy >= 0.78) / max(len(cys), 1) if cys else 0.0
+            height_drop_persistence = sum(1 for h in hs if h <= hs[0] * 0.90) / max(len(hs), 1) if len(hs) >= 1 and hs[0] > 0 else 0.0
+            collapse_impulse = max_down * max(0.0, -h_ratio)
+            post_cys = cys[max_ds_idx+1:] if max_ds_idx + 1 < len(cys) else []
+            post_floor_stability = sum(1 for cy in post_cys if abs(cy - floor_prox) <= 0.03) / max(len(post_cys), 1) if post_cys else 0.0
+            slow_descent_ratio = sum(1 for d in dy_list if 0.003 <= d <= 0.03) / max(len(dy_list), 1) if dy_list else 0.0
+            tilt_height_collapse = pose_tilt_max * max(0.0, 0.30 - pose_hr_min)
+
             feat = {
                 'center_dy': center_dy,
                 'height_ratio': h_ratio,
@@ -1681,6 +4962,8 @@ class VideoAnalysis:
                 'floor_proximity': floor_prox,
                 'area_change': area_change,
                 'vert_horiz_ratio': vh_ratio,
+                'center_dx_abs_mean': center_dx_abs_mean,
+                'center_x_span': center_x_span,
                 'max_down_speed': max_down,
                 'avg_conf': avg_conf,
                 'n_points': n_pts,
@@ -1690,8 +4973,38 @@ class VideoAnalysis:
                 'pose_height_ratio_min': pose_hr_min,
                 'pose_knee_bend_mean': pose_kb_mean,
                 'pose_knee_bend_min': pose_kb_min,
+                'pose_knee_support_mean': pose_kb_support_mean,
+                'pose_knee_support_min': pose_kb_support_min,
+                'lower_body_visibility': lower_body_visibility,
+                'straight_leg_ratio': straight_leg_ratio,
+                'support_leg_ratio': support_leg_ratio,
+                'bent_leg_ratio': bent_leg_ratio,
                 'pose_spread_mean': pose_sp_mean,
                 'pose_spread_max': pose_sp_max,
+                'shoulder_width': shoulder_width_mean,
+                'hip_width': hip_width_mean,
+                'ankle_width': ankle_width_mean,
+                'wrist_width': wrist_width_mean,
+                'knee_width': knee_width_mean,
+                'foot_y_diff': foot_y_diff_mean,
+                'shoulder_hip_ratio': shoulder_hip_ratio,
+                'ankle_hip_ratio': ankle_hip_ratio,
+                'wrist_shoulder_ratio': wrist_shoulder_ratio,
+                'limb_extension_ratio': limb_extension_ratio,
+                'body_compactness': body_compactness,
+                'knee_asymmetry': knee_asymmetry,
+                'elbow_bend_mean': elbow_bend_mean,
+                'arm_extension_ratio': arm_extension_ratio,
+                'full_skeleton_aspect': full_skel_aspect_mean,
+                'full_skeleton_height': full_skel_height_mean,
+                'upper_body_aspect': upper_body_aspect_mean,
+                'lower_body_aspect': lower_body_aspect_mean,
+                'upper_lower_height_ratio': upper_lower_height_ratio,
+                'upper_lower_center_gap': upper_lower_center_gap,
+                'upper_lower_width_ratio': upper_lower_width_ratio,
+                'torso_verticality': torso_verticality,
+                'leg_verticality': leg_verticality,
+                'lower_body_extension': lower_body_extension,
                 'pose_descent_mean': pose_desc_mean,
                 'pose_descent_max': pose_desc_max,
                 'pose_change_mean': pose_ch_mean,
@@ -1711,7 +5024,52 @@ class VideoAnalysis:
                 'tilt_change_duration': tilt_chg_dur,
                 'spread_after_descent': spread_after,
                 'floor_proximity_slope': fp_slope,
+                'floor_contact_ratio': floor_contact_ratio,
+                'height_drop_persistence': height_drop_persistence,
+                'collapse_impulse': collapse_impulse,
+                'post_floor_stability': post_floor_stability,
+                'slow_descent_ratio': slow_descent_ratio,
+                'tilt_height_collapse': tilt_height_collapse,
+                'pose_width_std': pose_width_std,
+                'pose_height_std': pose_height_std,
+                'torso_width_std': torso_width_std,
+                'shoulder_width_std': shoulder_width_std,
+                'torso_tilt_std': torso_tilt_std,
+                'upper_center_x_span': upper_center_x_span,
+                'upper_center_dx_abs_mean': upper_center_dx_abs_mean,
+                'upper_center_y_std': upper_center_y_std,
+                'upper_center_dy_abs_mean': upper_center_dy_abs_mean,
+                'shoulder_center_x_span': shoulder_center_x_span,
+                'shoulder_center_dx_abs_mean': shoulder_center_dx_abs_mean,
+                'shoulder_center_y_std': shoulder_center_y_std,
+                'upper_body_temporal_motion': upper_temporal_motion,
             }
+            feat = self._augment_xg_behavior_features(feat)
+
+            # Suppress jitter for occluded sitting/standing (avoiding false movement),
+            # while preserving genuine falls (large bounding box drop and cy velocity).
+            if _mean_valid < 3.0 and feat['max_down_speed'] < 0.08 and feat['center_dy'] < 0.03:
+                feat['stillness'] = 1.0
+                feat['center_dy'] = 0.0
+                feat['max_down_speed'] = 0.0
+                feat['speed_std'] = 0.0
+                feat['descent_duration'] = 0.0
+                feat['upper_body_motion'] = 0.0
+                feat['upper_body_temporal_motion'] = 0.0
+                feat['upper_center_x_span'] = 0.0
+                feat['upper_center_dx_abs_mean'] = 0.0
+                feat['upper_center_y_std'] = 0.0
+                feat['upper_center_dy_abs_mean'] = 0.0
+                feat['shoulder_center_x_span'] = 0.0
+                feat['shoulder_center_dx_abs_mean'] = 0.0
+                feat['shoulder_center_y_std'] = 0.0
+                feat['pose_change_mean'] = 0.0
+                feat['pose_change_max'] = 0.0
+                feat['pose_descent_mean'] = 0.0
+                feat['pose_descent_max'] = 0.0
+                feat['step_period_est'] = 0.0
+                feat['knee_angle_cycle_strength'] = 0.0
+
             windows.append(feat)
             t += stride_sec
 
@@ -1742,10 +5100,10 @@ class VideoAnalysis:
         vid_duration = round(total_frames_raw / orig_fps, 2) if orig_fps > 0 else 0.0
 
         # FN-0016: webcam-live 복합 개선 — 프레임 샘플링 강화 (C)
-        # FN-20260406-0003: realtime에서 target_fps 3, YOLO imgsz 480 → 추론 속도 개선
-        target_fps = 3 if _is_realtime else self._RF_TARGET_FPS
-        max_frames = 12 if _is_realtime else 0  # realtime: 4초 × 3fps = 최대 12프레임 캡
-        yolo_imgsz = 480 if _is_realtime else self._RF_YOLO_IMGSZ
+        # FN-20260521: realtime 분석은 4초 × 4fps까지 보되 YOLO 입력은 320으로 유지해 RTT를 방어한다.
+        target_fps = self._POSTURE_REALTIME_TARGET_FPS if _is_realtime else self._RF_TARGET_FPS
+        max_frames = int(4 * self._POSTURE_REALTIME_TARGET_FPS) if _is_realtime else 0
+        yolo_imgsz = self._RF_REALTIME_YOLO_IMGSZ if _is_realtime else self._RF_YOLO_IMGSZ
         step = max(int(round(orig_fps / target_fps)), 1)
         _t = _time.time()
         frames = []
@@ -1801,7 +5159,7 @@ class VideoAnalysis:
         frame_indices = [fidx for fidx, _ in frames]
         frame_images = [frame for _, frame in frames]
         # FN-0016: webcam-live YOLO conf 하향 (B) — 검출률 향상
-        _conf = 0.15 if _is_realtime else self._RF_CONF_THRES
+        _conf = self._RF_REALTIME_CONF_THRES if _is_realtime else self._RF_CONF_THRES
         batch_results = yolo_model.predict(source=frame_images, conf=_conf, verbose=False, imgsz=yolo_imgsz, device=self._get_yolo_device())
         _perf['yolo_predict'] = round(_time.time() - _t, 3)
 
@@ -1951,6 +5309,260 @@ class VideoAnalysis:
             'perf': _perf,
             'all_frame_keypoints': all_frame_keypoints,  # FN-0002: per-frame keypoints for pose features
         }
+
+    # ── FN-20260413-0003: Compute RF 13-feature stats from unified timeseries ──
+
+    def _compute_rf_features_from_timeseries(self, timeseries, vid_meta, total_sampled):
+        """Derive RF 13-feature statistics from unified timeseries (denormalize to resized-px coords).
+
+        This enables RF-Dual single-pass: the same YOLO results that produce the
+        unified (normalized) timeseries can also feed the RF fall classifier by
+        reverse-mapping back to the resized-pixel coordinate space in which the
+        RF model was originally trained.
+
+        Args:
+            timeseries: list of per-frame dicts from _extract_unified_timeseries
+            vid_meta: {width, height, fps, duration, total_frames}
+            total_sampled: total number of sampled frames (for detection_rate)
+
+        Returns:
+            dict with 'feat' (full feature dict), 'feat_df' (DataFrame with 13 RF columns),
+            'det_count' (number of detection rows).
+        """
+        import numpy as np
+        import pandas as pd
+
+        vid_width = vid_meta.get('width', 1)
+        vid_height = vid_meta.get('height', 1)
+
+        # Compute resize dimensions (same logic as _extract_rf_pipeline_features)
+        _resize_to = None
+        if vid_width > 1280 or vid_height > 720:
+            if vid_width > vid_height:
+                _resize_to = (640, int(vid_height * 640 / max(vid_width, 1)))
+            else:
+                _resize_to = (int(vid_width * 360 / max(vid_height, 1)), 360)
+
+        # Scale factors: normalized → resized-px
+        # unified stores: cx_norm = orig_cx / vid_width
+        # RF expects: center_x = resized_px = orig_cx / _coord_sx = cx_norm * vid_width / _coord_sx
+        # _coord_sx = vid_width / resize_w → center_x = cx_norm * resize_w
+        if _resize_to:
+            resize_w, resize_h = _resize_to
+        else:
+            resize_w, resize_h = vid_width, vid_height
+
+        # Convert timeseries to det_rows (resized-px coords)
+        det_rows = []
+        for entry in timeseries:
+            if entry.get('_from_rolling'):
+                continue  # skip stitched rolling entries
+            bbox = entry['bbox']
+            center_x = bbox['cx'] * resize_w
+            center_y = bbox['cy'] * resize_h
+            width = bbox['w'] * resize_w
+            height = bbox['h'] * resize_h
+
+            det_rows.append({
+                'frame_idx': entry['frame_idx'],
+                'width': width,
+                'height': height,
+                'center_x': center_x,
+                'center_y': center_y,
+                'area': width * height,
+                'confidence': bbox['conf'],
+            })
+
+        if len(det_rows) == 0:
+            # Return zero features if no detections
+            feat = {col: 0.0 for col in self._RF_FEATURE_COLUMNS}
+            feat['n_frames'] = 0
+            feat['total_sampled_frames'] = max(total_sampled, 1)
+            feat_df = pd.DataFrame([feat])
+            _rf_model_n_features = None
+            try:
+                rf_model = self._get_rf_model()
+                if hasattr(rf_model, 'n_features_in_'):
+                    _rf_model_n_features = int(rf_model.n_features_in_)
+            except Exception:
+                pass
+            if _rf_model_n_features == len(self._RF_V3_FEATURE_COLUMNS):
+                feat_df = feat_df.reindex(columns=self._RF_V3_FEATURE_COLUMNS, fill_value=0.0)
+            else:
+                feat_df = feat_df[self._RF_FEATURE_COLUMNS]
+            return {'feat': feat, 'feat_df': feat_df, 'det_count': 0}
+
+        df_det = pd.DataFrame(det_rows).sort_values('frame_idx').reset_index(drop=True)
+        g = df_det.copy()
+        g['area'] = g['width'] * g['height']
+        g['aspect_ratio'] = g['width'] / (g['height'] + 1e-6)
+        g['delta_y_raw'] = g['center_y'].diff()
+        g['delta_y'] = g['delta_y_raw'].clip(lower=0)
+        g['delta_height'] = g['height'].diff().abs()
+        g['delta_width'] = g['width'].diff().abs()
+        g['delta_area'] = g['area'].diff().abs()
+
+        g['delta_y_accel'] = g['delta_y'].diff()
+        _delta_y_accel_max = float(g['delta_y_accel'].max() or 0)
+
+        _n_tail = min(3, len(g))
+        _final_height = float(g['height'].tail(_n_tail).mean())
+        _height_mean = float(g['height'].mean())
+        _final_height_ratio = _final_height / (_height_mean + 1e-6)
+
+        _total_sampled = max(total_sampled, 1)
+        feat = {
+            'detection_rate': float(len(g)) / _total_sampled,
+            'n_frames': len(g),
+            'total_sampled_frames': _total_sampled,
+            'center_y_mean': g['center_y'].mean(),
+            'center_y_std': g['center_y'].std(),
+            'height_mean': _height_mean,
+            'height_std': g['height'].std(),
+            'aspect_ratio_mean': g['aspect_ratio'].mean(),
+            'aspect_ratio_std': g['aspect_ratio'].std(),
+            'delta_y_mean': g['delta_y'].mean(),
+            'delta_y_max': g['delta_y'].max(),
+            'delta_height_mean': g['delta_height'].mean(),
+            'delta_width_mean': g['delta_width'].mean(),
+            'delta_y_accel_max': _delta_y_accel_max,
+            'final_height_ratio': _final_height_ratio,
+            # motion guard auxiliary values
+            'width_mean': g['width'].mean(),
+            'width_std': g['width'].std(),
+            'area_mean': g['area'].mean(),
+            'area_std': g['area'].std(),
+            'delta_area_mean': g['delta_area'].mean(),
+        }
+        feat_df = pd.DataFrame([feat])
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # FN-0007: Pose feature expansion (future-ready)
+        # When an RF model trained with 25 features (bbox+pose) is deployed,
+        # extract keypoint-based pose features from timeseries and add them.
+        # Until then, use only the 13 bbox features for backward compatibility.
+        _use_pose = False
+        _use_rf_v3 = False
+        try:
+            rf_model = self._get_rf_model()
+            if hasattr(rf_model, 'n_features_in_'):
+                _rf_model_n_features = int(rf_model.n_features_in_)
+                if _rf_model_n_features == len(self._RF_V3_FEATURE_COLUMNS):
+                    _use_rf_v3 = True
+                elif _rf_model_n_features > len(self._RF_FEATURE_COLUMNS):
+                    _use_pose = True
+        except Exception:
+            pass
+
+        if _use_rf_v3:
+            feat_df = feat_df.reindex(columns=self._RF_V3_FEATURE_COLUMNS, fill_value=0.0)
+            feat_df = feat_df[self._RF_V3_FEATURE_COLUMNS]
+        elif _use_pose:
+            # Extract keypoint data from timeseries for pose feature calculation
+            all_frame_kps = []
+            for entry in timeseries:
+                if entry.get('_from_rolling'):
+                    continue
+                kps = entry.get('keypoints')
+                if kps and len(kps) >= 17:
+                    kp_list = [[kp['x'] * vid_meta.get('height', 1), kp['y'] * vid_meta.get('height', 1), kp['conf']] for kp in kps]
+                    all_frame_kps.append({'frame_idx': entry['frame_idx'], 'keypoints': kp_list})
+            pose_feat = self._extract_pose_features(all_frame_kps, vid_height=vid_meta.get('height', 480))
+            if pose_feat:
+                for col in self._POSE_FEATURE_COLUMNS:
+                    feat[col] = pose_feat.get(col, 0.0)
+            else:
+                for col in self._POSE_FEATURE_COLUMNS:
+                    feat[col] = 0.0 if 'angle' not in col else 180.0
+            _combined_cols = list(self._RF_FEATURE_COLUMNS) + list(self._POSE_FEATURE_COLUMNS)
+            feat_df = feat_df.reindex(columns=_combined_cols, fill_value=0.0)
+            for col in self._POSE_FEATURE_COLUMNS:
+                feat_df[col] = feat.get(col, 0.0)
+            feat_df = feat_df[_combined_cols]
+        else:
+            feat_df = feat_df[self._RF_FEATURE_COLUMNS]
+
+        return {'feat': feat, 'feat_df': feat_df, 'det_count': len(det_rows)}
+
+    def _compute_rf_fall_v2_features_from_timeseries(self, timeseries, vid_meta, total_sampled):
+        """Derive occlusion-aware v2 fall features from the normalized timeseries."""
+        import importlib.util
+        import numpy as np
+        import pandas as pd
+
+        feature_cols = list(self._RF_FALL_V2_FEATURE_COLUMNS)
+        if not timeseries:
+            feat = {col: 0.0 for col in feature_cols}
+            feat_df = pd.DataFrame([feat], columns=feature_cols)
+            return {'feat': feat, 'feat_df': feat_df}
+
+        module_path = self._project_abspath(os.path.join('scripts', 'retrain_rf_fall_v2.py'))
+        try:
+            spec = importlib.util.spec_from_file_location('_rf_fall_v2_features', module_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            meta = dict(vid_meta or {})
+            meta['sampled_frames'] = max(int(total_sampled or 0), len(timeseries), 1)
+            feat = mod.compute_features(timeseries, meta)
+            if getattr(mod, 'FEATURE_COLUMNS', None):
+                feature_cols = list(mod.FEATURE_COLUMNS)
+        except Exception:
+            feat = {col: 0.0 for col in feature_cols}
+            ordered = sorted([e for e in timeseries if not e.get('_from_rolling')], key=lambda e: float(e.get('time_sec', 0.0) or 0.0))
+            if ordered:
+                bbox = [e.get('bbox', {}) for e in ordered]
+                cy = np.array([float(b.get('cy', 0.0) or 0.0) for b in bbox], dtype=float)
+                bh = np.array([float(b.get('h', 0.0) or 0.0) for b in bbox], dtype=float)
+                bw = np.array([float(b.get('w', 0.0) or 0.0) for b in bbox], dtype=float)
+                area = bh * bw
+                total = max(int(total_sampled or len(ordered) or 1), 1)
+                head = min(5, len(ordered))
+                tail = min(5, len(ordered))
+                floor_bottom = cy + (bh * 0.5)
+                center_drop = float(np.mean(cy[-tail:]) - np.mean(cy[:head]))
+                height_drop = float(np.mean(bh[:head]) - np.mean(bh[-tail:]))
+                aspect = bw / (bh + 1e-6)
+                feat.update({
+                    'detection_rate': float(len(ordered)) / total,
+                    'sample_coverage': float(len(ordered)) / total,
+                    'center_y_mean': float(np.mean(cy)),
+                    'center_y_std': float(np.std(cy)),
+                    'center_y_drop': center_drop,
+                    'center_y_drop_ratio': center_drop / (float(np.mean(bh)) + 1e-6),
+                    'height_mean': float(np.mean(bh)),
+                    'height_std': float(np.std(bh)),
+                    'height_drop_ratio': height_drop / (float(np.mean(bh[:head])) + 1e-6),
+                    'area_mean': float(np.mean(area)),
+                    'area_drop_ratio': (float(np.mean(area[:head]) - np.mean(area[-tail:]))) / (float(np.mean(area[:head])) + 1e-6),
+                    'aspect_ratio_mean': float(np.mean(aspect)),
+                    'aspect_rise': float(np.mean(aspect[-tail:]) - np.mean(aspect[:head])),
+                    'floor_proximity': float(np.mean(floor_bottom)),
+                    'floor_contact_ratio': float(np.mean(floor_bottom >= 0.82)),
+                    'fall_kinematic_score': max(0.0, min(1.0, center_drop * 1.8 + height_drop * 1.4)),
+                })
+        feat = {col: float(feat.get(col, 0.0) or 0.0) for col in feature_cols}
+        feat_df = pd.DataFrame([feat]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        feat_df = feat_df.reindex(columns=feature_cols, fill_value=0.0)
+        return {'feat': feat, 'feat_df': feat_df}
+
+    def _downsample_timeseries_by_fps(self, timeseries, target_fps):
+        """Downsample a normalized timeseries by timestamp while preserving order."""
+        if not timeseries or target_fps <= 0:
+            return list(timeseries or [])
+
+        ordered = sorted(timeseries, key=lambda e: (float(e.get('time_sec', 0.0) or 0.0), int(e.get('frame_idx', 0) or 0)))
+        interval = 1.0 / float(target_fps)
+        selected = []
+        next_time = None
+        for entry in ordered:
+            t = float(entry.get('time_sec', 0.0) or 0.0)
+            if next_time is None or t + 1e-6 >= next_time:
+                selected.append(entry)
+                next_time = t + interval
+
+        if len(selected) < min(2, len(ordered)):
+            selected = [ordered[0], ordered[-1]] if len(ordered) > 1 else ordered[:]
+        return selected
 
     # FN-0003: Keypoint-based pose feature extraction
     # COCO keypoint indices
@@ -2162,7 +5774,7 @@ class VideoAnalysis:
 
     # FN-0017/FN-0039: Short-clip threshold for realtime mode (5-second chunks have n_frames ≈ 8-10)
     _SHORT_CLIP_N_FRAMES = 10  # n_frames below this triggers short-clip adjustments
-    _SHORT_CLIP_THRESHOLD_MAX = 0.72  # FN-0025: 0.65→0.72 — short clip 오탐 방지 강화 (base threshold 0.60 기준)
+    _SHORT_CLIP_THRESHOLD_MAX = 0.58  # Recall-priority: base 0.45 기준, short clip에서도 recall 유지
     _SHORT_CLIP_MIN_FRAMES = 3  # below this, result is 'insufficient_data'
 
     def _infer_rf_pipeline(self, video_path, filename='', analysis_profile='balanced', input_source='upload'):
@@ -2218,12 +5830,14 @@ class VideoAnalysis:
 
         # FN-0017/FN-0039: Adaptive threshold for short clips
         # Short clips have fewer frames → less reliable features → RAISE threshold to reduce false positives
-        _effective_threshold = self.fall_decision_threshold
+        _rf_confirm_threshold = self._rf_confirm_threshold()
+        _short_clip_threshold_max = self._rf_short_clip_threshold_max()
+        _effective_threshold = _rf_confirm_threshold
         if _is_short_clip and _n_det_frames >= self._SHORT_CLIP_MIN_FRAMES:
             # FN-0025: Linear interpolation: n_frames=3 → 0.72 (strict), n_frames=10 → 0.60 (baseline)
             _range = self._SHORT_CLIP_N_FRAMES - self._SHORT_CLIP_MIN_FRAMES
             _ratio = (_n_det_frames - self._SHORT_CLIP_MIN_FRAMES) / max(_range, 1)
-            _effective_threshold = self._SHORT_CLIP_THRESHOLD_MAX - _ratio * (self._SHORT_CLIP_THRESHOLD_MAX - self.fall_decision_threshold)
+            _effective_threshold = _short_clip_threshold_max - _ratio * (_short_clip_threshold_max - _rf_confirm_threshold)
             _confidence_level = 'medium' if _n_det_frames >= 5 else 'low'
 
         # FN-0028: fall_detected must be threshold-based, not raw prediction.
@@ -2317,7 +5931,11 @@ class VideoAnalysis:
         risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
 
         # Behavior
-        behavior = self._predict_behavior_from_runtime(None, fall_detected, allow_fallback=False)
+        behavior = self._predict_behavior_from_runtime(
+            {'fall_probability': round(score, 4), 'features': feat},
+            fall_detected,
+            allow_fallback=False,
+        )
         if behavior is not None:
             behavior_class, behavior_label = behavior.get('code', 'non-fall'), behavior.get('label', '비낙상')
         elif fall_detected:
@@ -2439,7 +6057,7 @@ class VideoAnalysis:
                     # Fallback: contribution-percentile based
                     lvl = 'high' if imp >= 0.12 else ('medium' if imp >= 0.06 else 'low')
                 # FN-0033: Override — if overall score >= threshold and contribution is in top-2, at least medium
-                if score >= self.fall_decision_threshold and contribution >= _scored[1][3] if len(_scored) > 1 else True:
+                if score >= self._rf_confirm_threshold() and contribution >= _scored[1][3] if len(_scored) > 1 else True:
                     if lvl == 'low':
                         lvl = 'medium'
                 analysis_basis.append({
@@ -2482,7 +6100,7 @@ class VideoAnalysis:
                 'device': _device_used,
                 'extracted_frames': len(frames),
                 'detected_person_frames': len(det_rows),
-                'features': {k: round(float(v), 4) if isinstance(v, float) else v for k, v in feat.items()},
+                'features': {k: (None if (lambda fv: fv != fv or fv == float('inf') or fv == float('-inf'))(float(v)) else round(float(v), 4)) if isinstance(v, (int, float)) else v for k, v in feat.items()},
                 'motion_guard': {
                     'applied': _motion_guard_applied,
                     'is_stationary': _is_stationary,
@@ -2524,86 +6142,45 @@ class VideoAnalysis:
     def _trained_model_info(self, baseline_summary, baseline_state, validation_report):
         """Return currently preferred production model information."""
         rf_available = self._rf_pipeline_available()
-        rf_pose_available = self._rf_pose_pipeline_available()
         rf_meta = self._rf_runtime_meta()
-        runtime_ready = self._trained_runtime_available(baseline_state)
-        person_feature_ready = runtime_ready and self._person_feature_available()
-        meta = self._baseline_model_meta()
-        fall_classifier = (meta.get('fall_classifier', {}) or {})
-        feature_meta = fall_classifier.get('features', []) or []
-        person_metric_ready = len(feature_meta) == 10
-        rf_project_metric_ready = float(rf_meta.get('cv_f1', 0.0) or 0.0) > 0
-        rf_metric_ready = rf_project_metric_ready or str(fall_classifier.get('type', '') or '').lower().startswith('randomforest') or len(feature_meta) == len(self._RF_FEATURE_COLUMNS)
-        cv_f1 = float(fall_classifier.get('cv_f1', 0.7499) or 0.7499) if person_metric_ready else 0.0
-        cv_auc = float(fall_classifier.get('cv_auc', 0.86) or 0.86) if person_metric_ready else 0.0
-        training_samples = int(fall_classifier.get('training_samples', 2250) or 2250) if person_metric_ready else 0
-        features = feature_meta or self._RF_FEATURE_COLUMNS
-        fc_path = fall_classifier.get('path', '')
-        if fc_path and not os.path.isabs(fc_path):
-            fc_path = self._project_abspath(fc_path)
-        else:
-            fc_path = self._normalize_existing_path(fc_path)
+        rf_summary = self._rf_project_summary()
+        rf_metrics = (rf_summary.get('best_metrics', {}) or {})
+        rf_thresholds = (rf_summary.get('tuned_thresholds', {}) or {})
+        rf_training_samples = int(rf_summary.get('training_samples', 0) or rf_meta.get('training_samples', 0) or 0)
+        rf_validation_samples = int(rf_summary.get('validation_samples', 0) or 0)
+        rf_metric_ready = rf_available and len(rf_metrics) > 0
         runtime_mode = 'heuristic-fallback'
         model_name = 'Fallback 분석'
         weights_path = ''
         weights_name = ''
-        display_training_samples = training_samples
-        if rf_pose_available:
-            runtime_mode = 'rf-pose-runtime'
-            model_name = 'RF-Pose Pipeline (RandomForest + YOLOv8n-Pose + Keypoints)'
-            weights_path = self._rf_pose_model_path()
-            weights_name = os.path.basename(weights_path)
-            _pose_summary = self._rf_pose_summary()
-            display_training_samples = int(_pose_summary.get('training_samples', 0) or 0)
-        elif rf_available:
-            runtime_mode = 'rf-pipeline-runtime'
-            model_name = 'RF Pipeline v4 (RandomForest + YOLOv8n-Pose)'
+        display_training_samples = rf_training_samples
+        if rf_available:
+            runtime_mode = 'rf-dual-runtime'
+            model_name = 'RF-Dual 운영 모델 (RandomForest + XG-Posture)'
             weights_path = rf_meta.get('model_path', self._RF_MODEL_PATH)
             weights_name = os.path.basename(weights_path)
-            display_training_samples = int(rf_meta.get('training_samples', 0) or 0)
-        elif person_feature_ready:
-            runtime_mode = 'person-feature-runtime'
-            model_name = 'Person-Feature Pipeline (YOLO + XGBoost)'
-            weights_path = fc_path or ''
-            weights_name = os.path.basename(fc_path) if fc_path else ''
-        metric_note = '3-Fold 교차 검증 기준 메트릭으로, 학습/검증 분할이 매 Fold마다 달라져 일반화 성능을 반영합니다.'
-        evaluation_note = f'CV F1 {round(cv_f1 * 100, 1)}%% · CV AUC {round(cv_auc * 100, 1)}%%'
-        split_note = f'3-Fold CV (전체 {training_samples}건)'
-        metric_source = 'cross-validation'
-        evaluation_source = '3-Fold Cross Validation'
-        if runtime_mode == 'rf-pipeline-runtime':
-            metric_note = 'RF 보조 파이프라인은 현재 구조 메타데이터를 기준으로 표시합니다. 별도 CV 메트릭 파일이 연결되면 함께 노출할 수 있습니다.'
-            evaluation_note = f"트리 {int(rf_meta.get('n_estimators', 0) or 0)}개 · 특징 {int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))}개"
-            split_note = 'RF 보조 파이프라인 운영 메타데이터 기준'
-            metric_source = 'rf-runtime-structure'
-            evaluation_source = 'RF Runtime Structure'
-            if rf_metric_ready:
-                rf_cv_f1 = float(rf_meta.get('cv_f1', 0.0) or fall_classifier.get('cv_f1', 0.0) or 0.0)
-                rf_cv_auc = float(rf_meta.get('cv_auc', 0.0) or fall_classifier.get('cv_auc', 0.0) or 0.0)
-                rf_training_samples = int(rf_meta.get('training_samples', 0) or fall_classifier.get('training_samples', 0) or 0)
-                rf_folds = int(((self._rf_project_summary().get('cv', {}) or {}).get('folds', 3)) or 3)
-                evaluation_note = f"CV F1 {round(rf_cv_f1 * 100, 1)}%% · CV AUC {round(rf_cv_auc * 100, 1)}%%"
-                metric_note = 'RF 보조 파이프라인 HITL 재학습 메타데이터를 반영한 교차 검증 메트릭입니다.' if rf_project_metric_ready else 'RF 보조 파이프라인 메타파일에 연결된 교차 검증 메트릭입니다.'
-                split_note = f"{rf_folds}-Fold CV (전체 {rf_training_samples}건)"
-                metric_source = 'cross-validation'
-                evaluation_source = f'{rf_folds}-Fold Cross Validation'
+        metric_note = 'RF-Dual 운영 모델의 최신 학습/검증 메타데이터입니다.'
+        evaluation_note = f"검증 Accuracy {round(float(rf_metrics.get('accuracy', 0.0) or 0.0) * 100, 1)}%% · Recall {round(float(rf_metrics.get('recall', 0.0) or 0.0) * 100, 1)}%% · F1 {round(float(rf_metrics.get('f1', 0.0) or 0.0) * 100, 1)}%%" if rf_metric_ready else f"트리 {int(rf_meta.get('n_estimators', 0) or 0)}개 · 특징 {int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))}개"
+        split_note = f"train {rf_training_samples}건 · validation {rf_validation_samples}건"
+        metric_source = 'validation-metrics' if rf_metric_ready else 'rf-runtime-structure'
+        evaluation_source = 'Validation Holdout' if rf_metric_ready else 'RF Runtime Structure'
         return {
-            'ready': person_feature_ready or runtime_ready or rf_available or rf_pose_available,
-            'runtime_ready': person_feature_ready or runtime_ready or rf_available or rf_pose_available,
+            'ready': rf_available,
+            'runtime_ready': rf_available,
             'runtime_mode': runtime_mode,
             'model_name': model_name,
-            'updated_at': rf_meta.get('updated_at', '') if runtime_mode in ('rf-pipeline-runtime', 'rf-pose-runtime') else meta.get('updated_at', ''),
+            'updated_at': rf_meta.get('updated_at', ''),
             'source_dataset': '낙상사고 위험동작 영상-센서 쌍 데이터 (AI Hub)',
             'weights_path': weights_path,
             'weights_name': weights_name,
             'class_names': ['normal(0)', 'fall(1)'],
             'sample_count': display_training_samples,
             'train_count': display_training_samples,
-            'validation_count': 0,
-            'accuracy': cv_f1,
-            'precision': cv_f1,
-            'recall': cv_f1,
-            'f1': cv_f1,
+            'validation_count': rf_validation_samples,
+            'accuracy': float(rf_metrics.get('accuracy', 0.0) or 0.0),
+            'precision': float(rf_metrics.get('precision', 0.0) or 0.0),
+            'recall': float(rf_metrics.get('recall', 0.0) or 0.0),
+            'f1': float(rf_metrics.get('f1', 0.0) or 0.0),
             'top1': 0.0,
             'val_loss': 0.0,
             'train_ratio': 1.0,
@@ -2613,8 +6190,8 @@ class VideoAnalysis:
             'metric_note': metric_note,
             'evaluation_source': evaluation_source,
             'evaluation_note': evaluation_note,
-            'eval_accuracy': cv_f1,
-            'eval_f1': cv_f1,
+            'eval_accuracy': float(rf_metrics.get('accuracy', 0.0) or 0.0),
+            'eval_f1': float(rf_metrics.get('f1', 0.0) or 0.0),
             'class_distribution': {},
             'data_quality_issues': [],
             'validation_sample_count': 0,
@@ -2629,10 +6206,12 @@ class VideoAnalysis:
                 'yolo_model': rf_meta.get('yolo_model', self._RF_YOLO_MODEL),
                 'updated_at': rf_meta.get('updated_at', ''),
                 'metric_ready': rf_metric_ready,
-                'cv_f1': float(rf_meta.get('cv_f1', 0.0) or fall_classifier.get('cv_f1', 0.0) or 0.0) if rf_metric_ready else 0.0,
-                'cv_auc': float(rf_meta.get('cv_auc', 0.0) or fall_classifier.get('cv_auc', 0.0) or 0.0) if rf_metric_ready else 0.0,
-                'training_samples': int(rf_meta.get('training_samples', 0) or fall_classifier.get('training_samples', 0) or 0) if rf_metric_ready else 0,
-                'features': rf_meta.get('features', self._RF_FEATURE_COLUMNS),
+                'cv_f1': float(rf_metrics.get('f1', 0.0) or 0.0) if rf_metric_ready else 0.0,
+                'cv_auc': float(rf_meta.get('cv_auc', 0.0) or 0.0) if rf_metric_ready else 0.0,
+                'training_samples': rf_training_samples if rf_metric_ready else 0,
+                'validation_samples': rf_validation_samples,
+                'threshold_confirm': float(rf_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold()),
+                'features': rf_summary.get('features', []) or rf_meta.get('features', self._RF_FEATURE_COLUMNS),
                 'feature_count': int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS)),
                 'n_estimators': int(rf_meta.get('n_estimators', 0) or 0),
                 'max_depth': rf_meta.get('max_depth', None),
@@ -2707,8 +6286,8 @@ class VideoAnalysis:
             'storage/training/action-behavior/model/training_summary.json',
             'storage/training/action-behavior/model/behavior_model.json',
             summary,
-            '학습된 낙상/비낙상 분류 모델',
-            '행동 라벨 추정 fallback',
+            '학습된 5-class 행동분류 모델',
+            '5-class 행동분류 학습 대기',
         )
         meta = self._behavior_model_meta()
         if state.get('ready') is False and meta.get('model') in ['behavior-rule-v1', 'behavior-binary-v1']:
@@ -2764,21 +6343,23 @@ class VideoAnalysis:
         runtime_key = str(result.get('runtime_key', '') or '')
         risk_score = self._metadata_to_number(result.get('risk_score', 0.0), 0.0)
         fall_detected = bool(result.get('fall_detected', False))
-        threshold = float(self.fall_decision_threshold)
+        threshold = float(self._rf_confirm_threshold())
         if runtime_key == 'xg-dual':
-            xg_threshold = float(self._XG_FALL_THRESHOLD)
+            posture_class_label = self._xg_posture_class_label()
+            xg_threshold = float(self._xg_fall_thresholds().get('confirm', self._XG_FALL_THRESHOLD))
             ri = result.get('runtime_inference', {}) or {}
             suppressed = ri.get('suppressed_by', []) or []
             decision_state = result.get('decision_state', 'unknown')
             posture_label = result.get('posture_label', '?')
+            fall_band = ri.get('fall_band', 'non-fall')
             suppressed_note = f' · 억제: {", ".join(suppressed)}' if suppressed else ''
             return {
                 'threshold': xg_threshold,
                 'score': round(risk_score, 4),
                 'runtime_key': runtime_key,
-                'summary': f'XG-Dual: XG-Fall(이진) + XG-Posture(6클래스) 결합 판정. 상태={decision_state}, 자세={posture_label}{suppressed_note}.',
+                'summary': f'XG-Dual: XG-Fall(최종) + XG-Posture(설명) 결합 판정. 상태={decision_state}, 밴드={fall_band}, 자세={posture_label}{suppressed_note}.',
                 'decision': '낙상' if fall_detected else '비낙상',
-                'formula': 'XG-Fall max_prob × 0.50 + mean_prob × 0.30 + fall_ratio × 0.20 → 5단계 guard → XG-Posture 6-class → arbitration',
+                'formula': f'XG-Fall max_prob × 0.50 + mean_prob × 0.30 + fall_ratio × 0.20 → 5단계 guard → XG-Posture {posture_class_label} → arbitration',
                 'details': [
                     f'최종 낙상 판정 기준: XG-Fall 위험점수 {xg_threshold:.2f} 이상 + guard 통과',
                     f'decision_state: {decision_state}',
@@ -2830,6 +6411,27 @@ class VideoAnalysis:
                 'details': [
                     f'최종 낙상 판정 기준: 위험점수 {threshold:.2f} 이상',
                     '사람 검출 뒤 bbox 13개 + 포즈 키포인트 12개 특징을 추출해 확률을 계산합니다.',
+                ],
+            }
+        if runtime_key == 'rf-dual':
+            posture_class_label = self._xg_posture_class_label()
+            ri = result.get('runtime_inference', {}) or {}
+            suppressed = ri.get('suppressed_by', []) or []
+            decision_state = result.get('decision_state', 'unknown')
+            posture_label = result.get('posture_label', '?')
+            suppressed_note = f' · 억제: {", ".join(suppressed)}' if suppressed else ''
+            return {
+                'threshold': threshold,
+                'score': round(risk_score, 4),
+                'runtime_key': runtime_key,
+                'summary': f'RF-Dual: RF(낙상 이진) + XG-Posture({posture_class_label} 자세) 결합 판정. 상태={decision_state}, 자세={posture_label}{suppressed_note}.',
+                'decision': '낙상' if fall_detected else '비낙상',
+                'formula': f'RF predict_proba 낙상 확률 → motion guard → XG-Posture {posture_class_label} → arbitration',
+                'details': [
+                    f'최종 낙상 판정 기준: RF 위험점수 {threshold:.2f} 이상 + motion guard 통과',
+                    f'decision_state: {decision_state}',
+                    f'감지 자세: {posture_label}',
+                    f'적용된 억제: {chr(44).join(suppressed) if suppressed else "없음"}',
                 ],
             }
         return {
@@ -2995,38 +6597,52 @@ class VideoAnalysis:
             trained_layers.append('낙상 Y/N 베이스라인')
         if behavior_state.get('ready'):
             trained_layers.append('낙상/비낙상 행동 분류')
+        rf_meta = self._rf_runtime_meta()
+        rf_fall_v2_summary = self._rf_fall_v2_summary()
+        rf_fall_v2_ready = self._rf_fall_v2_available()
+        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_fall_v2_metrics = (
+            (rf_fall_v2_summary.get('operational_validation', {}) or {})
+            or (rf_fall_v2_summary.get('validation', {}) or {})
+            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+        )
+        rf_feature_count = int(rf_fall_v2_summary.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))
+        rf_training_samples = int(rf_fall_v2_summary.get('training_samples', rf_meta.get('training_samples', 0)) or 0)
+        xg_posture_summary = self._xg_posture_summary()
+        posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
+        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_windows = int(
+            xg_posture_summary.get('n_windows', 0)
+            or xg_posture_summary.get('training_samples', 0)
+            or sum((xg_posture_summary.get('class_distribution', {}) or {}).values())
+            or 0
+        )
+        posture_feature_count = int(xg_posture_summary.get('feature_count', 0) or 0)
+        xg_posture_ready = self._xg_posture_available()
         selected_runtime = actual_runtime_key
         if not selected_runtime:
-            if self._rf_pose_pipeline_available():
-                selected_runtime = 'rf-pose-runtime'
-            elif self._rf_pipeline_available():
-                selected_runtime = 'rf-pipeline-runtime'
-            elif self._person_feature_available() and self._trained_runtime_available(baseline_state):
-                selected_runtime = 'person-feature-runtime'
+            if self._rf_pipeline_available() or rf_fall_v2_ready:
+                selected_runtime = 'rf-dual-runtime'
             elif len(trained_layers) == 0:
                 selected_runtime = 'heuristic-fallback'
             else:
-                selected_runtime = 'person-feature-runtime'
-        if selected_runtime == 'person-feature-runtime':
-            runtime_label = 'XGBoost v2 파이프라인 (YOLO + XGBoost)'
-            runtime_key = 'person-feature-runtime'
-            runtime_note = '현재 기본 운영 모델입니다. 사람 검출·추적 후 10개 모션 특징을 추출해 XGBoost v2 분류기로 낙상 확률을 계산합니다.'
-        elif selected_runtime == 'rf-pose-runtime':
-            runtime_label = 'RF-Pose 파이프라인 (RandomForest + YOLOv8n-Pose + Keypoints)'
-            runtime_key = 'rf-pose-runtime'
-            runtime_note = '현재 기본 운영 모델입니다. YOLOv8n-Pose 사람 검출 → 13개 bbox 특징 + 12개 포즈 키포인트 특징 → RandomForest 분류기로 낙상 위험도를 판단합니다.'
-        elif selected_runtime == 'rf-pipeline-runtime':
-            runtime_label = 'RF 보조 파이프라인 (RandomForest + YOLOv8n-Pose)'
-            runtime_key = 'rf-pipeline-runtime'
-            runtime_note = '비교 검증용 보조 모델입니다. YOLOv8n-Pose 사람 검출 → 13개 통계 특징 추출 → RandomForest 분류기로 낙상 위험도를 판단합니다.'
+                selected_runtime = 'rf-dual-runtime'
+        if selected_runtime == 'rf-dual-runtime':
+            runtime_label = 'RF-Dual 운영 파이프라인 (RF Fall + XG-Posture)'
+            runtime_key = 'rf-dual-runtime'
+            runtime_note = f"현재 공식 운영 모델입니다. RF-Fall v2 {rf_feature_count}개 특징 낙상 판정({rf_training_samples}건 학습, threshold {round(rf_fall_v2_confirm * 100, 1)}%, F1 {round(float(rf_fall_v2_metrics.get('f1', 0.0) or 0.0) * 100, 1)}%)과 XG-Posture {posture_class_label}({posture_windows}건, {posture_feature_count} features, Group CV macro F1 {round(posture_cv_f1 * 100, 1)}%)가 함께 동작합니다."
         elif selected_runtime == 'heuristic-fallback':
             runtime_label = '규칙·메타데이터 기반 fallback 분석'
             runtime_key = 'heuristic-fallback'
             runtime_note = 'RF 모델이 준비되지 않아 파일 메타데이터와 파일명 패턴을 사용한 fallback 결과를 반환합니다.'
         else:
-            runtime_label = 'XGBoost v2 파이프라인 (YOLO + XGBoost)'
-            runtime_key = 'person-feature-runtime'
-            runtime_note = '사람 검출·추적 후 10개 모션 특징을 추출해 XGBoost v2 분류기로 낙상 확률을 판단합니다.'
+            runtime_label = 'RF-Dual 운영 파이프라인 (RF Fall + XG-Posture)'
+            runtime_key = 'rf-dual-runtime'
+            runtime_note = 'RF-Dual을 기본 운영 기준으로 사용합니다.'
         return {
             'current_runtime': {
                 'key': runtime_key,
@@ -3036,70 +6652,89 @@ class VideoAnalysis:
             },
             'layers': [
                 {
-                    'title': '낙상 Y/N 레이어',
-                    'status': baseline_state.get('status', 'fallback'),
-                    'active_label': baseline_state.get('active_label', ''),
-                    'summary_exists': baseline_state.get('summary_exists', False),
-                    'model_exists': baseline_state.get('model_exists', False),
-                    'sample_count': baseline_state.get('sample_count', 0),
+                    'title': '낙상 최종 판정 레이어',
+                    'status': 'ready' if (self._rf_pipeline_available() or rf_fall_v2_ready) else 'fallback',
+                    'active_label': f"RF-Fall v2 / RandomForest {rf_feature_count}개 특징 / threshold {round(rf_fall_v2_confirm * 100, 1)}%",
+                    'summary_exists': bool(rf_fall_v2_summary) or self._rf_pipeline_available(),
+                    'model_exists': self._rf_pipeline_available() or rf_fall_v2_ready,
+                    'sample_count': rf_training_samples,
                 },
                 {
-                    'title': '행동 분류 레이어',
-                    'status': behavior_state.get('status', 'fallback'),
-                    'active_label': behavior_state.get('active_label', ''),
-                    'summary_exists': behavior_state.get('summary_exists', False),
-                    'model_exists': behavior_state.get('model_exists', False),
-                    'sample_count': behavior_state.get('sample_count', 0),
+                    'title': '자세 설명 레이어',
+                    'status': 'ready' if xg_posture_ready else 'training-needed',
+                    'active_label': f"XG-Posture {posture_class_label} / {posture_windows} rows / {posture_feature_count} features / Group F1 {round(posture_cv_f1 * 100, 1)}%",
+                    'summary_exists': bool(xg_posture_summary),
+                    'model_exists': xg_posture_ready,
+                    'sample_count': posture_windows,
                 },
                 {
-                    'title': '운영 데이터 현황',
-                    'status': 'ready' if intake_summary.get('total', 0) > 0 or archive_summary.get('total', 0) > 0 else 'training-needed',
-                    'active_label': f"학습 intake {intake_summary.get('total', 0)}건 · 분석 아카이브 {archive_summary.get('total', 0)}건",
-                    'summary_exists': intake_summary.get('total', 0) > 0,
-                    'model_exists': archive_summary.get('total', 0) > 0,
-                    'sample_count': intake_summary.get('total', 0),
+                    'title': '청크 운영 레이어',
+                    'status': 'ready',
+                    'active_label': f"4초 실시간 청크 · 분석 아카이브 {archive_summary.get('total', 0)}건",
+                    'summary_exists': True,
+                    'model_exists': True,
+                    'sample_count': int(archive_summary.get('total', 0) or 0),
                 },
             ],
         }
 
     def _analysis_diagnostics(self, baseline_state, behavior_state, intake_summary, archive_summary):
         items = []
-        rf_available = self._rf_pipeline_available()
+        rf_available = self._rf_pipeline_available() or self._rf_fall_v2_available()
         rf_meta = self._rf_runtime_meta()
-        meta = self._baseline_model_meta()
-        fall_classifier = (meta.get('fall_classifier', {}) or {})
-        feature_meta = fall_classifier.get('features', []) or []
-        rf_metric_ready = str(fall_classifier.get('type', '') or '').lower().startswith('randomforest') or len(feature_meta) == len(self._RF_FEATURE_COLUMNS)
-        cv_f1 = float(fall_classifier.get('cv_f1', 0.0) or 0.0) if rf_metric_ready else 0.0
-        cv_auc = float(fall_classifier.get('cv_auc', 0.0) or 0.0) if rf_metric_ready else 0.0
-        pf_available = self._person_feature_available()
-        if pf_available:
+        rf_summary = self._rf_project_summary()
+        rf_metrics = (rf_summary.get('best_metrics', {}) or {})
+        rf_fall_v2_summary = self._rf_fall_v2_summary()
+        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_metrics = (
+            (rf_fall_v2_summary.get('operational_validation', {}) or {})
+            or (rf_fall_v2_summary.get('validation', {}) or {})
+            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+            or rf_metrics
+        )
+        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_feature_count = int(rf_fall_v2_summary.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))
+        xg_posture_summary = self._xg_posture_summary()
+        posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
+        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_windows = int(
+            xg_posture_summary.get('n_windows', 0)
+            or xg_posture_summary.get('training_samples', 0)
+            or sum((xg_posture_summary.get('class_distribution', {}) or {}).values())
+            or 0
+        )
+        posture_feature_count = int(xg_posture_summary.get('feature_count', 0) or 0)
+        xg_posture_ready = self._xg_posture_available()
+        if rf_available:
             items.append({
                 'severity': 'info',
-                'title': 'XGBoost v2 파이프라인이 기본 운영 모델로 연결되었습니다.',
-                'description': 'YOLO ByteTrack 사람 추적 → 10개 모션 특징 추출 → XGBoost v2 분류기(1500건 학습)로 낙상 확률을 판단합니다.',
-                'action': '자동 선택은 XGBoost v2 파이프라인을 우선 사용합니다.',
-            })
-        elif rf_available:
-            items.append({
-                'severity': 'info',
-                'title': 'RF 보조 파이프라인이 연결되었습니다 (XGBoost 미준비).',
-                'description': (f'CV F1 {round(cv_f1 * 100, 1)}%%, CV AUC {round(cv_auc * 100, 1)}%% — YOLOv8n-Pose 사람 검출 → 13개 통계 특징 → RandomForest 분류' if rf_metric_ready else f"{rf_meta.get('model_class', 'RandomForestClassifier')} · 트리 {int(rf_meta.get('n_estimators', 0) or 0)}개 · 특징 {int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))}개"),
-                'action': 'XGBoost v2 파이프라인을 준비하면 자동으로 메인 모델로 전환됩니다.',
+                'title': 'RF-Dual이 현재 공식 운영 파이프라인으로 연결되어 있습니다.',
+                'description': f"RF-Fall v2 {rf_feature_count}개 특징 기반 낙상 이진 분류가 최종 판정을 담당합니다. threshold sweep 기준 F1 {round(float(rf_fall_v2_metrics.get('f1', 0.0) or 0.0) * 100, 1)}%, Recall {round(float(rf_fall_v2_metrics.get('recall', 0.0) or 0.0) * 100, 1)}%, confirm threshold {round(rf_fall_v2_confirm * 100, 1)}%입니다.",
+                'action': '운영 문서와 관리자 표시는 RF-Dual 기준으로 유지하고, threshold 변경 시 검증 수치도 함께 갱신하세요.',
             })
         else:
             items.append({
                 'severity': 'warn',
                 'title': '학습된 분석 모델이 준비되지 않아 규칙 기반 fallback으로 동작합니다.',
-                'description': 'XGBoost v2 파이프라인 또는 RF 보조 파이프라인 모델 파일을 확인하세요.',
+                'description': 'RF-Dual 운영 모델 파일이 없어 파일 메타데이터 기반 fallback만 동작합니다.',
                 'action': '모델 파일을 배치하고 서버가 접근 가능하도록 권한을 설정하세요.',
             })
-        if behavior_state.get('ready') is False:
+        if xg_posture_ready:
+            items.append({
+                'severity': 'info',
+                'title': 'XG-Posture 자세 레이어가 운영 설명에 사용됩니다.',
+                'description': f"{posture_class_label} 자세 분류기 기준 {posture_windows}건, {posture_feature_count}개 feature, Group CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%입니다.",
+                'action': 'lie / sit / fall 경계 사례가 늘어나면 XG-Posture 재학습 후 summary를 다시 반영하세요.',
+            })
+        else:
             items.append({
                 'severity': 'warn',
-                'title': '행동 분류 모델이 준비되지 않아 설명력이 제한됩니다.',
-                'description': '행동 분류는 현재 파일명 패턴과 위험 점수 기반 추정에 가깝습니다.',
-                'action': '행동 분류 학습 요약과 모델 파일을 생성한 뒤 결과 해석 레이어를 연결해야 합니다.',
+                'title': 'XG-Posture 자세 모델이 준비되지 않아 설명력이 제한됩니다.',
+                'description': 'RF 낙상 확률만으로는 sit / lie / fall 경계 설명이 부족해집니다.',
+                'action': 'xg-posture 모델과 training_summary를 복구한 뒤 재배포하세요.',
             })
         if cv2 is None:
             items.append({
@@ -3133,7 +6768,7 @@ class VideoAnalysis:
             })
         return {
             'status': overall_status,
-            'headline': '현재 분석 품질은 학습 모델 준비 상태, 서버 메타데이터 추출 가능 여부, 실시간 입력 검증 이력에 의해 좌우됩니다.',
+            'headline': '현재 분석 품질은 RF-Dual 운영 모델, XG-Posture 설명 레이어, 그리고 4초 무삭제 실시간 청크 정책에 의해 좌우됩니다.',
             'items': items,
         }
 
@@ -3174,68 +6809,46 @@ class VideoAnalysis:
         """Return available model options.
         FN-0014: RF-Pose deprecated — hidden from UI, available only via config.
         """
-        runtime_ready = self._trained_runtime_available(baseline_state)
-        person_feature_ready = runtime_ready and self._person_feature_available()
         rf_available = self._rf_pipeline_available()
-        xg_fall_ready = self._xg_fall_available()
-        xg_posture_ready = self._xg_posture_available()
-        xg_dual_ready = xg_fall_ready and xg_posture_ready
+        rf_dual_ready = rf_available
         options = [
             {
-                'key': 'xg-dual',
-                'label': 'XG-Dual (Fall+Posture) 파이프라인',
-                'description': 'XG-Fall 낙상 감지 + XG-Posture 6-class 자세 분류를 동시 수행하는 듀얼 파이프라인입니다.',
-                'available': xg_dual_ready,
-            },
-            {
-                'key': 'xg-fall',
-                'label': 'XG-Fall 37-Feature 파이프라인',
-                'description': '37개 통합 특징(bbox+pose+temporal+gait) → XGBoost 낙상 감지 파이프라인입니다.',
-                'available': xg_fall_ready,
-            },
-            {
-                'key': 'person-feature',
-                'label': 'XGBoost v2 파이프라인',
-                'description': 'YOLO ByteTrack 사람 추적 → 10개 모션 특징 → XGBoost v2 분류 파이프라인입니다.',
-                'available': person_feature_ready,
-            },
-            {
-                'key': 'rf-pipeline',
-                'label': 'RF 보조 파이프라인',
-                'description': 'YOLOv8n-Pose 사람 검출 → 13개 bbox 통계 특징 → RandomForest 분류 파이프라인입니다.',
-                'available': rf_available,
+                'key': 'rf-dual',
+                'label': 'RF-Dual (Fall+Posture) 파이프라인',
+                'description': f'RF 낙상 감지 + XG-Posture {self._xg_posture_class_label()} 자세 분류를 결합한 듀얼 파이프라인입니다. RF 속도 + 자세 풍부함 조합.',
+                'available': rf_dual_ready,
             },
             # FN-0014 Stage A: rf-pose deprecated — UI에서 숨김
             # config에서 직접 model_type=rf-pose 지정 시에만 사용 가능
         ]
-        default_key = 'xg-dual' if xg_dual_ready else ('xg-fall' if xg_fall_ready else ('person-feature' if person_feature_ready else 'rf-pipeline'))
+        default_key = 'rf-dual'
         return {
             'default': default_key,
             'options': options,
         }
 
     def _model_option_label(self, key):
-        key = str(key or 'xg-dual').strip().lower()
+        key = str(key or 'rf-dual').strip().lower()
         labels = {
-            'xg-dual': 'XG-Dual (Fall+Posture) 파이프라인',
-            'xg-fall': 'XG-Fall 37-Feature 파이프라인',
             'person-feature': 'XGBoost v2 파이프라인',
             'rf-pipeline': 'RF 보조 파이프라인',
             'rf-pose': 'RF-Pose 파이프라인 (deprecated)',
+            'rf-dual': 'RF-Dual (Fall+Posture) 파이프라인',
         }
-        return labels.get(key, key or 'XG-Dual 파이프라인')
+        return labels.get(key, key or 'RF-Dual 파이프라인')
 
     def _webcam_mode_info(self):
         return {
             'status': 'preview-enabled',
-            'message': '브라우저 웹캠 미리보기와 4초 단위 청크 분석 흐름을 지원합니다.',
+            'message': '브라우저 웹캠 미리보기와 4초 연속 청크 분석 흐름을 지원합니다.',
             'supported_formats': ['video/webm'],
-            'recommended_record_sec': 8,
+            'recommended_record_sec': 10,
             'steps': [
                 '웹캠 권한 허용',
                 '실시간 프리뷰 확인',
                 '4초 단위 청크 생성',
-                '기존 분석 API로 순차 전송',
+                'RTT 급증 시에도 브라우저 큐에서 청크를 삭제하지 않음',
+                '기존 분석 API로 순차 전송 및 실패 청크 재시도',
                 '향후 서버 추론 큐로 확장',
             ]
         }
@@ -3244,10 +6857,10 @@ class VideoAnalysis:
         return {
             'possible': True,
             'status': 'phase-1-browser-streaming',
-            'headline': '현재 구조에서는 브라우저 스트림 샘플링 + 주기 전송 방식의 실시간 분석이 가장 현실적인 적용 범위입니다.',
-            'summary': '완전한 서버 상시 스트리밍 이전에, 브라우저에서 4초 단위로 잘라 업로드 API에 재사용하는 방식이 구현 난이도와 안정성 측면에서 가장 적합합니다.',
+            'headline': '현재 구조에서는 4초 연속 청크를 누락 없이 순차 분석하는 방식이 가장 안정적인 적용 범위입니다.',
+            'summary': '완전한 서버 상시 스트리밍 이전에, 브라우저에서 4초 청크를 생성하고 서버 처리 지연이 튀어도 큐에서 버리지 않는 방식으로 분석 누락을 방지합니다.',
             'current_scope': [
-                '브라우저 MediaRecorder 로 4초 청크 생성',
+                '브라우저 MediaRecorder 로 4초 연속 청크 생성',
                 '업로드 분석 API 재사용',
                 '위험 점수·행동 분류·대표 이벤트만 즉시 갱신',
                 '좌측 영상 창에서 입력 장면을 지속 표시',
@@ -3271,7 +6884,7 @@ class VideoAnalysis:
             ],
             'constraints': [
                 '완전 초단위 스트리밍 추론은 아직 아닙니다.',
-                '청크 분석 중 다음 청크 일부를 건너뛸 수 있습니다.',
+                '서버 처리 시간이 4초를 넘으면 결과 표시 지연과 큐 적체가 생길 수 있습니다.',
                 '장시간 운영에는 RTSP 입력과 worker 기반 서버 구조가 추가로 필요합니다.',
             ],
             'ui_scope': {
@@ -3282,29 +6895,24 @@ class VideoAnalysis:
         }
 
     def _model_explanation(self, baseline_summary, behavior_summary, baseline_state, behavior_state, intake_summary, archive_summary):
-        behavior_dataset = (behavior_summary or {}).get('dataset', {}) or {}
-        behavior_validation = (behavior_summary or {}).get('validation_metrics', {}) or {}
-        behavior_sample_value = behavior_dataset.get('sample_count', 0) if behavior_state.get('ready') else 0
+        xg_posture_summary = self._xg_posture_summary()
+        posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_sequence_cv = self._xg_posture_sequence_cv(xg_posture_summary)
+        posture_sequence_accuracy = float(posture_sequence_cv.get('accuracy', posture_cv_accuracy) or 0.0)
+        posture_sequence_f1 = float(posture_sequence_cv.get('f1_macro', 0.0) or 0.0)
+        posture_sample_value = int(xg_posture_summary.get('n_windows', 0) or 0)
         rf_available = self._rf_pipeline_available()
-        runtime_ready = self._trained_runtime_available(baseline_state)
-        person_feature_ready = runtime_ready and self._person_feature_available()
         rf_meta = self._rf_runtime_meta()
-        meta = self._baseline_model_meta()
-        fall_classifier = (meta.get('fall_classifier', {}) or {})
-        feature_meta = fall_classifier.get('features', []) or []
-        person_metric_ready = len(feature_meta) == 10
-        rf_metric_ready = str(fall_classifier.get('type', '') or '').lower().startswith('randomforest') or len(feature_meta) == len(self._RF_FEATURE_COLUMNS)
-        cv_f1 = float(fall_classifier.get('cv_f1', 0.7499) or 0.7499) if person_metric_ready else 0.0
-        cv_auc = float(fall_classifier.get('cv_auc', 0.86) or 0.86) if person_metric_ready else 0.0
-        training_samples = int(fall_classifier.get('training_samples', 2250) or 2250) if person_metric_ready else 0
-        rf_cv_f1 = float(fall_classifier.get('cv_f1', 0.0) or 0.0) if rf_metric_ready else 0.0
-        rf_cv_auc = float(fall_classifier.get('cv_auc', 0.0) or 0.0) if rf_metric_ready else 0.0
-        rf_training_samples = int(fall_classifier.get('training_samples', 0) or 0) if rf_metric_ready else 0
-        yolo_eval = (baseline_summary.get('evaluation', {}) or {}).get('average', {}) or {}
+        rf_summary = self._rf_project_summary()
+        rf_metrics = (rf_summary.get('best_metrics', {}) or {})
+        rf_threshold = float(((rf_summary.get('best_config', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_training_samples = int(rf_summary.get('training_samples', 0) or rf_meta.get('training_samples', 0) or 0)
+        rf_validation_samples = int(rf_summary.get('validation_samples', 0) or 0)
         return {
-            'headline': '운영 기본 순서는 XGBoost v2 파이프라인 → RF 보조 파이프라인 → YOLO 분류 모델 순입니다.',
-            'runtime_label': 'XGBoost v2 파이프라인' if person_feature_ready else ('RF 보조 파이프라인' if rf_available else ('YOLO 분류 모델' if runtime_ready else '규칙·메타데이터 기반 fallback')),
-            'runtime_note': 'XGBoost v2 파이프라인을 기본 운영 모델로 사용하고, 필요 시 RF 보조 파이프라인을 비교용으로 사용합니다.' if person_feature_ready else ('RF 보조 파이프라인을 사용하고, XGBoost v2가 준비되면 자동으로 전환됩니다.' if rf_available else ('YOLO 분류 백업 모델을 사용합니다.' if runtime_ready else '학습 모델이 준비되지 않아 fallback을 사용합니다.')),
+            'headline': '운영 기본 순서는 RF-Dual 최종 판정 → XG-Posture 자세 설명 → 4초 실시간 청크 운영 순입니다.',
+            'runtime_label': 'RF-Dual 운영 파이프라인' if rf_available else '규칙·메타데이터 기반 fallback',
+            'runtime_note': '현재 서비스는 RF-Dual을 공식 운영 모델로 사용하고, XG-Posture를 자세 설명과 오탐 억제 레이어로 결합합니다.' if rf_available else '학습 모델이 준비되지 않아 fallback을 사용합니다.',
             'cards': [
                 {
                     'key': 'fast',
@@ -3318,42 +6926,42 @@ class VideoAnalysis:
                     ],
                 },
                 {
-                    'key': 'person-feature',
-                    'title': 'XGBoost v2 파이프라인 (운영 기본값)',
-                    'status': 'ready' if person_feature_ready else 'not-ready',
-                    'summary': f'Person detector + 10개 모션 특징 + XGBoost (학습 {training_samples}건, CV F1 {round(cv_f1 * 100, 1)}%%)',
-                    'items': [
-                        f"학습 샘플 {training_samples}건",
-                        f"CV F1 {round(cv_f1 * 100, 1)}%%",
-                        f"CV AUC {round(cv_auc * 100, 1)}%%",
-                        '현재 업로드/실시간 분석의 기본 운영 모델',
-                    ],
-                },
-                {
-                    'key': 'rf-pipeline',
-                    'title': 'RF 보조 파이프라인',
+                    'key': 'rf-dual',
+                    'title': 'RF-Dual (운영 기본값)',
                     'status': 'ready' if rf_available else 'not-ready',
-                    'summary': (f'YOLOv8n-Pose → 13 특징 → RandomForest (학습 {rf_training_samples}건, CV F1 {round(rf_cv_f1 * 100, 1)}%%)' if rf_metric_ready else f"YOLOv8n-Pose → 13 특징 → RandomForest (트리 {int(rf_meta.get('n_estimators', 0) or 0)}개, 특징 {int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))}개)"),
+                    'summary': f'RF {len(self._RF_FEATURE_COLUMNS)}개 특징 + XG-Posture 설명 결합 (학습 {rf_training_samples}건, 검증 {rf_validation_samples}건, F1 {round(float(rf_metrics.get("f1", 0.0) or 0.0) * 100, 1)}%%)',
                     'items': [
-                        (f"학습 샘플 {rf_training_samples}건 (5-Fold CV)" if rf_metric_ready else f"모델 클래스 {rf_meta.get('model_class', 'RandomForestClassifier') }"),
-                        (f"CV F1 {round(rf_cv_f1 * 100, 1)}%%" if rf_metric_ready else f"트리 수 {int(rf_meta.get('n_estimators', 0) or 0)}개"),
-                        (f"CV AUC {round(rf_cv_auc * 100, 1)}%%" if rf_metric_ready else f"특징 수 {int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))}개"),
-                        '보조 비교 모델 (사용자 수동 선택)',
+                        f"학습 샘플 {rf_training_samples}건 / 검증 {rf_validation_samples}건",
+                        f"검증 Recall {round(float(rf_metrics.get('recall', 0.0) or 0.0) * 100, 1)}%%",
+                        f"운영 threshold {round(rf_threshold * 100, 0)}%%",
+                        '현재 업로드/실시간 분석의 공식 운영 모델',
                     ],
                 },
                 {
-                    'key': 'behavior',
-                    'title': '낙상/비낙상 분류',
-                    'status': 'ready' if behavior_state.get('ready') else 'training-needed',
-                    'summary': behavior_state.get('active_label', '행동 라벨 추정 fallback'),
-                    'model_type': behavior_state.get('model_type', 'fallback'),
-                    'model_type_label': behavior_state.get('model_type_label', ''),
-                    'model_type_note': behavior_state.get('model_type_note', ''),
+                    'key': 'xg-posture',
+                    'title': 'XG-Posture 자세 설명 레이어',
+                    'status': 'ready' if self._xg_posture_available() else 'not-ready',
+                    'summary': f"{int(xg_posture_summary.get('feature_count', 0) or 0)}개 특징 기반 {posture_class_label} 자세 분류 (윈도우 {posture_sample_value}건, sequence acc {round(posture_sequence_accuracy * 100, 1)}%, macro F1 {round(posture_sequence_f1 * 100, 1)}%)",
                     'items': [
-                        f"분류 방식: {behavior_state.get('model_type_label', 'fallback')}",
-                        f"총 {behavior_sample_value}건",
-                        f"검증 정확도 {round(float(behavior_validation.get('accuracy', 0.0) or 0.0) * 100, 1)}%",
-                        f"Macro F1 {round(float(behavior_validation.get('macro_f1', 0.0) or 0.0) * 100, 1)}%",
+                        f"활성 클래스 {int(xg_posture_summary.get('n_classes', 0) or 0)}개",
+                        f"학습 윈도우 {posture_sample_value}건",
+                        '주요 역할: sit / lie / fall 경계 설명',
+                        '최종 fall_detected를 직접 바꾸기보다 설명과 arbitration에 기여',
+                    ],
+                },
+                {
+                    'key': 'chunk-ops',
+                    'title': '4초 실시간 청크 운영 레이어',
+                    'status': 'ready',
+                    'summary': '실시간 입력을 4초 단위로 끊어 순차 분석하고, RTT 급증 시에도 브라우저 큐에서 청크를 삭제하지 않습니다.',
+                    'model_type': 'operations',
+                    'model_type_label': '운영 정책',
+                    'model_type_note': '업로드와 실시간 모두 동일한 청크 운영 규칙을 사용합니다.',
+                    'items': [
+                        '4초 단위 연속 청크',
+                        '실패 청크 재시도 및 큐 적체 표시',
+                        '업로드 로그와 실시간 로그에 동일 구간 라벨 저장',
+                        '운영 알림은 누적 청크 결과 기준으로 해석',
                     ],
                 },
                 {
@@ -3362,7 +6970,8 @@ class VideoAnalysis:
                     'status': 'preview',
                     'summary': '웹캠 청크를 동일 결과 스키마로 보내 업로드와 실시간 분석 구조를 맞춥니다.',
                     'items': [
-                        '5초 청크 전송',
+                        '4초 단위 연속 청크 전송',
+                        'RTT 급증 시에도 청크 누락 방지',
                         '좌측 프리뷰 유지',
                         '향후 서버 큐 구조로 확장 가능',
                     ],
@@ -3370,14 +6979,14 @@ class VideoAnalysis:
             ],
             'learning_data': [
                 {
-                    'label': '낙상 Y/N 데이터셋 (RF)',
-                    'value': rf_training_samples if rf_metric_ready else int(rf_meta.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS)),
-                    'note': 'RF 보조 파이프라인의 학습 메타가 있으면 샘플 수, 없으면 현재 운영 특징 수를 표시합니다.',
+                    'label': 'RF 낙상 데이터셋',
+                    'value': rf_training_samples,
+                    'note': '현재 운영 RandomForest 낙상 판정 모델의 학습 샘플 수입니다.',
                 },
                 {
-                    'label': '행동 분류 데이터셋',
-                    'value': behavior_sample_value,
-                    'note': '이진 행동 분류 학습 요약이 없으면 0으로 유지됩니다.',
+                    'label': 'XG-Posture 데이터셋',
+                    'value': posture_sample_value,
+                    'note': f'{posture_class_label} 자세 분류 학습에 사용한 시계열 윈도우 수입니다.',
                 },
                 {
                     'label': '분석 아카이브',
@@ -3386,14 +6995,14 @@ class VideoAnalysis:
                 },
                 {
                     'label': '실시간 권장 청크(초)',
-                    'value': 4,
-                    'note': '브라우저 스트림 샘플링 시 권장 전송 길이',
+                    'value': 5,
+                    'note': '2초 간격으로 겹쳐 보내는 슬라이딩 윈도우 길이',
                 },
             ],
             'notes': [
                 '메인페이지는 빠른 확인과 CTA 중심으로 단순화합니다.',
                 '운영 설정과 학습 상태는 관리자 화면에서 분리 관리합니다.',
-                '실시간 분석은 청크 기반 안정화 후 서버 큐 단계로 확장합니다.',
+                '실시간 분석은 4초 연속 청크와 무삭제 큐 기반 안정화 후 서버 큐 단계로 확장합니다.',
             ]
         }
 
@@ -3443,6 +7052,36 @@ class VideoAnalysis:
             return '*' * len(token)
         return f"{'*' * (len(token) - 4)}{token[-4:]}"
 
+    def _limit_inference_threads(self, bundle_or_model):
+        """Keep small realtime predictions from spawning slow thread pools."""
+        targets = []
+        if isinstance(bundle_or_model, dict):
+            targets.append(bundle_or_model.get('model'))
+        targets.append(bundle_or_model)
+        for model in [m for m in targets if m is not None]:
+            try:
+                if hasattr(model, 'set_params'):
+                    model.set_params(n_jobs=1)
+            except Exception:
+                pass
+            try:
+                if hasattr(model, 'set_params'):
+                    model.set_params(nthread=1)
+            except Exception:
+                pass
+            try:
+                if hasattr(model, 'n_jobs'):
+                    model.n_jobs = 1
+            except Exception:
+                pass
+            try:
+                booster = model.get_booster() if hasattr(model, 'get_booster') else None
+                if booster is not None:
+                    booster.set_param({'nthread': 1})
+            except Exception:
+                pass
+        return bundle_or_model
+
     def _load_alert_settings(self):
         saved = self._read_json(self._alert_settings_path(), default={}) or {}
         return self._merge(self._default_alert_settings(), saved)
@@ -3471,7 +7110,623 @@ class VideoAnalysis:
         merged = self._merge(current, settings or {})
         merged['updated_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self._write_json(self._alert_settings_path(), merged)
+        self._invalidate_prototype_info_cache()
         return self._public_alert_settings(merged)
+
+    def _default_llm_settings(self):
+        return {
+            'updated_at': '',
+            'enabled': False,
+            'provider': 'openai',
+            'model': 'gpt-4.1',
+            'api_key': '',
+            'temperature': 0.1,
+            'max_output_tokens': 700,
+            'mode': 'advisory',
+            'prompt_policy': (
+                'RF-Dual 낙상 판정, XG-Posture 5-class 확률, 주요 feature, '
+                '이벤트 구간 근거를 함께 보고 사람이 읽을 수 있는 판정 사유를 생성합니다.'
+            ),
+        }
+
+    def _load_llm_settings(self):
+        saved = self._read_json(self._llm_settings_path(), default={}) or {}
+        return self._merge(self._default_llm_settings(), saved)
+
+    def _public_llm_settings(self, settings=None):
+        settings = self._merge(self._default_llm_settings(), settings or self._load_llm_settings())
+        api_key = str(settings.get('api_key', '') or '')
+        env_key = str(os.environ.get('OPENAI_API_KEY', '') or '')
+        return {
+            'updated_at': settings.get('updated_at', ''),
+            'enabled': bool(settings.get('enabled', False)),
+            'provider': settings.get('provider', 'openai'),
+            'model': settings.get('model', 'gpt-4.1'),
+            'temperature': settings.get('temperature', 0.1),
+            'max_output_tokens': settings.get('max_output_tokens', 700),
+            'mode': settings.get('mode', 'advisory'),
+            'prompt_policy': settings.get('prompt_policy', ''),
+            'api_key_configured': bool(api_key or env_key),
+            'api_key_source': 'settings' if api_key else ('environment' if env_key else ''),
+            'api_key_masked': self._mask_token(api_key or env_key),
+            'security_note': 'API Key는 서버 설정에만 저장하고 브라우저 응답에는 마스킹 값만 노출합니다.',
+        }
+
+    def save_llm_settings(self, settings):
+        current = self._load_llm_settings()
+        incoming = settings or {}
+        api_key_action = str(incoming.pop('api_key_action', '') or '').strip().lower()
+        api_key = str(incoming.pop('api_key', '') or '').strip()
+        merged = self._merge(current, incoming)
+        if api_key_action == 'clear':
+            merged['api_key'] = ''
+        elif api_key:
+            merged['api_key'] = api_key
+        else:
+            merged['api_key'] = current.get('api_key', '')
+        merged['provider'] = 'openai'
+        try:
+            merged['temperature'] = max(0.0, min(1.0, float(merged.get('temperature', 0.1) or 0.1)))
+        except Exception:
+            merged['temperature'] = 0.1
+        try:
+            merged['max_output_tokens'] = max(128, min(4000, int(merged.get('max_output_tokens', 700) or 700)))
+        except Exception:
+            merged['max_output_tokens'] = 700
+        merged['updated_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        path = self._write_json(self._llm_settings_path(), merged)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        self._invalidate_prototype_info_cache()
+        return self._public_llm_settings(merged)
+
+    def _llm_api_key(self, settings=None):
+        settings = settings or self._load_llm_settings()
+        return str(settings.get('api_key', '') or os.environ.get('OPENAI_API_KEY', '') or '').strip()
+
+    def _build_llm_interpretation_prompt(self, result):
+        ri = result.get('runtime_inference', {}) or {}
+        mr = result.get('model_runtime', {}) or {}
+        behavior = result.get('behavior_result', {}) or {}
+        payload = {
+            'fall_detected': result.get('fall_detected'),
+            'risk_score': result.get('risk_score'),
+            'risk_level': result.get('risk_level'),
+            'risk_label': result.get('risk_label'),
+            'summary': result.get('summary', ''),
+            'decision_state': result.get('decision_state', ''),
+            'fall_result': result.get('fall_result', {}),
+            'behavior_result': behavior,
+            'posture_label': result.get('posture_label', ''),
+            'posture_score': result.get('posture_score', 0),
+            'posture_probs': result.get('posture_probs', {}),
+            'posture_diagnostics': ri.get('posture_diagnostics', {}),
+            'motion_guard': ri.get('motion_guard', {}),
+            'occlusion': ri.get('occlusion', {}),
+            'short_clip': ri.get('short_clip', {}),
+            'feature_frame_counts': {
+                'rf_feature_frames': mr.get('rf_feature_frames'),
+                'posture_feature_frames': mr.get('posture_feature_frames'),
+                'posture_windows': mr.get('posture_windows'),
+                'rf_target_fps': mr.get('rf_target_fps'),
+                'posture_target_fps': mr.get('posture_target_fps'),
+            },
+            'key_features': {
+                k: (ri.get('features', {}) or {}).get(k)
+                for k in [
+                    'detection_rate', 'n_frames', 'center_y_std', 'height_std',
+                    'aspect_ratio_mean', 'aspect_ratio_std', 'delta_y_mean',
+                    'delta_y_max', 'delta_y_accel_max', 'final_height_ratio',
+                ]
+            },
+            'analysis_overview': result.get('analysis_overview', []),
+            'chunk_summary': (result.get('chunk_analysis', {}) or {}).get('summary', {}),
+        }
+        return self._sanitize_for_json(payload)
+
+    def _local_interpretation_text(self, result):
+        risk_pct = round(self._metadata_to_number(result.get('risk_score', 0.0), 0.0) * 100.0, 1)
+        posture_label = result.get('posture_label') or result.get('behavior_class') or ''
+        posture_text = self._posture_label_text(posture_label) if posture_label else '행동 미확정'
+        decision_state = result.get('decision_state', '')
+        facial = result.get('facial_state') or ((result.get('runtime_inference') or {}).get('facial_state')) or {}
+        facial_text = ''
+        if isinstance(facial, dict) and facial.get('reason') == 'face_not_detected':
+            facial_text = '얼굴/표정은 검출되지 않아 점수 보정에는 사용하지 않았습니다.'
+        elif isinstance(facial, dict) and (facial.get('available') or facial.get('face_detected')):
+            facial_text = f"표정 보조 신호는 {facial.get('label') or facial.get('emotion_top_label') or '분석됨'} 상태로 확인했습니다."
+        else:
+            facial_text = '표정 보조 신호는 이번 응답에서 사용하지 않았습니다.'
+        if result.get('fall_detected'):
+            first = f"낙상 모델 점수는 {risk_pct}%로 임계값 이상이며, 현재 상태는 {decision_state or '낙상 의심'}입니다."
+        else:
+            first = f"낙상 모델 점수는 {risk_pct}%로 즉시 낙상 판정보다는 낮고, 행동분류는 {posture_text}로 계산됐습니다."
+        basis = result.get('analysis_basis') or []
+        basis_text = ''
+        if basis:
+            labels = [str(item.get('label', '')) for item in basis[:3] if item.get('label')]
+            if labels:
+                basis_text = ' 주요 근거는 ' + ', '.join(labels) + '입니다.'
+        return (first + basis_text + ' ' + facial_text).strip()
+
+    def _generate_llm_interpretation(self, result):
+        """Generate a Korean explanation using the configured OpenAI model."""
+        import json as _json
+        import urllib.request as _urlrequest
+        import urllib.error as _urlerror
+        import time as _time
+
+        settings = self._load_llm_settings()
+        public = self._public_llm_settings(settings)
+        if not bool(settings.get('enabled', False)):
+            return {'enabled': False, 'status': 'disabled', 'text': '', 'model': public.get('model', 'gpt-4.1')}
+
+        sync_enabled = str(os.environ.get('LLM_INTERPRETATION_SYNC', settings.get('sync_interpretation', 'false'))).lower() in ('1', 'true', 'yes', 'y')
+        if not sync_enabled:
+            return {
+                'enabled': True,
+                'status': 'local_fast',
+                'model': public.get('model', 'gpt-4.1'),
+                'text': self._local_interpretation_text(result),
+                'reason': '동기 OpenAI 호출은 응답 지연을 키워 기본 응답에서는 로컬 근거 요약으로 대체했습니다.',
+            }
+
+        api_key = self._llm_api_key(settings)
+        if not api_key:
+            return {'enabled': True, 'status': 'missing_api_key', 'text': '', 'model': public.get('model', 'gpt-4.1')}
+
+        payload = self._build_llm_interpretation_prompt(result)
+        policy = str(settings.get('prompt_policy', '') or self._default_llm_settings().get('prompt_policy', ''))
+        system_prompt = (
+            '너는 낙상 감지 시스템의 판독 보조 LLM이다. '
+            '입력된 모델 점수와 feature만 근거로 한국어 설명을 작성한다. '
+            '의학적 확진처럼 말하지 말고, 모델 판정 근거와 불확실성을 분리한다. '
+            '자세/행동분류가 unknown 또는 낮은 신뢰도이면 잘못 확정하지 말고 재촬영/피드백 필요성을 말한다. '
+            '출력은 3~5문장으로 간결하게 작성한다.'
+        )
+        if policy:
+            system_prompt += ' 운영 정책: ' + policy
+        user_prompt = '다음 JSON 분석 결과를 사용해 사용자에게 보여줄 판단 근거를 작성하세요.\n' + _json.dumps(payload, ensure_ascii=False)
+
+        body = {
+            'model': str(settings.get('model', 'gpt-4.1') or 'gpt-4.1'),
+            'input': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            'temperature': float(settings.get('temperature', 0.1) or 0.1),
+            'max_output_tokens': min(360, int(settings.get('max_output_tokens', 700) or 700)),
+        }
+        req = _urlrequest.Request(
+            'https://api.openai.com/v1/responses',
+            data=_json.dumps(body).encode('utf-8'),
+            headers={
+                'Authorization': 'Bearer ' + api_key,
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        started = _time.time()
+        try:
+            timeout_sec = max(1.5, min(6.0, self._finite_float(os.environ.get('LLM_INTERPRETATION_TIMEOUT_SEC'), 3.0)))
+            with _urlrequest.urlopen(req, timeout=timeout_sec) as resp:
+                data = _json.loads(resp.read().decode('utf-8'))
+            text = str(data.get('output_text', '') or '').strip()
+            if not text:
+                chunks = []
+                for item in data.get('output', []) or []:
+                    for content in item.get('content', []) or []:
+                        if content.get('type') in ('output_text', 'text'):
+                            chunks.append(str(content.get('text', '') or ''))
+                text = ''.join(chunks).strip()
+            return {
+                'enabled': True,
+                'status': 'generated' if text else 'empty',
+                'model': body['model'],
+                'text': text,
+                'elapsed_sec': round(_time.time() - started, 3),
+            }
+        except _urlerror.HTTPError as exc:
+            return {'enabled': True, 'status': 'error', 'model': body['model'], 'text': '', 'error': f'OpenAI API HTTP {exc.code}'}
+        except Exception as exc:
+            return {'enabled': True, 'status': 'error', 'model': body['model'], 'text': '', 'error': str(exc)[:160]}
+
+    def _extract_openai_response_text(self, data):
+        text = str((data or {}).get('output_text', '') or '').strip()
+        if text:
+            return text
+        chunks = []
+        for item in (data or {}).get('output', []) or []:
+            for content in item.get('content', []) or []:
+                if content.get('type') in ('output_text', 'text'):
+                    chunks.append(str(content.get('text', '') or ''))
+        return ''.join(chunks).strip()
+
+    def _parse_llm_json_object(self, text):
+        import json as _json
+        text = str(text or '').strip()
+        if not text:
+            return {}
+        candidates = [text]
+        if '```' in text:
+            parts = [p.strip() for p in text.split('```') if p.strip()]
+            for part in parts:
+                if part.lower().startswith('json'):
+                    part = part[4:].strip()
+                candidates.append(part)
+        first = text.find('{')
+        last = text.rfind('}')
+        if first >= 0 and last > first:
+            candidates.append(text[first:last + 1])
+        for candidate in candidates:
+            try:
+                parsed = _json.loads(candidate)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                continue
+        return {}
+
+    def _realtime_behavior_llm_reason(self, result):
+        """Return a reason string when realtime behavior needs LLM review."""
+        if not isinstance(result, dict) or result.get('fall_detected') is True:
+            return ''
+        if result.get('runtime_key') != 'rf-dual':
+            return ''
+        ri = result.get('runtime_inference', {}) or {}
+        diag = ri.get('posture_diagnostics', {}) or {}
+        behavior = result.get('behavior_result', {}) or {}
+        label = str(result.get('posture_label') or ri.get('posture_label') or '').strip()
+        score = self._metadata_to_number(result.get('posture_score', ri.get('posture_score', 0.0)), 0.0)
+        margin = self._metadata_to_number(behavior.get('margin', ri.get('posture_margin', 0.0)), 0.0)
+        reason = str(diag.get('reason', '') or '')
+
+        center_span = self._metadata_to_number(diag.get('center_x_span', 0.0), 0.0)
+        center_dx = self._metadata_to_number(diag.get('center_dx_abs_mean', 0.0), 0.0)
+        speed_std = self._metadata_to_number(diag.get('speed_std', 0.0), 0.0)
+        gait_dynamic = self._metadata_to_number(diag.get('gait_dynamic_score', 0.0), 0.0)
+        run_stride = self._metadata_to_number(diag.get('run_stride_score', 0.0), 0.0)
+        lower_vis = self._metadata_to_number(diag.get('lower_body_visibility', 0.0), 0.0)
+        upper_motion = self._metadata_to_number(diag.get('upper_motion_energy', diag.get('upper_body_temporal_motion', 0.0)), 0.0)
+        upper_span = self._metadata_to_number(diag.get('upper_center_x_span', 0.0), 0.0)
+        upper_dx = self._metadata_to_number(diag.get('upper_center_dx_abs_mean', 0.0), 0.0)
+        shoulder_span = self._metadata_to_number(diag.get('shoulder_center_x_span', 0.0), 0.0)
+        shoulder_dx = self._metadata_to_number(diag.get('shoulder_center_dx_abs_mean', 0.0), 0.0)
+
+        body_translation = center_span >= 0.070 or center_dx >= 0.018 or (speed_std >= 0.012 and center_span >= 0.045)
+        walk_displacement = self._walk_displacement_signal(center_span, center_dx, speed_std, lower_vis)
+        lower_gait = walk_displacement and (gait_dynamic >= 0.18 or run_stride >= 0.16)
+        upper_only_motion = (
+            not walk_displacement
+            and not lower_gait
+            and (
+                upper_motion >= 0.045
+                or upper_span >= 0.040
+                or upper_dx >= 0.012
+                or shoulder_span >= 0.032
+                or shoulder_dx >= 0.010
+            )
+        )
+        if label in ('walk', 'run') and not (walk_displacement or lower_gait):
+            return 'walk_without_body_translation'
+        if label in ('walk', 'run') and upper_only_motion:
+            return 'upper_body_motion_without_body_translation'
+        if reason.startswith('upper_body_') and (score < 0.62 or margin < 0.12):
+            return 'upper_body_low_confidence'
+        if bool(behavior.get('provisional')) or bool(ri.get('posture_provisional')):
+            return 'realtime_provisional_behavior'
+        if lower_vis < 0.30 and upper_only_motion:
+            return 'occluded_lower_body_ambiguous_motion'
+        if score < 0.45 or margin < 0.045:
+            return 'low_margin_behavior'
+        return ''
+
+    def _build_realtime_behavior_llm_payload(self, result, review_reason):
+        ri = result.get('runtime_inference', {}) or {}
+        diag = ri.get('posture_diagnostics', {}) or {}
+        behavior = result.get('behavior_result', {}) or {}
+        keys = [
+            'avg_conf', 'lower_body_visibility', 'center_x_span', 'center_dx_abs_mean',
+            'speed_std', 'stillness', 'gait_dynamic_score', 'run_stride_score',
+            'upper_body_temporal_motion', 'upper_motion_energy', 'upper_center_x_span',
+            'upper_center_dx_abs_mean', 'upper_center_y_std', 'shoulder_center_x_span',
+            'shoulder_center_dx_abs_mean', 'torso_tilt_std', 'upright_geometry_score',
+            'sit_geometry_score', 'lie_geometry_score', 'standing_skeleton_score',
+            'sitting_skeleton_score', 'lying_skeleton_score', 'torso_verticality',
+            'leg_verticality', 'lower_body_extension', 'floor_contact_ratio',
+            'full_skeleton_aspect', 'pose_height_ratio_mean',
+        ]
+        return self._sanitize_for_json({
+            'review_reason': review_reason,
+            'fall_detected': result.get('fall_detected'),
+            'risk_score': result.get('risk_score'),
+            'posture_label': result.get('posture_label'),
+            'posture_score': result.get('posture_score'),
+            'posture_probs': result.get('posture_probs', {}),
+            'behavior_result': {
+                'accepted': behavior.get('accepted'),
+                'class': behavior.get('class'),
+                'score': behavior.get('score'),
+                'margin': behavior.get('margin'),
+                'provisional': behavior.get('provisional'),
+                'probs_source': behavior.get('probs_source'),
+            },
+            'posture_diagnostics': {k: diag.get(k) for k in keys if k in diag},
+            'fall_runtime': {
+                'fall_score': ri.get('fall_score'),
+                'fall_model_version': ri.get('fall_model_version'),
+                'effective_threshold': ri.get('effective_threshold'),
+                'suppressed_by': ri.get('suppressed_by', []),
+            },
+            'rules_for_review': [
+                'fall_detected=false이면 낙상/비낙상 판단은 바꾸지 말고 행동 5-class만 보조 판정한다.',
+                'walk/run은 4초 청크에서 사람 bbox 중심의 지속 수평 이동 또는 하체 보행 리듬이 있어야 한다.',
+                '상체/어깨 흔들림만 있고 center_x_span/center_dx가 낮으면 walk/run을 선택하지 않는다.',
+                '하체가 가려지면 상체 세로성, bbox 높이, 바닥 접촉, sitting/standing/lying score로 stand/sit/lie 중 가장 타당한 것을 고른다.',
+            ],
+        })
+
+    def _generate_realtime_behavior_llm_review(self, result, review_reason, timeout_sec=3.0):
+        import json as _json
+        import time as _time
+        import urllib.error as _urlerror
+        import urllib.request as _urlrequest
+
+        settings = self._load_llm_settings()
+        public = self._public_llm_settings(settings)
+        model = str(settings.get('model', 'gpt-4.1') or 'gpt-4.1')
+        if not bool(settings.get('enabled', False)):
+            return {'enabled': False, 'status': 'disabled', 'model': model, 'text': '', 'reason': review_reason}
+        api_key = self._llm_api_key(settings)
+        if not api_key:
+            return {'enabled': True, 'status': 'missing_api_key', 'model': model, 'text': '', 'reason': review_reason}
+
+        payload = self._build_realtime_behavior_llm_payload(result, review_reason)
+        system_prompt = (
+            '너는 실시간 낙상 감지 시스템의 행동분류 보정자다. '
+            '입력 feature만 근거로 판단하고 JSON 객체만 출력한다. '
+            '낙상 여부는 RF 이진 모델 결과를 따른다. fall_detected=false이면 stand/walk/run/sit/lie 중 하나를 보조 판정한다. '
+            '중요: walk/run은 4초 청크에서 몸 전체 bbox 중심의 지속 이동 또는 하체 보행 리듬이 있을 때만 선택한다. '
+            '상체나 어깨가 흔들렸다는 이유만으로 walk/run을 선택하지 말라. '
+            '하체 가림이 있으면 상체 직립성, bbox 높이, 바닥 접촉, sitting/standing/lying feature로 stand/sit/lie를 고른다. '
+            '출력 스키마: {"class":"stand|walk|run|sit|lie|uncertain","confidence":0.0,"should_override":true|false,"reason_ko":"짧은 한국어 근거"}'
+        )
+        body = {
+            'model': model,
+            'input': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': _json.dumps(payload, ensure_ascii=False)},
+            ],
+            'temperature': min(0.2, float(settings.get('temperature', 0.1) or 0.1)),
+            'max_output_tokens': min(320, int(settings.get('max_output_tokens', 700) or 700)),
+        }
+        req = _urlrequest.Request(
+            'https://api.openai.com/v1/responses',
+            data=_json.dumps(body).encode('utf-8'),
+            headers={'Authorization': 'Bearer ' + api_key, 'Content-Type': 'application/json'},
+            method='POST',
+        )
+        started = _time.time()
+        try:
+            with _urlrequest.urlopen(req, timeout=max(1.5, float(timeout_sec or 3.0))) as resp:
+                data = _json.loads(resp.read().decode('utf-8'))
+            text = self._extract_openai_response_text(data)
+            parsed = self._parse_llm_json_object(text)
+            return {
+                'enabled': True,
+                'status': 'generated',
+                'model': model,
+                'text': str(parsed.get('reason_ko', '') or text or '').strip(),
+                'parsed': parsed,
+                'reason': review_reason,
+                'elapsed_sec': round(_time.time() - started, 3),
+            }
+        except _urlerror.HTTPError as exc:
+            return {'enabled': True, 'status': 'error', 'model': model, 'text': '', 'error': f'OpenAI API HTTP {exc.code}', 'reason': review_reason}
+        except Exception as exc:
+            return {'enabled': True, 'status': 'error', 'model': model, 'text': '', 'error': str(exc)[:160], 'reason': review_reason}
+
+    def _normalized_behavior_probs(self, current_probs, target, confidence):
+        classes = ['stand', 'walk', 'run', 'sit', 'lie']
+        confidence = max(0.34, min(0.82, float(confidence or 0.0)))
+        base = {c: max(0.0, float((current_probs or {}).get(c, 0.0) or 0.0)) for c in classes}
+        base[target] = max(base.get(target, 0.0), confidence)
+        remaining = max(0.0, 1.0 - base[target])
+        others = [c for c in classes if c != target]
+        other_total = sum(base.get(c, 0.0) for c in others)
+        if other_total > 0:
+            for c in others:
+                base[c] = remaining * (base.get(c, 0.0) / other_total)
+        else:
+            share = remaining / max(len(others), 1)
+            for c in others:
+                base[c] = share
+        total = sum(base.values())
+        return {c: (base[c] / total if total > 0 else (1.0 if c == target else 0.0)) for c in classes}
+
+    def _apply_behavior_llm_override(self, result, target, confidence, review):
+        if target not in ('stand', 'walk', 'run', 'sit', 'lie'):
+            return result
+        label_text = self._posture_label_text(target)
+        probs = self._normalized_behavior_probs(result.get('posture_probs', {}), target, confidence)
+        score = float(probs.get(target, confidence) or confidence)
+        result['posture_label'] = target
+        result['posture_score'] = round(score, 4)
+        result['posture_probs'] = {k: round(v, 4) for k, v in probs.items()}
+        result['behavior_class'] = target
+        result['behavior_label'] = label_text
+        result['decision_state'] = 'posture_only'
+        result['summary'] = f'RF 이진 모델 기준 비낙상입니다. 감지된 행동: {label_text}. (LLM 보정 포함)'
+        result.setdefault('explain', []).append('LLM 보정: ' + str(review.get('text', '') or f'{label_text}로 보정했습니다.'))
+
+        behavior = dict(result.get('behavior_result', {}) or {})
+        behavior.update({
+            'source': str(behavior.get('source', 'xg-posture') or 'xg-posture') + '+llm-review',
+            'accepted': True,
+            'class': target,
+            'label': label_text,
+            'score': round(score, 4),
+            'llm_override': True,
+        })
+        result['behavior_result'] = behavior
+
+        ri = dict(result.get('runtime_inference', {}) or {})
+        ri['posture_label'] = target
+        ri['posture_score'] = round(score, 4)
+        ri['posture_probs'] = {k: round(v, 4) for k, v in probs.items()}
+        ri['posture_accepted'] = True
+        ri['decision_state'] = 'posture_only'
+        diag = dict(ri.get('posture_diagnostics', {}) or {})
+        diag.update({
+            'applied': True,
+            'reason': 'llm_behavior_review_override',
+            'description': str(review.get('text', '') or 'LLM이 애매한 실시간 행동분류를 보정했습니다.'),
+            'llm_override_target': target,
+        })
+        ri['posture_diagnostics'] = diag
+        result['runtime_inference'] = ri
+
+        result['behavior_inference'] = {
+            'code': target,
+            'label': label_text,
+            'source': 'rf-dual+llm-review',
+            'fallback': False,
+        }
+        return result
+
+    def _apply_realtime_behavior_llm_review(self, result, realtime_context=None):
+        if not isinstance(result, dict):
+            return result
+        review_reason = self._realtime_behavior_llm_reason(result)
+        if not review_reason:
+            return result
+
+        import time as _time
+        ctx = realtime_context or {}
+        session_id = str(ctx.get('session_id') or 'default')
+        cache_key = session_id + ':' + review_reason
+        now_ts = _time.time()
+        cache_path = '/tmp/fallai_rt_llm_review_cache.json'
+        try:
+            if not self._rt_llm_review_cache and os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as cache_file:
+                    loaded_cache = json.load(cache_file)
+                if isinstance(loaded_cache, dict):
+                    self._rt_llm_review_cache = loaded_cache
+        except Exception:
+            pass
+
+        def _persist_llm_cache():
+            try:
+                compact_cache = {
+                    key: value for key, value in self._rt_llm_review_cache.items()
+                    if now_ts - float((value or {}).get('ts', 0.0) or 0.0) < 60.0
+                }
+                with open(cache_path, 'w', encoding='utf-8') as cache_file:
+                    json.dump(compact_cache, cache_file, ensure_ascii=False)
+                self._rt_llm_review_cache = compact_cache
+            except Exception:
+                pass
+
+        def _llm_target_from_review(review):
+            parsed = review.get('parsed', {}) or {}
+            target_val = str(parsed.get('class', parsed.get('label', '')) or '').strip().lower()
+            confidence_val = self._metadata_to_number(parsed.get('confidence', 0.0), 0.0)
+            should_override_val = bool(parsed.get('should_override', False))
+            min_override_confidence_val = 0.35 if (
+                should_override_val
+                and review_reason in ('upper_body_motion_without_body_translation', 'occluded_lower_body_ambiguous_motion')
+            ) else 0.55
+            if target_val == 'uncertain' or confidence_val < min_override_confidence_val or not should_override_val:
+                target_val = ''
+            return target_val, confidence_val
+
+        def _run_llm_review_background(result_snapshot):
+            try:
+                generated = self._generate_realtime_behavior_llm_review(result_snapshot, review_reason, timeout_sec=3.0)
+                target_val, confidence_val = _llm_target_from_review(generated)
+                self._rt_llm_review_cache[cache_key] = {
+                    'ts': _time.time(),
+                    'review': dict(generated),
+                    'override_label': target_val,
+                    'confidence': confidence_val,
+                }
+                _persist_llm_cache()
+            except Exception as exc:
+                self._rt_llm_review_cache[cache_key] = {
+                    'ts': _time.time(),
+                    'review': {
+                        'enabled': True,
+                        'status': 'error',
+                        'model': self._public_llm_settings().get('model', 'gpt-4.1'),
+                        'text': '',
+                        'error': str(exc)[:160],
+                        'reason': review_reason,
+                    },
+                    'override_label': '',
+                    'confidence': 0.0,
+                }
+                _persist_llm_cache()
+
+        cached = self._rt_llm_review_cache.get(cache_key)
+        if cached and (now_ts - float(cached.get('ts', 0.0) or 0.0)) < 30.0:
+            review = dict(cached.get('review', {}) or {})
+            if review.get('status') != 'queued':
+                review['status'] = 'cached'
+                review['cached'] = True
+            target = str(cached.get('override_label', '') or '')
+            confidence = float(cached.get('confidence', 0.0) or 0.0)
+        else:
+            review = {
+                'enabled': True,
+                'status': 'queued',
+                'model': self._public_llm_settings().get('model', 'gpt-4.1'),
+                'text': 'LLM 판독을 백그라운드로 요청했습니다. 다음 청크부터 캐시된 판독을 반영합니다.',
+                'reason': review_reason,
+            }
+            target = ''
+            confidence = 0.0
+            self._rt_llm_review_cache[cache_key] = {
+                'ts': now_ts,
+                'review': dict(review),
+                'override_label': target,
+                'confidence': confidence,
+            }
+            _persist_llm_cache()
+            try:
+                import threading as _threading
+                _threading.Thread(
+                    target=_run_llm_review_background,
+                    args=(self._sanitize_for_json(dict(result or {})),),
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
+
+        result['llm_behavior_review'] = review
+        result['llm_interpretation'] = {
+            'enabled': review.get('enabled', True),
+            'status': review.get('status', 'generated'),
+            'model': review.get('model', ''),
+            'text': str(review.get('text', '') or '').strip(),
+            'elapsed_sec': review.get('elapsed_sec', 0),
+            'reason': review_reason,
+        }
+        ri = dict(result.get('runtime_inference', {}) or {})
+        ri['llm_behavior_review'] = review
+        result['runtime_inference'] = ri
+        if str(review.get('text', '') or '').strip():
+            result.setdefault('analysis_basis', []).append({
+                'label': 'LLM 행동 보정',
+                'value': self._posture_label_text(target) if target else '검토',
+                'unit': '',
+                'description': str(review.get('text', '') or '').strip(),
+                'level': 'normal',
+            })
+        if target:
+            result = self._apply_behavior_llm_override(result, target, confidence, review)
+        return result
 
     def _training_data_requirements(self):
         return {
@@ -3535,7 +7790,7 @@ class VideoAnalysis:
         latest = []
         # FN-20260406-0001: 마지막 RF-Pose 재학습 시각 로드
         rf_pose_summary = self._read_json(
-            self._project_abspath(self._RF_POSE_SUMMARY_REL_PATH), default={}) or {}
+            self._rf_pose_summary_path(), default={}) or {}
         last_train_at = rf_pose_summary.get('updated_at', '') or ''
         since_last_train = 0
         for label in ['Y', 'N']:
@@ -3630,37 +7885,153 @@ class VideoAnalysis:
             'checks': checks,
         }
 
-    def warmup_models(self, model_type='rf-pose'):
-        """FN-20260406-0003: Pre-load YOLO + RF/RF-Pose models into memory.
-        Called before realtime session starts to eliminate cold-start latency on first chunk."""
+    def warmup_models(self, model_type='rf-dual'):
+        """Pre-load realtime models so the first live chunk does not pay cold-start cost."""
         import time as _time
         _t = _time.time()
         loaded = []
+        errors = []
         try:
-            self._get_rf_yolo_model()
+            yolo = self._get_rf_yolo_model()
             loaded.append('yolo-pose')
-        except Exception:
-            pass
+            try:
+                import numpy as _np
+                blank = _np.zeros((self._RF_REALTIME_YOLO_IMGSZ, self._RF_REALTIME_YOLO_IMGSZ, 3), dtype=_np.uint8)
+                yolo.predict(
+                    blank,
+                    imgsz=self._RF_REALTIME_YOLO_IMGSZ,
+                    conf=self._RF_REALTIME_CONF_THRES,
+                    device=self._get_yolo_device(),
+                    verbose=False,
+                )
+                loaded.append('yolo-pose-infer')
+            except Exception as infer_e:
+                errors.append({'stage': 'yolo-pose-infer', 'message': str(infer_e)})
+        except Exception as e:
+            errors.append({'stage': 'yolo-pose', 'message': str(e)})
         if model_type in ('rf-pose', 'auto', ''):
             try:
                 if self._rf_pose_pipeline_available():
                     self._get_rf_pose_model()
                     loaded.append('rf-pose')
-            except Exception:
-                pass
-        if model_type in ('rf-pipeline', 'auto', ''):
+            except Exception as e:
+                errors.append({'stage': 'rf-pose', 'message': str(e)})
+        if model_type in ('rf-pipeline', 'rf-dual', 'auto', ''):
             try:
                 if self._rf_pipeline_available():
                     self._get_rf_model()
                     loaded.append('rf-pipeline')
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append({'stage': 'rf-pipeline', 'message': str(e)})
+        if model_type in ('rf-dual', 'auto', ''):
+            try:
+                if self._rf_fall_v2_available():
+                    self._get_rf_fall_v2_model()
+                    loaded.append('rf-fall-v2')
+            except Exception as e:
+                errors.append({'stage': 'rf-fall-v2', 'message': str(e)})
+            try:
+                if self._xg_posture_available():
+                    self._get_xg_posture_model()
+                    loaded.append('xg-posture')
+            except Exception as e:
+                errors.append({'stage': 'xg-posture', 'message': str(e)})
+            # Warm the conditional lower-body occlusion helper before the first realtime chunk.
+            try:
+                if self._xg_posture_occlusion_aux_available():
+                    self._get_xg_posture_occlusion_aux_model()
+                    loaded.append('xg-posture-occlusion-aux')
+            except Exception as e:
+                errors.append({'stage': 'xg-posture-occlusion-aux', 'message': str(e)})
+            try:
+                if self._facial_aux_available():
+                    self._get_facial_cascade('haarcascade_eye.xml')
+                    self._get_facial_cascade('haarcascade_smile.xml')
+                    warm_emotion = os.environ.get('FACIAL_AUX_WARM_EMOTION', 'true').lower() not in ('0', 'false', 'no')
+                    warm_driver = os.environ.get('FACIAL_AUX_WARM_DRIVER', 'true').lower() not in ('0', 'false', 'no')
+                    if warm_emotion and self._get_facial_aihub82_model() is not None:
+                        loaded.append('facial-state-aihub82')
+                    elif warm_emotion and self._get_facial_emotion_session() is not None:
+                        loaded.append('facial-state-ferplus')
+                    else:
+                        loaded.append('facial-state-face-only')
+                    if warm_driver and self._get_facial_driver_state_model() is not None:
+                        loaded.append('facial-state-aihub173-driver')
+            except Exception as e:
+                errors.append({'stage': 'facial-state-aux', 'message': str(e)})
         return {
             'warmed_up': loaded,
             'elapsed_ms': round((_time.time() - _t) * 1000),
+            'errors': errors,
+            'posture_occlusion_aux_available': self._xg_posture_occlusion_aux_available(),
+            'facial_state_aux_available': self._facial_aux_available(),
+            'facial_emotion_model_path': self._facial_emotion_model_path(),
+            'facial_aihub82_model_path': self._facial_aihub82_model_path(),
+            'facial_driver_state_model_path': self._facial_driver_state_model_path(),
+            'facial_aihub82_model_available': os.path.isfile(self._facial_aihub82_model_path()),
+            'facial_driver_state_model_available': os.path.isfile(self._facial_driver_state_model_path()),
+            'facial_emotion_model_available': os.path.isfile(self._facial_emotion_model_path()),
+        }
+
+    def _rt_cache_file(self, session_id):
+        safe = ''.join(ch for ch in str(session_id or 'default') if ch.isalnum() or ch in ['-', '_'])[:80] or 'default'
+        return os.path.join('/tmp', f'wiz_rt_cache_{safe}.json')
+
+    def _load_rt_session_cache(self, session_id):
+        path = self._rt_cache_file(session_id)
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _save_rt_session_cache(self, session_id, payload):
+        path = self._rt_cache_file(session_id)
+        try:
+            with open(path, 'w') as f:
+                json.dump(payload or {}, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _clear_rt_session_cache(self, session_id):
+        path = self._rt_cache_file(session_id)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    def _latest_xg_fall_eval_summary(self):
+        import glob
+
+        report_dir = self._project_abspath('storage', 'training', 'fall-detection', 'evaluation')
+        report_paths = sorted(glob.glob(os.path.join(report_dir, 'eval_xg-fall_*.json')))
+        if len(report_paths) == 0:
+            return None
+        latest_path = report_paths[-1]
+        report = self._read_json(latest_path, default={}) or {}
+        xg_fall = ((report.get('models', {}) or {}).get('xg_fall', {}) or {})
+        failure_report = (xg_fall.get('failure_report', {}) or {})
+        return {
+            'timestamp': report.get('timestamp', ''),
+            'report_path': self._project_relative_path(latest_path),
+            'metrics': xg_fall.get('metrics', {}) or {},
+            'thresholds': xg_fall.get('thresholds', {}) or {},
+            'band_counts': failure_report.get('band_counts', {}) or {},
+            'false_negative_count': int(failure_report.get('false_negative_count', 0) or 0),
+            'false_positive_count': int(failure_report.get('false_positive_count', 0) or 0),
+            'suspected_actual_fall_count': int(failure_report.get('suspected_actual_fall_count', 0) or 0),
+            'suspected_actual_nonfall_count': int(failure_report.get('suspected_actual_nonfall_count', 0) or 0),
+            'suspected_actual_falls': (failure_report.get('suspected_actual_falls', []) or [])[:5],
+            'suspected_actual_nonfalls': (failure_report.get('suspected_actual_nonfalls', []) or [])[:5],
         }
 
     def prototype_info(self):
+        now = time.time()
+        cached = self.__class__._prototype_info_cache
+        if cached is not None and now - self.__class__._prototype_info_cache_ts <= self._PROTOTYPE_INFO_CACHE_TTL_SEC:
+            return copy.deepcopy(cached)
+
         baseline_summary = self._baseline_summary()
         behavior_summary = self._behavior_summary()
         intake_summary = self._intake_summary()
@@ -3669,7 +8040,34 @@ class VideoAnalysis:
         behavior_state = self._behavior_state(behavior_summary)
         analysis_engine_summary = self._analysis_engine_summary(baseline_state, behavior_state, intake_summary, archive_summary)
         analysis_diagnostics = self._analysis_diagnostics(baseline_state, behavior_state, intake_summary, archive_summary)
-        return {
+        rf_summary = self._rf_project_summary()
+        rf_metrics = (rf_summary.get('best_metrics', {}) or {})
+        rf_training_samples = int(rf_summary.get('training_samples', 0) or 0)
+        rf_validation_samples = int(rf_summary.get('validation_samples', 0) or 0)
+        rf_fall_v2_summary = self._rf_fall_v2_summary()
+        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_metrics = (
+            (rf_fall_v2_summary.get('operational_validation', {}) or {})
+            or (rf_fall_v2_summary.get('validation', {}) or {})
+            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+        )
+        rf_fall_v2_samples = int(rf_fall_v2_summary.get('training_samples', 0) or 0)
+        rf_fall_v2_ready = self._rf_fall_v2_available()
+        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        xg_posture_summary = self._xg_posture_summary()
+        posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
+        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_windows = int(
+            xg_posture_summary.get('n_windows', 0)
+            or xg_posture_summary.get('training_samples', 0)
+            or sum((xg_posture_summary.get('class_distribution', {}) or {}).values())
+            or 0
+        )
+        posture_feature_count = int(xg_posture_summary.get('feature_count', 0) or 0)
+        info = {
             'supported_formats': self.allowed_extensions,
             'max_upload_mb': self.max_upload_mb,
             'prototype_mode': not self._rf_pipeline_available(),
@@ -3688,19 +8086,62 @@ class VideoAnalysis:
             'webcam_mode': self._webcam_mode_info(),
             'realtime_readiness': self._realtime_readiness(),
             'dataset_summary': {
-                'fall_sample_count': int(((self._baseline_model_meta().get('fall_classifier', {}) or {}).get('training_samples', 2250)) or 2250),
-                'fall_sample_note': 'XGBoost v2 파이프라인 학습에 사용된 전체 샘플 수',
-                'fall_model_label': 'XGBoost v2 파이프라인 (YOLO + XGBoost)' if self._person_feature_available() else ('규칙 기반 fallback' if not self._rf_pipeline_available() else 'RF 보조 파이프라인'),
-                'behavior_sample_count': (behavior_summary or {}).get('dataset', {}).get('sample_count', 0) if behavior_state.get('ready') else 0,
-                'behavior_sample_note': '이진 행동 분류 학습 요약이 없으면 0으로 유지됩니다.',
-                'behavior_model_label': behavior_state.get('active_label', '행동 라벨 추정 fallback'),
+                'fall_sample_count': rf_fall_v2_samples if rf_fall_v2_ready else rf_training_samples,
+                'fall_sample_note': (
+                    f'현재 운영 RF-Fall v2 학습 {rf_fall_v2_samples}건 (F1 {round(float(rf_fall_v2_metrics.get("f1", 0.0) or 0.0) * 100, 1)}%, Recall {round(float(rf_fall_v2_metrics.get("recall", 0.0) or 0.0) * 100, 1)}%, Precision {round(float(rf_fall_v2_metrics.get("precision", 0.0) or 0.0) * 100, 1)}%)'
+                    if rf_fall_v2_ready
+                    else f'현재 운영 RF-Dual 낙상 모델 학습 {rf_training_samples}건 / 검증 {rf_validation_samples}건 (F1 {round(float(rf_metrics.get("f1", 0.0) or 0.0) * 100, 1)}%)'
+                ),
+                'fall_model_label': 'RF-Fall v2 occlusion-aware + XG-Posture' if rf_fall_v2_ready else 'RF-Dual 운영 파이프라인 (RandomForest + XG-Posture)',
+                'behavior_sample_count': posture_windows,
+                'behavior_sample_note': f'XG-Posture {posture_class_label} 학습 {posture_windows}건 · {posture_feature_count}개 feature · Group CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%',
+                'behavior_model_label': 'XG-Posture 5-class 행동분류 레이어',
                 'analysis_archive_count': archive_summary.get('total', 0),
-                'realtime_chunk_sec': 5,
+                'realtime_chunk_sec': self._REALTIME_STEADY_CHUNK_SEC,
+                'chunk_policy_label': 'Realtime contiguous chunks (4초 청크 · 무삭제 큐)',
+                'chunk_overlap_sec': max(0, self._REALTIME_STEADY_CHUNK_SEC - self._REALTIME_STRIDE_SEC),
             },
             'model_explanation': self._model_explanation(baseline_summary, behavior_summary, baseline_state, behavior_state, intake_summary, archive_summary),
             'analysis_engine_summary': analysis_engine_summary,
             'analysis_diagnostics': analysis_diagnostics,
             'analysis_archive_summary': archive_summary,
+            'fall_decision_criteria': {
+                'headline': 'RF-Dual은 RF-Fall v2 낙상 확률을 우선 사용하고, XG-Posture 자세와 arbitration 상태를 함께 사용해 낙상 여부를 최종 결정합니다.',
+                'rf_confirm_threshold': rf_fall_v2_confirm if rf_fall_v2_ready else self._rf_confirm_threshold(),
+                'rf_fall_v2_ready': rf_fall_v2_ready,
+                'xg_thresholds': self._xg_fall_thresholds(),
+                'bands': [
+                    {
+                        'key': 'safe',
+                        'label': '안전',
+                        'description': 'RF 낙상 확률이 확인 임계값보다 낮고, XG-Posture도 stand/walk/run 또는 안전 상태를 지지하는 구간입니다.',
+                    },
+                    {
+                        'key': 'posture_only',
+                        'label': '자세 감지',
+                        'description': '앉기/눕기처럼 자세 변화는 보이지만 급격한 붕괴 증거가 부족해 낙상 경보는 올리지 않는 상태입니다.',
+                    },
+                    {
+                        'key': 'fall_suspected',
+                        'label': '낙상 의심',
+                        'description': '낙상 확률이 경계 구간이거나 자세/모션 근거가 부분적으로 충돌해 추가 확인이 필요한 상태입니다.',
+                    },
+                    {
+                        'key': 'fall_confirmed',
+                        'label': '낙상 확인',
+                        'description': 'RF 낙상 확률과 자세 붕괴 근거가 함께 높아 즉시 알림 후보로 보는 상태입니다.',
+                    },
+                ],
+                'rf_dual_reason': [
+                    'RF는 bbox 통계로 빠르게 낙상 확률을 계산해 1차 안전장치 역할을 합니다.',
+                    f'XG-Posture는 행동/자세를 {posture_class_label}로 분리해 왜 위험/비위험인지 설명력을 제공합니다.',
+                    '낙상 관련 posture feature는 lie와 fall 경계, fast-sit 같은 오탐 억제, log 설명 생성에 필요합니다.',
+                ],
+            },
+            'chunk_policy': {
+                'realtime': self._chunk_policy_config('webcam-live'),
+                'upload': self._chunk_policy_config('upload'),
+            },
             'result_schema': [
                 {'key': 'fall_detected', 'label': '낙상 감지 여부'},
                 {'key': 'behavior_class', 'label': '행동 분류 코드'},
@@ -3719,18 +8160,22 @@ class VideoAnalysis:
             ],
             'training_data_requirements': self._training_data_requirements(),
             'decision_thresholds': {
-                'fall_detected': self.fall_decision_threshold,
-                'medium_risk': self.fall_decision_threshold,
+                'fall_detected': rf_fall_v2_confirm if rf_fall_v2_ready else self._rf_confirm_threshold(),
+                'medium_risk': rf_fall_v2_confirm if rf_fall_v2_ready else self._rf_confirm_threshold(),
                 'high_risk': 0.8,
             },
             'trained_model': self._trained_model_info(baseline_summary, baseline_state, {}),
             'baseline_training': baseline_summary,
             'action_behavior_training': behavior_summary,
             'retraining_health': self._retraining_health(baseline_summary, baseline_state),
+            'continuous_training': {
+                'aihub82': self.continuous_training_status('aihub82'),
+            },
             'intake_summary': intake_summary,
             'alert_policy': self._alert_policy(),
             'emergency_protocol': self._emergency_protocol(),
             'alert_settings': self._public_alert_settings(self._load_alert_settings()),
+            'llm_settings': self._public_llm_settings(),
             'routing_checklist': self._routing_checklist(),
             'model_comparison_report': self._model_comparison_report(),
             'pipeline_page': {
@@ -3739,6 +8184,603 @@ class VideoAnalysis:
                 'description': '메인페이지에서 분리된 파이프라인 구조와 전환 계획을 확인합니다.',
             },
         }
+        self.__class__._prototype_info_cache = copy.deepcopy(info)
+        self.__class__._prototype_info_cache_ts = now
+        return info
+
+    def _chunk_policy_config(self, input_source='upload'):
+        source = str(input_source or 'upload').strip().lower()
+        is_realtime = source in ('webcam-live', 'webcam', 'realtime')
+        version = self._REALTIME_CHUNK_POLICY_VERSION if is_realtime else self._UPLOAD_CHUNK_POLICY_VERSION
+        if version == self._LEGACY_CHUNK_POLICY_VERSION:
+            return {
+                'enabled': True,
+                'version': version,
+                'title': '레거시 RF-Dual 청크 정책',
+                'headline': 'RF-Dual 4초 연속 청크 정책입니다. 누락 방지를 위해 겹침보다 안정적인 순차 처리를 우선합니다.',
+                'dense_intro': [],
+                'steady_sec': self._REALTIME_STEADY_CHUNK_SEC,
+                'spawn_ms': int(self._REALTIME_STRIDE_SEC * 1000),
+                'max_slots': 2,
+                'max_queue': 120,
+                'rollback_target': self._LEGACY_CHUNK_POLICY_VERSION,
+            }
+        headline = (
+            '실시간 입력은 4초 청크를 끊김 없이 순차 분석합니다. RTT가 튀어도 브라우저 큐에서 청크를 버리지 않습니다.'
+            if is_realtime
+            else '업로드 영상도 실시간과 같은 4초 청크로 다시 분석해 행동 변화 전후를 분할 로그에 표시합니다.'
+        )
+        return {
+            'enabled': True,
+            'version': version,
+            'title': '4초 공통 청크 정책',
+            'headline': headline,
+            'dense_intro': [],
+            'steady_sec': self._REALTIME_STEADY_CHUNK_SEC,
+            'stride_sec': self._REALTIME_STRIDE_SEC,
+            'spawn_ms': int(self._REALTIME_STRIDE_SEC * 1000),
+            'max_slots': 2 if is_realtime else 1,
+            'max_queue': 120,
+            'sampling': {
+                'extract_fps': self._POSTURE_REALTIME_TARGET_FPS,
+                'rf_fps': self._RF_TARGET_FPS,
+                'posture_fps': self._POSTURE_REALTIME_TARGET_FPS,
+                'steady_extract_frames': int(self._REALTIME_STEADY_CHUNK_SEC * self._POSTURE_REALTIME_TARGET_FPS),
+                'steady_rf_frames': int(self._REALTIME_STEADY_CHUNK_SEC * self._RF_TARGET_FPS),
+                'note': '실시간 RTT 안정화를 위해 서버는 3fps/320px 경량 추론을 쓰고 RF 낙상 모델은 학습 분포에 맞춰 2fps로 다운샘플합니다.',
+            },
+            'rollback_target': self._LEGACY_CHUNK_POLICY_VERSION,
+        }
+
+    def _format_chunk_seconds(self, value):
+        val = round(float(value or 0.0), 2)
+        if abs(val - int(val)) < 0.001:
+            return str(int(val))
+        return str(val)
+
+    def _build_chunk_window_label(self, start_sec, end_sec):
+        return self._format_chunk_seconds(start_sec) + '~' + self._format_chunk_seconds(end_sec) + '초'
+
+    def _build_chunk_windows(self, duration, input_source='upload'):
+        duration = max(0.0, float(duration or 0.0))
+        policy = self._chunk_policy_config(input_source)
+        if policy.get('enabled') is not True or duration <= 0.0:
+            return []
+        seen = set()
+        windows = []
+
+        def _append(start_sec, end_sec, phase):
+            start_val = round(max(0.0, float(start_sec or 0.0)), 2)
+            end_val = round(min(duration, max(start_val, float(end_sec or 0.0))), 2)
+            if end_val - start_val < 1.0:
+                return
+            key = (start_val, end_val)
+            if key in seen:
+                return
+            seen.add(key)
+            windows.append({
+                'start_sec': start_val,
+                'end_sec': end_val,
+                'duration_sec': round(end_val - start_val, 2),
+                'phase': phase,
+                'label': self._build_chunk_window_label(start_val, end_val),
+            })
+
+        for end_sec in list(policy.get('dense_intro', []) or []):
+            _append(0.0, min(duration, float(end_sec or 0.0)), 'bootstrap')
+
+        steady_sec = float(policy.get('steady_sec', 5) or 5)
+        stride_sec = float(policy.get('stride_sec', steady_sec) or steady_sec)
+        if duration > steady_sec:
+            start_sec = 0.0
+            while start_sec < duration - 0.01:
+                _append(start_sec, min(duration, start_sec + steady_sec), 'steady')
+                start_sec += stride_sec
+
+        if len(windows) == 0:
+            _append(0.0, duration, 'single')
+        return windows
+
+    def _decision_state_label(self, state):
+        labels = {
+            'safe': '안전',
+            'posture_only': '자세 감지',
+            'fall_suspected': '낙상 의심',
+            'fall_confirmed': '낙상 확인',
+            'uncertain': '불확실',
+            'fallback-warning': 'Fallback 경고',
+        }
+        return labels.get(str(state or '').strip(), str(state or '').strip())
+
+    def _posture_label_text(self, posture):
+        labels = {
+            'stand': '서기',
+            'walk': '걷기',
+            'run': '뛰기',
+            'sit': '앉기',
+            'lie': '눕기',
+            'fall': '낙상',
+        }
+        return labels.get(str(posture or '').strip(), str(posture or '').strip())
+
+    def _result_behavior_code(self, result, fallback=''):
+        result = result or {}
+        accepted = {'stand', 'walk', 'run', 'sit', 'lie', 'fall'}
+        if bool(result.get('fall_detected', False)):
+            return 'fall'
+        candidates = [
+            result.get('behavior_class', ''),
+            result.get('posture_label', ''),
+            ((result.get('runtime_inference', {}) or {}).get('posture_label', '')),
+            ((result.get('behavior_result', {}) or {}).get('class', '')),
+            fallback,
+        ]
+        for candidate in candidates:
+            code = str(candidate or '').strip()
+            if code in accepted:
+                return code
+        return ''
+
+    def _annotate_chunk_behavior_transitions(self, logs):
+        logs = list(logs or [])
+        states = []
+        for item in logs:
+            result = item.get('result', {}) or {}
+            code = self._result_behavior_code(result, item.get('posture_label', ''))
+            label = self._posture_label_text(code) if code else ''
+            states.append({'code': code, 'label': label})
+
+        for idx, item in enumerate(logs):
+            cur = states[idx]
+            prev = states[idx - 1] if idx > 0 else {'code': '', 'label': ''}
+            nxt = states[idx + 1] if idx + 1 < len(states) else {'code': '', 'label': ''}
+            changed_from_prev = bool(prev.get('code') and cur.get('code') and prev.get('code') != cur.get('code'))
+            changes_to_next = bool(nxt.get('code') and cur.get('code') and nxt.get('code') != cur.get('code'))
+            display_label = cur.get('label', '')
+            if changed_from_prev:
+                display_label = (prev.get('label') or prev.get('code') or '') + ' → ' + (cur.get('label') or cur.get('code') or '')
+            context_parts = []
+            if prev.get('label'):
+                context_parts.append('이전 ' + prev.get('label'))
+            if cur.get('label'):
+                context_parts.append('현재 ' + cur.get('label'))
+            if nxt.get('label'):
+                context_parts.append('이후 ' + nxt.get('label'))
+            transition = {
+                'current_code': cur.get('code', ''),
+                'current_label': cur.get('label', ''),
+                'previous_code': prev.get('code', ''),
+                'previous_label': prev.get('label', ''),
+                'next_code': nxt.get('code', ''),
+                'next_label': nxt.get('label', ''),
+                'changed_from_previous': changed_from_prev,
+                'changes_to_next': changes_to_next,
+                'display_label': display_label,
+                'context_label': ' · '.join(context_parts),
+            }
+            item['behavior_code'] = cur.get('code', '')
+            item['behavior_label'] = cur.get('label', '')
+            item['behavior_transition'] = transition
+            result = item.get('result', {}) or {}
+            result['behavior_transition'] = transition
+            if changed_from_prev:
+                prefix = '행동 전환 ' + display_label
+                one_line = str(item.get('one_line', '') or '')
+                if one_line and prefix not in one_line:
+                    item['one_line'] = prefix + ' · ' + one_line
+                elif not one_line:
+                    item['one_line'] = prefix
+                desc = str(item.get('description', '') or '')
+                ctx = transition.get('context_label', '')
+                if ctx and ctx not in desc:
+                    item['description'] = (ctx + ' · ' + desc).strip(' ·')
+            elif changes_to_next:
+                item['next_behavior_hint'] = (cur.get('label', '') + ' → ' + nxt.get('label', '')).strip(' →')
+        return logs
+
+    def _chunk_behavior_sequence_summary(self, logs):
+        sequence = []
+        transition_count = 0
+        for item in logs or []:
+            transition = item.get('behavior_transition', {}) or {}
+            code = transition.get('current_code') or item.get('behavior_code', '')
+            label = transition.get('current_label') or item.get('behavior_label', '')
+            if not code:
+                continue
+            if sequence and sequence[-1].get('code') == code:
+                sequence[-1]['count'] += 1
+                sequence[-1]['end_chunk_id'] = item.get('chunk_id')
+                sequence[-1]['end_label'] = item.get('chunk_label', '')
+            else:
+                if sequence:
+                    transition_count += 1
+                sequence.append({
+                    'code': code,
+                    'label': label,
+                    'count': 1,
+                    'start_chunk_id': item.get('chunk_id'),
+                    'end_chunk_id': item.get('chunk_id'),
+                    'start_label': item.get('chunk_label', ''),
+                    'end_label': item.get('chunk_label', ''),
+                })
+        seq_text = ' → '.join([
+            (item.get('label') or item.get('code') or '') + (' x' + str(item.get('count')) if int(item.get('count', 0) or 0) > 1 else '')
+            for item in sequence
+            if item.get('label') or item.get('code')
+        ])
+        return {
+            'sequence': sequence,
+            'transition_count': transition_count,
+            'transition_line': ('행동 변화: ' + seq_text) if transition_count > 0 and seq_text else '',
+        }
+
+    def _build_log_summary(self, result, chunk_window=None):
+        result = dict(result or {})
+        score = round(self._metadata_to_number(result.get('risk_score', 0.0), 0.0) * 100, 1)
+        posture_label = self._posture_label_text(result.get('posture_label', ''))
+        decision_label = self._decision_state_label(result.get('decision_state', ''))
+        runtime_label = str(result.get('runtime_label', result.get('runtime_key', '')) or '').strip()
+        is_fallback = bool(((result.get('behavior_inference', {}) or {}).get('fallback', False))) or result.get('runtime_key') == 'heuristic-fallback'
+        basis_items = list(result.get('analysis_basis', []) or [])
+        explain = list(result.get('explain', []) or [])
+        reason = ''
+        if len(explain) > 0:
+            reason = str(explain[0])
+        elif len(basis_items) > 0:
+            top_item = basis_items[0] or {}
+            reason = str(top_item.get('label', '') or top_item.get('description', '') or '')
+        if len(reason) == 0:
+            reason = str(result.get('summary', '') or '')
+        if is_fallback:
+            title = 'Fallback 경고'
+            if len(reason) == 0:
+                reason = '학습 런타임 실패로 fallback 분석만 기록했습니다.'
+        else:
+            title = '낙상 확인' if result.get('fall_detected') else (decision_label or (posture_label or '안전'))
+        parts = []
+        if isinstance(chunk_window, dict) and chunk_window.get('label'):
+            parts.append(str(chunk_window.get('label')))
+        parts.append(title)
+        parts.append('위험 ' + str(score) + '%')
+        if posture_label:
+            parts.append('자세 ' + posture_label)
+        if decision_label and decision_label not in ['안전', posture_label]:
+            parts.append('상태 ' + decision_label)
+        if runtime_label:
+            parts.append(runtime_label)
+        return {
+            'title': title,
+            'line': ' · '.join([p for p in parts if len(str(p or '').strip()) > 0]),
+            'description': reason,
+        }
+
+    def _extract_temp_clip(self, video_path, start_sec, end_sec, suffix='chunk'):
+        import tempfile
+
+        if cv2 is None or os.path.exists(video_path) is False:
+            return {'clip_path': '', 'message': '원본 영상을 찾을 수 없습니다.'}
+        meta = self._video_meta(video_path)
+        fps = float(meta.get('fps', 0.0) or 30.0)
+        start_frame = int(max(0.0, float(start_sec or 0.0)) * fps)
+        end_frame = int(max(float(end_sec or 0.0), float(start_sec or 0.0)) * fps)
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened() is False:
+            return {'clip_path': '', 'message': '원본 영상을 열 수 없습니다.'}
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or meta.get('width', 0) or 640)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or meta.get('height', 0) or 360)
+        fd, out_path = tempfile.mkstemp(prefix='wiz_chunk_', suffix='_' + self._sanitize_filename(suffix) + '.mp4')
+        os.close(fd)
+        writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps or 30.0, (width, height))
+        current = start_frame
+        while current <= end_frame:
+            ok, frame = cap.read()
+            if ok is False:
+                break
+            writer.write(frame)
+            current += 1
+        cap.release()
+        writer.release()
+        if os.path.exists(out_path) is False or os.path.getsize(out_path) == 0:
+            try:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+            except Exception:
+                pass
+            return {'clip_path': '', 'message': '클립을 생성하지 못했습니다.'}
+        return {'clip_path': out_path, 'message': '임시 청크 클립 생성 완료'}
+
+    def _run_chunk_analysis(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0):
+        from concurrent.futures import ThreadPoolExecutor
+        import time as _time
+
+        if os.path.exists(video_path) is False:
+            return {'enabled': False, 'policy': self._chunk_policy_config(input_source), 'logs': [], 'summary': None}
+
+        meta = self._video_meta(video_path)
+        duration = max(float(duration_hint or 0.0), float(meta.get('duration_sec', 0.0) or 0.0))
+        windows = self._build_chunk_windows(duration, input_source=input_source)
+        policy = self._chunk_policy_config(input_source)
+        logs = []
+        chunk_session_id = 'upload_' + hashlib.sha1((str(video_path) + str(filename) + str(duration)).encode('utf-8')).hexdigest()[:12]
+        chunk_input_source = 'webcam-live' if str(input_source or '').strip().lower() == 'upload' else input_source
+
+        def _facial_log_summary(result):
+            face = (result.get('facial_state') or ((result.get('runtime_inference') or {}).get('facial_state')) or {})
+            if not isinstance(face, dict) or not face:
+                return {
+                    'available': False,
+                    'label': '표정 분석 없음',
+                    'percent': 0,
+                    'support_score': 0.0,
+                    'reason': 'missing',
+                    'face_detected': False,
+                }
+            if face.get('reason') == 'face_not_detected' or face.get('face_visible') is False:
+                label = '얼굴/표정 미검출'
+                percent = 0
+            else:
+                label = face.get('label') or face.get('emotion_display_label') or face.get('emotion_top_label') or face.get('driver_state_top_label') or '표정 분석'
+                confidence = self._finite_float(face.get('emotion_confidence'), 0.0)
+                if not confidence:
+                    confidence = self._finite_float(face.get('facial_confidence'), 0.0) * self._finite_float(face.get('actual_face_ratio'), 1.0)
+                if not confidence:
+                    confidence = self._finite_float(face.get('driver_state_confidence'), 0.0)
+                percent = int(round(max(0.0, min(1.0, confidence)) * 100.0))
+            return {
+                'available': bool(face.get('available')),
+                'applied': bool(face.get('applied')),
+                'label': str(label or '표정 분석'),
+                'percent': percent,
+                'support_score': round(self._finite_float(face.get('support_score'), 0.0), 4),
+                'reason': face.get('reason', ''),
+                'state': face.get('state', ''),
+                'face_detected': bool(face.get('face_detected') or face.get('face_visible')),
+                'actual_face_ratio': round(self._finite_float(face.get('actual_face_ratio'), 0.0), 4),
+                'driver_state_top_label': face.get('driver_state_top_label', ''),
+                'driver_state_risk': round(self._finite_float(face.get('driver_state_risk'), 0.0), 4),
+            }
+
+        def _extract_window_clip(item):
+            idx, window = item
+            clip_info = self._extract_temp_clip(
+                video_path,
+                window.get('start_sec', 0.0),
+                window.get('end_sec', 0.0),
+                suffix='chunk_' + str(idx),
+            )
+            return idx, window, clip_info
+
+        extractor = ThreadPoolExecutor(max_workers=1)
+        future = None
+        try:
+            if len(windows) > 0:
+                future = extractor.submit(_extract_window_clip, (1, windows[0]))
+
+            for index in range(len(windows)):
+                if future is None:
+                    break
+                idx, window, clip_info = future.result()
+                next_index = index + 1
+                future = extractor.submit(_extract_window_clip, (next_index + 1, windows[next_index])) if next_index < len(windows) else None
+
+                clip_path = clip_info.get('clip_path', '')
+                if len(clip_path) == 0:
+                    continue
+                started = _time.time()
+                try:
+                    chunk_result = self._infer_with_trained_model(
+                        clip_path,
+                        filename=filename,
+                        analysis_profile=analysis_profile,
+                        model_type=model_type,
+                        input_source=chunk_input_source,
+                        duration_hint=window.get('duration_sec', 0.0),
+                        realtime_context={
+                            'chunk_id': idx,
+                            'session_id': chunk_session_id,
+                            'upload_chunk': True,
+                            'force_facial_refresh': True,
+                        },
+                    )
+                except Exception as e:
+                    chunk_result = self._heuristic_result(
+                        filename,
+                        window.get('duration_sec', 0.0),
+                        meta.get('width', 0),
+                        meta.get('height', 0),
+                        meta.get('fps', 0.0),
+                        analysis_profile,
+                    )
+                    chunk_result['runtime_warning'] = {
+                        'severity': 'warn',
+                        'title': '분할 청크 추론 실패 → fallback',
+                        'description': str(e),
+                    }
+                finally:
+                    try:
+                        os.unlink(clip_path)
+                    except Exception:
+                        pass
+
+                chunk_result['log_summary'] = self._build_log_summary(chunk_result, window)
+                _chunk_ri = dict((chunk_result.get('runtime_inference') or {}))
+                _chunk_mr = dict((chunk_result.get('model_runtime') or {}))
+                chunk_result_lite = self._sanitize_for_json({
+                    'fall_detected': bool(chunk_result.get('fall_detected', False)),
+                    'behavior_class': chunk_result.get('behavior_class', ''),
+                    'behavior_label': chunk_result.get('behavior_label', ''),
+                    'risk_score': chunk_result.get('risk_score', 0.0),
+                    'risk_level': chunk_result.get('risk_level', ''),
+                    'risk_label': chunk_result.get('risk_label', ''),
+                    'summary': chunk_result.get('summary', ''),
+                    'runtime_key': chunk_result.get('runtime_key', ''),
+                    'runtime_label': chunk_result.get('runtime_label', ''),
+                    'posture_label': chunk_result.get('posture_label', ''),
+                    'posture_score': chunk_result.get('posture_score', 0.0),
+                    'posture_probs': chunk_result.get('posture_probs', {}),
+                    'decision_state': chunk_result.get('decision_state', ''),
+                    'analysis_basis': (chunk_result.get('analysis_basis') or [])[:4],
+                    'facial_state': chunk_result.get('facial_state', {}),
+                    'behavior_result': chunk_result.get('behavior_result', {}),
+                    'log_summary': chunk_result.get('log_summary', {}),
+                    'runtime_inference': {
+                        'fall_score': _chunk_ri.get('fall_score'),
+                        'fall_detected': _chunk_ri.get('fall_detected'),
+                        'effective_threshold': _chunk_ri.get('effective_threshold'),
+                        'facial_state': _chunk_ri.get('facial_state'),
+                        'facial_support_score': _chunk_ri.get('facial_support_score'),
+                        'posture_diagnostics': {
+                            k: (_chunk_ri.get('posture_diagnostics') or {}).get(k)
+                            for k in [
+                                'avg_conf', 'lower_body_visibility', 'center_x_span',
+                                'center_dx_abs_mean', 'speed_std', 'stillness',
+                                'gait_dynamic_score', 'run_stride_score',
+                                'upright_geometry_score', 'sit_geometry_score',
+                                'lie_geometry_score',
+                            ]
+                        },
+                        'perf': _chunk_ri.get('perf', {}),
+                    },
+                    'model_runtime': {
+                        'label': _chunk_mr.get('label', ''),
+                        'fall_model_version': _chunk_mr.get('fall_model_version', ''),
+                        'fall_probability': _chunk_mr.get('fall_probability'),
+                        'posture_windows': _chunk_mr.get('posture_windows'),
+                        'detected_person_frames': _chunk_mr.get('detected_person_frames'),
+                        'extracted_frames': _chunk_mr.get('extracted_frames'),
+                        'rf_feature_frames': _chunk_mr.get('rf_feature_frames'),
+                        'posture_feature_frames': _chunk_mr.get('posture_feature_frames'),
+                        'facial_state_aux': _chunk_mr.get('facial_state_aux', {}),
+                    },
+                })
+                facial_summary = _facial_log_summary(chunk_result_lite)
+                logs.append({
+                    'chunk_id': idx,
+                    'phase': window.get('phase', 'steady'),
+                    'window': window,
+                    'chunk_label': window.get('label', '청크 ' + str(idx)),
+                    'runtime_key': chunk_result.get('runtime_key', ''),
+                    'log_type': 'fallback-warning' if chunk_result.get('runtime_key') == 'heuristic-fallback' else 'analysis',
+                    'risk_score': round(self._metadata_to_number(chunk_result.get('risk_score', 0.0), 0.0), 4),
+                    'risk_level': chunk_result.get('risk_level', 'low'),
+                    'fall_detected': bool(chunk_result.get('fall_detected', False)),
+                    'posture_label': chunk_result.get('posture_label', ''),
+                    'facial_state': facial_summary,
+                    'facial_label': facial_summary.get('label', ''),
+                    'facial_percent': facial_summary.get('percent', 0),
+                    'decision_state': chunk_result.get('decision_state', 'safe'),
+                    'elapsed_sec': round(_time.time() - started, 3),
+                    'one_line': chunk_result.get('log_summary', {}).get('line', ''),
+                    'description': chunk_result.get('log_summary', {}).get('description', ''),
+                    'result': chunk_result_lite,
+                })
+        finally:
+            extractor.shutdown(wait=False)
+
+        if len(logs) == 0:
+            return {'enabled': False, 'policy': policy, 'logs': [], 'summary': None}
+
+        logs = self._annotate_chunk_behavior_transitions(logs)
+        ranked_source = [item for item in logs if item.get('log_type') != 'fallback-warning']
+        if len(ranked_source) == 0:
+            ranked_source = list(logs)
+        ranked = sorted(ranked_source, key=lambda item: (1 if item.get('fall_detected') else 0, float(item.get('risk_score', 0.0) or 0.0), -int(item.get('chunk_id', 0) or 0)), reverse=True)
+        peak = ranked[0]
+        behavior_summary = self._chunk_behavior_sequence_summary(logs)
+        facial_items = [item.get('facial_state') or {} for item in logs]
+        facial_available = [item for item in facial_items if item.get('available')]
+        facial_visible = [item for item in facial_items if item.get('face_detected')]
+        facial_support = [item for item in facial_items if self._finite_float(item.get('support_score'), 0.0) > 0]
+        facial_labels = {}
+        for item in facial_items:
+            label = str(item.get('label') or '').strip()
+            if label:
+                facial_labels[label] = facial_labels.get(label, 0) + 1
+        top_facial_label = ''
+        if facial_labels:
+            top_facial_label = sorted(facial_labels.items(), key=lambda pair: pair[1], reverse=True)[0][0]
+        facial_summary = {
+            'available_count': len(facial_available),
+            'visible_count': len(facial_visible),
+            'support_count': len(facial_support),
+            'window_count': len(logs),
+            'top_label': top_facial_label,
+            'line': (
+                f"표정 {len(facial_visible)}/{len(logs)}청크 얼굴검출"
+                + (f" · 주요 {top_facial_label}" if top_facial_label else '')
+                + (f" · 보조점수 {len(facial_support)}청크" if facial_support else '')
+            ),
+        }
+        summary = {
+            'window_count': len(logs),
+            'dense_count': len([item for item in logs if item.get('phase') == 'bootstrap']),
+            'fallback_warning_count': len([item for item in logs if item.get('log_type') == 'fallback-warning']),
+            'peak_chunk_id': peak.get('chunk_id'),
+            'peak_label': peak.get('chunk_label', ''),
+            'peak_risk_score': peak.get('risk_score', 0.0),
+            'max_end_sec': max([self._metadata_to_number(((item.get('window', {}) or {}).get('end_sec', 0.0)), 0.0) for item in logs] or [0.0]),
+            'behavior_sequence': behavior_summary.get('sequence', []),
+            'behavior_transition_count': behavior_summary.get('transition_count', 0),
+            'behavior_transition_line': behavior_summary.get('transition_line', ''),
+            'facial_state': facial_summary,
+            'facial_state_line': facial_summary.get('line', ''),
+            'line': '분할 로그 ' + str(len(logs)) + '건 · 최고 위험 ' + str(peak.get('chunk_label', '-')) + ' · ' + str(round(float(peak.get('risk_score', 0.0) or 0.0) * 100, 1)) + '%',
+        }
+        if summary.get('behavior_transition_line'):
+            summary['line'] += ' · ' + summary.get('behavior_transition_line')
+        if summary.get('facial_state_line'):
+            summary['line'] += ' · ' + summary.get('facial_state_line')
+        return {
+            'enabled': True,
+            'policy': policy,
+            'logs': logs,
+            'summary': summary,
+        }
+
+    def _persist_upload_analysis_record(self, saved_name, result, chunk_analysis=None):
+        meta_path = self._upload_meta_path(saved_name)
+        meta = self._read_json(meta_path, default={}) or {}
+        logs = []
+        for item in list((chunk_analysis or {}).get('logs', []) or []):
+            logs.append({
+                'chunk_id': item.get('chunk_id'),
+                'chunk_label': item.get('chunk_label', ''),
+                'phase': item.get('phase', ''),
+                'window': item.get('window', {}),
+                'risk_score': item.get('risk_score', 0.0),
+                'risk_level': item.get('risk_level', 'low'),
+                'fall_detected': bool(item.get('fall_detected', False)),
+                'posture_label': item.get('posture_label', ''),
+                'facial_state': item.get('facial_state', {}),
+                'facial_label': item.get('facial_label', ''),
+                'facial_percent': item.get('facial_percent', 0),
+                'behavior_code': item.get('behavior_code', ''),
+                'behavior_label': item.get('behavior_label', ''),
+                'behavior_transition': item.get('behavior_transition', {}),
+                'next_behavior_hint': item.get('next_behavior_hint', ''),
+                'decision_state': item.get('decision_state', ''),
+                'log_type': item.get('log_type', 'analysis'),
+                'one_line': item.get('one_line', ''),
+                'description': item.get('description', ''),
+            })
+        meta['last_analysis'] = {
+            'analyzed_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'runtime_key': result.get('runtime_key', ''),
+            'risk_score': result.get('risk_score', 0.0),
+            'risk_level': result.get('risk_level', 'low'),
+            'fall_detected': bool(result.get('fall_detected', False)),
+            'posture_label': result.get('posture_label', ''),
+            'decision_state': result.get('decision_state', ''),
+            'summary': result.get('summary', ''),
+            'log_summary': result.get('log_summary', {}),
+            'chunk_analysis': {
+                'policy': (chunk_analysis or {}).get('policy', {}),
+                'summary': (chunk_analysis or {}).get('summary', {}),
+                'logs': logs,
+            },
+        }
+        self._write_json(meta_path, meta)
 
     def _metadata_to_number(self, value, default=0.0):
         try:
@@ -3756,7 +8798,7 @@ class VideoAnalysis:
 
     def _guess_behavior(self, filename, risk_score):
         name = (filename or '').lower()
-        if risk_score >= self.fall_decision_threshold or 'fall' in name:
+        if risk_score >= self._rf_confirm_threshold() or 'fall' in name:
             return 'fall', '낙상'
         return 'non-fall', '비낙상'
 
@@ -3774,10 +8816,10 @@ class VideoAnalysis:
         score += 0.05
         score = max(0.05, min(0.98, score))
 
-        fall_detected = score >= self.fall_decision_threshold
-        risk_level = 'high' if score >= 0.8 else ('medium' if score >= self.fall_decision_threshold else 'low')
-        risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
-        behavior_class, behavior_label = self._guess_behavior(filename, score)
+        fall_detected = False
+        risk_level = 'low'
+        risk_label = '안정'
+        behavior_class, behavior_label = 'non-fall', '비낙상'
         event_time = round(max(1.0, duration * 0.5 if duration > 0 else 4.0), 2)
         analysis_basis = [
             {
@@ -3811,10 +8853,11 @@ class VideoAnalysis:
             'risk_score': round(score, 4),
             'risk_level': risk_level,
             'risk_label': risk_label,
-            'summary': '낙상 고위험 동작이 의심됩니다.' if fall_detected else '현재 구간에서는 즉시 낙상 고위험이 감지되지 않았습니다.',
+            'summary': '학습 런타임 실패로 fallback 분석만 제공했습니다. 이 결과는 낙상 최종 판정에 사용하지 않습니다.',
             'analysis_basis': analysis_basis,
             'runtime_key': 'heuristic-fallback',
             'runtime_label': '규칙·메타데이터 기반 fallback 분석',
+            'decision_state': 'fallback-warning',
             'events': [
                 {
                     'label': '대표 분석 구간',
@@ -3871,8 +8914,61 @@ class VideoAnalysis:
         fps = self._metadata_to_number(metadata.get('fps', 0))
         analysis_profile = str(metadata.get('analysis_profile', 'balanced') or 'balanced').strip().lower()
         input_source = str(metadata.get('input_source', 'upload') or 'upload').strip() or 'upload'
-        model_type = str(metadata.get('model_type', 'xg-dual') or 'xg-dual').strip().lower()
+        model_type = str(metadata.get('model_type', 'rf-dual') or 'rf-dual').strip().lower()
+        realtime_context = {
+            'chunk_id': metadata.get('chunk_id', None),
+            'session_id': metadata.get('realtime_session_id', None),
+        }
+        _is_realtime = input_source in ('webcam-live', 'webcam', 'realtime')
 
+        # ── Realtime fast-path: tempfile + skip summary + lightweight response ──
+        if _is_realtime:
+            import tempfile as _tmpmod
+            _t_save = _time.time()
+            _tmp_fd, saved_path = _tmpmod.mkstemp(suffix=f'.{ext}')
+            os.write(_tmp_fd, content)
+            os.close(_tmp_fd)
+            saved_name = f'rt_{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}_{hashlib.sha1(content).hexdigest()[:8]}'
+            _st['file_save_sec'] = round(_time.time() - _t_save, 3)
+            _st['summary_load_sec'] = 0
+
+            result = None
+            runtime_warning = None
+            _t_inf = _time.time()
+            try:
+                result = self._infer_with_trained_model(saved_path, filename, analysis_profile, model_type=model_type, input_source=input_source, duration_hint=duration, realtime_context=realtime_context)
+                inferred_meta = (result.get('video_meta', {}) or {})
+                duration = self._metadata_to_number(inferred_meta.get('duration', duration), duration)
+            except Exception as e:
+                runtime_warning = str(e)
+                result = None
+            finally:
+                try:
+                    os.unlink(saved_path)
+                except Exception:
+                    pass
+            if result is None:
+                result = self._heuristic_result(filename, duration, width, height, fps, analysis_profile)
+                if runtime_warning:
+                    result['runtime_warning'] = {'severity': 'warn', 'title': 'Realtime 추론 실패 → fallback', 'description': runtime_warning}
+            _st['inference_sec'] = round(_time.time() - _t_inf, 3)
+
+            _st['result_build_sec'] = 0
+            _st['alert_dispatch_sec'] = 0
+            result['analysis_profile'] = analysis_profile
+            _t_llm = _time.time()
+            result = self._apply_realtime_behavior_llm_review(result, realtime_context=realtime_context)
+            _st['llm_sec'] = round(_time.time() - _t_llm, 3)
+            result['log_summary'] = self._build_log_summary(result)
+            _st['response_ready_sec'] = round(_time.time() - _t0, 3)
+            _st['total_server_sec'] = round(_time.time() - _t0, 3)
+            return self._sanitize_for_json({
+                'saved_name': saved_name,
+                'server_timing': _st,
+                **result,
+            })
+
+        # ── Normal (upload) path ──
         _t_save = _time.time()
         file_hash = hashlib.sha1(content).hexdigest()[:12]
         timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
@@ -3900,7 +8996,7 @@ class VideoAnalysis:
         result = None
         _t_inf = _time.time()
         try:
-            result = self._infer_with_trained_model(saved_path, filename, analysis_profile, model_type=model_type, input_source=input_source, duration_hint=duration)
+            result = self._infer_with_trained_model(saved_path, filename, analysis_profile, model_type=model_type, input_source=input_source, duration_hint=duration, realtime_context=realtime_context)
             inferred_meta = (result.get('video_meta', {}) or {})
             duration = self._metadata_to_number(inferred_meta.get('duration', duration), duration)
             width = int(self._metadata_to_number(inferred_meta.get('width', width), width))
@@ -3915,6 +9011,10 @@ class VideoAnalysis:
             }
         if result is None:
             result = self._heuristic_result(filename, duration, width, height, fps, analysis_profile)
+        quality_warning = ((result.get('model_runtime', {}) or {}).get('input_quality_warning')
+                           if isinstance(result, dict) else None)
+        if runtime_warning is None and quality_warning:
+            runtime_warning = quality_warning
         _st['inference_sec'] = round(_time.time() - _t_inf, 3)
         _t_build = _time.time()
         result['analysis_profile'] = analysis_profile
@@ -3938,6 +9038,12 @@ class VideoAnalysis:
             elapsed = self._metadata_to_number((result.get('runtime_inference', {}) or {}).get('elapsed_sec', 0), 0)
             det_frames = int((result.get('model_runtime', {}) or {}).get('detected_person_frames', 0) or 0)
             result['analysis_speed_note'] = f'RF-Pose 파이프라인(YOLOv8n-Pose + 키포인트 + RandomForest)으로 분석했습니다. ({round(elapsed, 1)}초 · 사람 검출 {det_frames}프레임)'
+        elif result.get('runtime_key') == 'rf-dual':
+            elapsed = self._metadata_to_number((result.get('runtime_inference', {}) or {}).get('perf', {}).get('total', 0), 0)
+            det_frames = int((result.get('model_runtime', {}) or {}).get('detected_person_frames', 0) or 0)
+            posture_lbl = result.get('posture_label', '')
+            decision_st = result.get('decision_state', '')
+            result['analysis_speed_note'] = f'RF-Dual(Fall+Posture) 파이프라인으로 분석했습니다. ({round(elapsed, 1)}초 · 사람 검출 {det_frames}프레임 · 자세 {posture_lbl} · 상태 {decision_st})'
         else:
             result['analysis_speed_note'] = f'{self._profile_label(analysis_profile)}으로 운영 해석 정보를 함께 준비했습니다.'
         result['admin_details_available'] = True
@@ -3976,6 +9082,8 @@ class VideoAnalysis:
             runtime_label = 'RF 보조 파이프라인 (RandomForest + YOLOv8n-Pose)'
         elif runtime_key == 'rf-pose-runtime':
             runtime_label = 'RF-Pose 파이프라인 (RandomForest + YOLOv8n-Pose + Keypoints)'
+        elif runtime_key == 'rf-dual':
+            runtime_label = 'RF-Dual (Fall+Posture) 파이프라인'
         else:
             runtime_label = baseline_state.get('active_label', '메타데이터·파일명 기반 fallback')
         result['analysis_overview'] = [
@@ -3999,6 +9107,19 @@ class VideoAnalysis:
             _feat_count = int(mr.get('combined_feature_count', mr.get('feature_count', 0)) or 0)
             _feat_note = f' · 특징 {_feat_count}개' if _feat_count else ''
             result['analysis_overview'].append(f"추출 프레임 {int(mr.get('extracted_frames', 0) or 0)}장 · 사람 검출 {int(mr.get('detected_person_frames', 0) or 0)}장{_feat_note} · 낙상 확률 {round(self._metadata_to_number(mr.get('fall_probability', 0.0), 0.0) * 100, 1)}%")
+        elif runtime_key == 'rf-dual':
+            mr = result.get('model_runtime', {}) or {}
+            _posture_lbl = result.get('posture_label', '?')
+            _decision_st = result.get('decision_state', '?')
+            _posture_wins = int(mr.get('posture_windows', 0) or 0)
+            result['analysis_overview'].append(f"추출 프레임 {int(mr.get('extracted_frames', 0) or 0)}장 · 사람 검출 {int(mr.get('detected_person_frames', 0) or 0)}장 · 낙상 확률 {round(self._metadata_to_number(mr.get('fall_probability', 0.0), 0.0) * 100, 1)}% · 자세 {_posture_lbl}({_posture_wins}개 윈도우) · 상태 {_decision_st}")
+            _quality_warning = (mr.get('input_quality_warning') or {})
+            _sampling = (mr.get('frame_sampling') or {})
+            if _quality_warning:
+                result['analysis_overview'].append(
+                    f"입력 품질 경고: 샘플링 예정 {_sampling.get('expected_sampled_frames', '?')}장 중 "
+                    f"{_sampling.get('actual_sampled_frames', int(mr.get('extracted_frames', 0) or 0))}장만 읽혀 낙상 구간이 빠졌을 수 있습니다."
+                )
         result['risk_score_guide'] = self._risk_score_guide(result)
         result['behavior_summary'] = self._behavior_result_summary(result)
         result['requested_model'] = {
@@ -4011,6 +9132,26 @@ class VideoAnalysis:
         }
         result['analysis_overview'].append(f"요청 모델 {self._model_option_label(model_type)} · 실제 적용 모델 {result.get('runtime_label', runtime_label)}")
         result['analysis_basis'] = self._sort_analysis_basis(existing_basis)
+        result['log_summary'] = self._build_log_summary(result)
+
+        chunk_analysis = self._run_chunk_analysis(
+            saved_path,
+            filename=filename,
+            analysis_profile=analysis_profile,
+            model_type=model_type,
+            input_source='upload',
+            duration_hint=duration,
+        )
+        result['chunk_analysis'] = chunk_analysis
+        chunk_summary = ((chunk_analysis or {}).get('summary') or {})
+        if chunk_summary.get('line'):
+            result['analysis_overview'].append(str(chunk_summary.get('line')))
+        if chunk_summary.get('behavior_transition_line'):
+            result['analysis_overview'].append(str(chunk_summary.get('behavior_transition_line')))
+
+        _t_llm = _time.time()
+        result['llm_interpretation'] = self._generate_llm_interpretation(result)
+        _st['llm_sec'] = round(_time.time() - _t_llm, 3)
 
         _st['result_build_sec'] = round(_time.time() - _t_build, 3)
 
@@ -4034,7 +9175,7 @@ class VideoAnalysis:
         _st['response_ready_sec'] = round(_time.time() - _t0, 3)
         _st['total_server_sec'] = round(_time.time() - _t0, 3)
 
-        return {
+        raw = {
             'saved_name': saved_name,
             'original_name': filename,
             'file': {
@@ -4051,6 +9192,105 @@ class VideoAnalysis:
             'server_timing': _st,
             **result,
         }
+        self._persist_upload_analysis_record(saved_name, result, chunk_analysis)
+        # NaN/Inf → None: Python json emits invalid JSON tokens (NaN) that JS JSON.parse() rejects
+        return self._sanitize_for_json(raw)
+
+    def _is_training_video_filename(self, filename):
+        ext = os.path.splitext(str(filename or '').lower())[1].lstrip('.')
+        return ext in set(self.allowed_extensions)
+
+    def _is_training_archive_filename(self, filename):
+        lower = str(filename or '').lower()
+        return lower.endswith('.zip') or lower.endswith('.tar') or lower.endswith('.tar.gz') or lower.endswith('.tgz')
+
+    def _archive_training_items(self, content, filename):
+        """Return video files from a zip/tar upload without trusting archive paths."""
+        items = []
+        max_items = 2000
+        lower = str(filename or '').lower()
+        try:
+            if lower.endswith('.zip'):
+                with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                    for info in archive.infolist():
+                        if info.is_dir():
+                            continue
+                        original_name = str(info.filename or '').replace('\\', '/')
+                        base_name = os.path.basename(original_name)
+                        if not self._is_training_video_filename(base_name):
+                            continue
+                        with archive.open(info) as file:
+                            item_content = file.read()
+                        if item_content:
+                            items.append((original_name, base_name, item_content))
+                        if len(items) >= max_items:
+                            break
+            elif lower.endswith('.tar') or lower.endswith('.tar.gz') or lower.endswith('.tgz'):
+                with tarfile.open(fileobj=io.BytesIO(content), mode='r:*') as archive:
+                    for member in archive.getmembers():
+                        if not member.isfile():
+                            continue
+                        original_name = str(member.name or '').replace('\\', '/')
+                        base_name = os.path.basename(original_name)
+                        if not self._is_training_video_filename(base_name):
+                            continue
+                        extracted = archive.extractfile(member)
+                        if extracted is None:
+                            continue
+                        item_content = extracted.read()
+                        if item_content:
+                            items.append((original_name, base_name, item_content))
+                        if len(items) >= max_items:
+                            break
+        except Exception as exc:
+            raise Exception(f'압축 파일을 읽지 못했습니다: {exc}')
+        return items
+
+    def _store_training_sample_content(self, content, filename, label, note='', metadata=None, archive_source=''):
+        metadata = metadata or {}
+        self._ensure_intake_dirs()
+        label_dir = os.path.join(self._training_dir(), label)
+        os.makedirs(label_dir, exist_ok=True)
+        filename = self._sanitize_filename(filename or 'training-video')
+        file_hash = hashlib.sha1(content).hexdigest()[:12]
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        saved_name = timestamp + '-' + file_hash + '-' + filename
+        target = os.path.join(label_dir, saved_name)
+        posture_class = str(metadata.get('posture_class') or metadata.get('posture') or '').strip().lower()
+        meta_payload = {
+            'label': label,
+            'posture_class': posture_class,
+            'original_name': filename,
+            'saved_name': saved_name,
+            'uploaded_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'note': note,
+            'metadata': metadata,
+        }
+        if archive_source:
+            meta_payload['archive_source'] = archive_source
+        with open(target, 'wb') as file:
+            file.write(content)
+        self._write_json(target + '.json', meta_payload)
+
+        posture_target = ''
+        if posture_class:
+            posture_dir = os.path.join(self._training_dir(), posture_class)
+            os.makedirs(posture_dir, exist_ok=True)
+            posture_target = os.path.join(posture_dir, saved_name)
+            with open(posture_target, 'wb') as file:
+                file.write(content)
+            posture_meta = dict(meta_payload)
+            posture_meta['intake_view'] = 'posture_class'
+            posture_meta['linked_l1_path'] = target
+            self._write_json(posture_target + '.json', posture_meta)
+        self._invalidate_prototype_info_cache()
+        return {
+            'label': label,
+            'posture_class': posture_class,
+            'saved_name': saved_name,
+            'posture_intake_saved': bool(posture_target),
+            'archive_source': archive_source,
+        }
 
     def submit_training_sample(self, uploaded_file, label, note='', metadata=None):
         metadata = metadata or {}
@@ -4059,33 +9299,197 @@ class VideoAnalysis:
         label = str(label or '').strip().upper()
         if label not in ('Y', 'N'):
             raise Exception('학습 라벨은 Y 또는 N 이어야 합니다.')
+        posture_class = str(metadata.get('posture_class') or metadata.get('posture') or '').strip().lower()
+        if posture_class and posture_class not in self._LABEL_L2_CLASSES:
+            raise Exception('행동 라벨은 stand/walk/run/sit/lie/fall 중 하나여야 합니다.')
 
         filename = self._sanitize_filename(getattr(uploaded_file, 'filename', 'training-video'))
         content = uploaded_file.read()
         if not content:
             raise Exception('비어 있는 파일은 등록할 수 없습니다.')
 
-        label_dir = os.path.join(self._training_dir(), label)
-        os.makedirs(label_dir, exist_ok=True)
-        file_hash = hashlib.sha1(content).hexdigest()[:12]
-        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        saved_name = timestamp + '-' + file_hash + '-' + filename
-        target = os.path.join(label_dir, saved_name)
-        with open(target, 'wb') as file:
-            file.write(content)
-        self._write_json(target + '.json', {
-            'label': label,
-            'original_name': filename,
-            'saved_name': saved_name,
-            'uploaded_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'note': note,
-            'metadata': metadata,
-        })
-        return {
-            'label': label,
-            'saved_name': saved_name,
+        if self._is_training_archive_filename(filename):
+            archive_items = self._archive_training_items(content, filename)
+            if not archive_items:
+                raise Exception('압축 파일 안에서 지원 영상 파일을 찾지 못했습니다.')
+            saved_items = []
+            for original_name, base_name, item_content in archive_items:
+                item_metadata = dict(metadata)
+                item_metadata['archive_upload'] = True
+                item_metadata['archive_name'] = filename
+                item_metadata['archive_inner_path'] = original_name
+                saved_items.append(self._store_training_sample_content(
+                    item_content,
+                    base_name,
+                    label,
+                    note,
+                    item_metadata,
+                    archive_source=filename,
+                ))
+            first = saved_items[0] if saved_items else {}
+            return {
+                'label': label,
+                'posture_class': posture_class,
+                'saved_name': first.get('saved_name', ''),
+                'posture_intake_saved': any(bool(item.get('posture_intake_saved')) for item in saved_items),
+                'archive': True,
+                'archive_name': filename,
+                'saved_count': len(saved_items),
+                'items': saved_items[:50],
+                'intake_summary': self._intake_summary(),
+            }
+
+        if not self._is_training_video_filename(filename):
+            raise Exception('지원하지 않는 학습 파일 형식입니다. 영상 또는 zip/tar 압축 파일을 올려주세요.')
+        result = self._store_training_sample_content(content, filename, label, note, metadata)
+        result.update({
+            'archive': False,
+            'saved_count': 1,
             'intake_summary': self._intake_summary(),
+        })
+        return result
+
+    def _training_jobs_dir(self):
+        path = self._persistent_model_path('training-jobs')
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _training_job_path(self, job_id):
+        safe_id = self._sanitize_filename(job_id or '')
+        if not safe_id:
+            safe_id = 'latest'
+        return os.path.join(self._training_jobs_dir(), safe_id + '.json')
+
+    def _training_latest_job_id_path(self):
+        return os.path.join(self._training_jobs_dir(), 'latest_job_id.txt')
+
+    def _continuous_training_status_path(self, name='aihub82'):
+        safe_name = self._sanitize_filename(name or 'aihub82') or 'aihub82'
+        return self._project_abspath('outputs', 'continuous_training', safe_name + '_status.json')
+
+    def continuous_training_status(self, name='aihub82'):
+        path = self._continuous_training_status_path(name)
+        data = self._read_json(path, {})
+        if not data:
+            return {
+                'ok': False,
+                'status': 'missing',
+                'stage': 'not-started',
+                'message': 'AI-Hub 82 연속 학습 상태 파일이 아직 없습니다.',
+                'status_path': path,
+            }
+        data.setdefault('ok', True)
+        data.setdefault('status_path', path)
+        data.setdefault('message', data.get('latest_log') or data.get('stage') or 'AI-Hub 82 연속 학습 상태를 확인했습니다.')
+        return data
+
+    def _read_training_job(self, job_id):
+        if not job_id or str(job_id).strip() == 'latest':
+            try:
+                with open(self._training_latest_job_id_path(), 'r', encoding='utf-8') as file:
+                    job_id = file.read().strip()
+            except Exception:
+                job_id = ''
+        if not job_id:
+            return {
+                'ok': False,
+                'status': 'missing',
+                'message': '아직 실행된 학습 job이 없습니다.',
+            }
+        path = self._training_job_path(job_id)
+        data = self._read_json(path, {})
+        if not data:
+            return {
+                'ok': False,
+                'job_id': job_id,
+                'status': 'missing',
+                'message': '학습 job 상태 파일을 찾지 못했습니다.',
+            }
+        return data
+
+    def start_training_job(self, job_type='full', note='', apply_mode='manual'):
+        job_type = str(job_type or 'full').strip().lower()
+        if job_type not in ('full', 'rf', 'posture'):
+            job_type = 'full'
+        apply_mode = str(apply_mode or 'manual').strip().lower()
+        job_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '-' + hashlib.sha1(
+            f"{job_type}|{time.time()}".encode('utf-8')
+        ).hexdigest()[:8]
+        job_path = self._training_job_path(job_id)
+        log_path = os.path.join(self._training_jobs_dir(), job_id + '.log')
+        runner = self._project_abspath('scripts', 'dashboard_training_job.py')
+        if not os.path.isfile(runner):
+            raise Exception('백그라운드 학습 runner를 찾지 못했습니다.')
+        intake = self._intake_summary()
+        total_items = int(
+            (intake.get('fall_sample_count', 0) or 0)
+            + (intake.get('posture_sample_count', 0) or 0)
+            + (intake.get('Y', 0) or 0)
+            + (intake.get('N', 0) or 0)
+            + (intake.get('posture_intake_total', 0) or 0)
+        )
+        status = {
+            'ok': True,
+            'job_id': job_id,
+            'job_type': job_type,
+            'apply_mode': apply_mode,
+            'status': 'queued',
+            'stage': 'queued',
+            'progress': 0.0,
+            'processed': 0,
+            'total': total_items,
+            'eta_sec': None,
+            'note': note,
+            'created_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'intake_summary': intake,
+            'log_path': log_path,
+            'message': '백그라운드 학습 대기 중',
         }
+        self._write_json(job_path, status)
+        with open(self._training_latest_job_id_path(), 'w', encoding='utf-8') as file:
+            file.write(job_id)
+        with open(log_path, 'ab') as log:
+            subprocess.Popen(
+                [sys.executable, runner, '--job-id', job_id, '--job-file', job_path, '--job-type', job_type],
+                cwd=self._project_root(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return self._read_training_job(job_id)
+
+    def training_job_status(self, job_id='latest'):
+        data = self._read_training_job(job_id)
+        if data.get('status') in ('running', 'queued'):
+            started_raw = data.get('started_monotonic')
+            if started_raw:
+                elapsed = max(0.0, time.time() - self._finite_float(started_raw, time.time()))
+                progress = max(0.0, min(0.99, self._finite_float(data.get('progress'), 0.0)))
+                if progress > 0:
+                    data['eta_sec'] = round(max(0.0, elapsed * (1.0 - progress) / progress), 1)
+                data['elapsed_sec'] = round(elapsed, 1)
+        return data
+
+    def apply_training_job(self, job_id='latest'):
+        data = self._read_training_job(job_id)
+        if data.get('status') not in ('completed', 'completed_pending_apply'):
+            raise Exception('완료된 학습 job만 적용할 수 있습니다.')
+        data['status'] = 'applied'
+        data['applied_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data['message'] = '학습 결과를 운영 캐시에 반영했습니다.'
+        self.__class__._rf_model_cache = None
+        self.__class__._rf_model_mtime = None
+        self.__class__._rf_model_path_cache = None
+        self.__class__._rf_fall_v2_model_cache = None
+        self.__class__._rf_fall_v2_model_mtime = None
+        self.__class__._rf_fall_v2_model_path_cache = None
+        self.__class__._xg_posture_model_cache = None
+        self.__class__._xg_posture_model_mtime = None
+        self.__class__._xg_posture_model_path_cache = None
+        self._invalidate_prototype_info_cache()
+        self._write_json(self._training_job_path(data.get('job_id')), data)
+        return data
 
     def retrain_baseline(self):
         baseline_module = self._baseline_module()
@@ -4129,19 +9533,7 @@ class VideoAnalysis:
         # FN-0014 Stage A: rf-pose retrain skipped (deprecated)
         # rf-pose 코드는 유지하되, 자동 재학습에서 제외
         timings['rf_pose_sec'] = 0
-        # FN-0007: XG-Fall 37-feature retrain
-        xg_fall_summary = {}
-        _t0 = time.time()
-        try:
-            xg_fall_result = self.retrain_xg_fall()
-            xg_fall_summary = xg_fall_result.get('summary', {})
-            if xg_fall_result.get('errors'):
-                errors.extend(xg_fall_result.get('errors', []))
-            timings['xg_fall_sec'] = round(time.time() - _t0, 2)
-        except Exception as e:
-            timings['xg_fall_sec'] = round(time.time() - _t0, 2)
-            errors.append(f'xg-fall 재학습 실패: {str(e)}')
-        # FN-0013: XG-Posture 6-class retrain
+        # FN-0013: XG-Posture retrain
         xg_posture_summary = {}
         _t0 = time.time()
         try:
@@ -4164,7 +9556,6 @@ class VideoAnalysis:
             'action_behavior_training': behavior_summary,
             'rf_pipeline_training': rf_pipeline_summary,
             'rf_pose_training': rf_pose_summary,
-            'xg_fall_training': xg_fall_summary,
             'xg_posture_training': xg_posture_summary,
             'model_comparison': model_comparison,
             'retrain_started_at': started_at,
@@ -4283,7 +9674,7 @@ class VideoAnalysis:
         errors = []
         if summary['class_distribution']['Y'] < 2 or summary['class_distribution']['N'] < 2:
             summary['message'] = 'RF HITL 재학습은 클래스별 최소 2건 이상 필요합니다.'
-            self._write_json(self._project_abspath(self._RF_PROJECT_SUMMARY_REL_PATH), summary)
+            self._write_json(self._rf_project_summary_path(), summary)
             return {'summary': summary, 'errors': errors}
 
         df = pd.DataFrame(rows)
@@ -4348,7 +9739,7 @@ class VideoAnalysis:
             },
             'feature_importance': {col: round(float(imp), 4) for col, imp in zip(self._RF_FEATURE_COLUMNS, getattr(model, 'feature_importances_', []))},
         })
-        self._write_json(self._project_abspath(self._RF_PROJECT_SUMMARY_REL_PATH), summary)
+        self._write_json(self._rf_project_summary_path(), summary)
         return {'summary': summary, 'errors': errors}
 
     def retrain_rf_pose_pipeline(self):
@@ -4416,7 +9807,7 @@ class VideoAnalysis:
         errors = []
         if summary['class_distribution']['Y'] < 2 or summary['class_distribution']['N'] < 2:
             summary['message'] = 'RF-Pose 재학습은 클래스별 최소 2건 이상 필요합니다.'
-            self._write_json(self._project_abspath(self._RF_POSE_SUMMARY_REL_PATH), summary)
+            self._write_json(self._rf_pose_summary_path(), summary)
             return {'summary': summary, 'errors': errors}
 
         df = pd.DataFrame(rows)
@@ -4472,7 +9863,7 @@ class VideoAnalysis:
             },
             'feature_importance': {col: round(float(imp), 4) for col, imp in zip(_combined_columns, getattr(model, 'feature_importances_', []))},
         })
-        self._write_json(self._project_abspath(self._RF_POSE_SUMMARY_REL_PATH), summary)
+        self._write_json(self._rf_pose_summary_path(), summary)
         return {'summary': summary, 'errors': errors}
 
     # ── FN-0007: XG-Fall 37-feature inference ──────────────────────────
@@ -4538,30 +9929,82 @@ class VideoAnalysis:
 
         max_prob = float(np.max(proba))
         mean_prob = float(np.mean(proba))
-        fall_ratio = float(np.sum(proba >= self._XG_FALL_THRESHOLD)) / len(proba)
+        _thresholds = self._xg_fall_thresholds()
+        _confirm_thr = _thresholds['confirm']
+        fall_ratio = float(np.sum(proba >= _confirm_thr)) / len(proba)
 
         # Score: weighted combination
         peak_idx = int(np.argmax(proba))
         peak_feats = windows[peak_idx]
         _fp = peak_feats.get('floor_proximity', 0.0)
         _hr = peak_feats.get('height_ratio', 0.0)
-        _fp_boost = min(1.0, max(0.0, (_fp - 0.5) / 0.5)) if _fp > 0.5 else 0.0
-        _hr_boost = min(1.0, max(0.0, (-_hr - 0.05) / 0.25)) if _hr < -0.05 else 0.0
-        final_score = max_prob * 0.45 + mean_prob * 0.25 + fall_ratio * 0.15 + _fp_boost * 0.10 + _hr_boost * 0.05
-        final_score = round(max(0.0, min(0.999999, final_score)), 6)
-
-        # Motion gate (majority vote)
         _mds = peak_feats.get('max_down_speed', 0.0)
         _cdy = peak_feats.get('center_dy', 0.0)
+        _ac = peak_feats.get('aspect_change', 0.0)
+        _area_chg = peak_feats.get('area_change', 0.0)
+        _tilt_max = peak_feats.get('pose_tilt_max', 0.0)
+        _fp_boost = min(1.0, max(0.0, (_fp - 0.5) / 0.5)) if _fp > 0.5 else 0.0
+        _hr_boost = min(1.0, max(0.0, (-_hr - 0.05) / 0.25)) if _hr < -0.05 else 0.0
+        _floor_contact = peak_feats.get('floor_contact_ratio', 0.0)
+        _drop_persist = peak_feats.get('height_drop_persistence', 0.0)
+        _pose_hr_min = peak_feats.get('pose_height_ratio_min', 1.0)
+        _slow_descent_ratio = peak_feats.get('slow_descent_ratio', 0.0)
+        # Frontal/rear fall boost: require stronger collapse evidence to avoid bed-rise false positives.
+        _frontal_fall = abs(_ac) >= 0.12 and (
+            (_area_chg < -0.10 and _hr <= -0.04)
+            or (_tilt_max >= 55.0 and _pose_hr_min <= 0.12)
+            or (_floor_contact >= 0.35 and _drop_persist >= 0.45)
+        )
+        _ac_boost = min(1.0, abs(_ac) / 0.3) * 0.5 if _frontal_fall else 0.0
+        # Peak-dominant boost: when max_prob is very high, the fall is concentrated
+        # in a brief moment — give extra weight to the peak signal
+        _peak_boost = min(0.08, (max_prob - 0.80) * 0.4) if max_prob >= 0.80 else 0.0
+        final_score = max_prob * 0.40 + mean_prob * 0.22 + fall_ratio * 0.13 + _fp_boost * 0.08 + _hr_boost * 0.05 + _ac_boost * 0.07 + _peak_boost
+        final_score = round(max(0.0, min(0.999999, final_score)), 6)
+
+        # Motion gate (enhanced for frontal/rear falls)
         gate_checks = {
             'max_down_speed': _mds >= 0.15,
             'center_dy': _cdy >= 0.03,
-            'pose_change': (_hr <= -0.05 or peak_feats.get('aspect_change', 0.0) >= 0.05 or _fp >= 0.78),
+            'pose_change': (_hr <= -0.05 or abs(_ac) >= 0.05 or _fp >= 0.78),
+            'frontal_fall': _frontal_fall,
         }
         _gate_pass = sum(1 for v in gate_checks.values() if v) >= 2
         _floor_override = _fp >= 0.85 and _hr <= -0.08
         _speed_override = _fp >= 0.75 and _mds >= 0.3
-        motion_gate_passed = _gate_pass or _floor_override or _speed_override
+        _frontal_override = _frontal_fall and max_prob >= 0.50
+        _strong_pose_collapse = (
+            max_prob >= 0.84
+            and mean_prob >= 0.45
+            and fall_ratio >= 0.45
+            and _pose_hr_min <= 0.12
+            and (_tilt_max >= 25.0 or abs(_hr) >= 0.10 or abs(_ac) >= 0.08)
+        )
+        _directional_collapse_override = (
+            max_prob >= 0.84
+            and mean_prob >= 0.45
+            and fall_ratio >= 0.45
+            and _cdy >= 0.03
+            and _fp >= 0.50
+            and _tilt_max >= 45.0
+        )
+        _still_post_fall_override = (
+            max_prob >= 0.84
+            and mean_prob >= 0.45
+            and fall_ratio >= 0.45
+            and peak_feats.get('stillness', 0.0) >= 0.95
+            and _fp >= 0.20 and _fp <= 0.40
+            and _tilt_max <= 20.0
+            and _drop_persist < 0.15
+        )
+        _slow_fall_override = (
+            max_prob >= 0.80
+            and _tilt_max >= 60.0
+            and _pose_hr_min <= 0.10
+            and _hr <= -0.10
+            and _slow_descent_ratio >= 0.20
+        )
+        motion_gate_passed = _gate_pass or _floor_override or _speed_override or _frontal_override or _slow_fall_override or _strong_pose_collapse or _directional_collapse_override or _still_post_fall_override
 
         if not motion_gate_passed:
             final_score = min(final_score, max_prob * 0.35, mean_prob * 0.45, 0.35)
@@ -4571,15 +10014,47 @@ class VideoAnalysis:
 
         # 1) Stationary suppressor — very low motion + low tilt change → suppress
         _still = peak_feats.get('stillness', 0.0)
-        _tilt_max = peak_feats.get('pose_tilt_max', 0.0)
         _speed_std = peak_feats.get('speed_std', 0.0)
         if _still >= 0.75 and _tilt_max <= 12.0 and _mds < 0.12 and _speed_std < 0.05:
             final_score = min(final_score, 0.30)
             _suppressed_by.append('stationary_suppressor')
 
+        # Bed-rise suppressor — large body tilt on bed without downward motion is not a fall.
+        if (
+            _still >= 0.85 and _mds < 0.03 and abs(_cdy) < 0.01
+            and _fp < 0.55 and _tilt_max >= 20.0 and _tilt_max <= 55.0
+            and _pose_hr_min >= 0.18 and _floor_contact < 0.25
+        ):
+            final_score = min(final_score, 0.22)
+            _suppressed_by.append('bed_rise_suppressor')
+
+        # Spike-only suppressor — isolated peak without sustained fall pattern.
+        if (
+            max_prob >= 0.84 and mean_prob < 0.22 and fall_ratio < 0.12
+            and _tilt_max < 35.0 and _floor_contact < 0.15 and _drop_persist < 0.15
+        ):
+            final_score = min(final_score, 0.24)
+            _suppressed_by.append('spike_only_suppressor')
+
+        # Reverse-motion suppressor — strong fall score without downward center motion is likely non-fall.
+        if (
+            _cdy <= 0.0 and _mds < 0.05 and _tilt_max < 40.0 and _fp < 0.70
+            and not _frontal_fall and not _strong_pose_collapse and not _directional_collapse_override and not _still_post_fall_override
+        ):
+            final_score = min(final_score, 0.24)
+            _suppressed_by.append('reverse_motion_suppressor')
+
+        # Static low-tilt floor-like posture without active descent is usually non-fall carryover.
+        if (
+            _mds < 0.01 and abs(_cdy) < 0.025 and _tilt_max < 35.0 and peak_feats.get('descent_duration', 0.0) <= 0.02
+            and _floor_contact == 0.0 and _pose_hr_min <= 0.02 and _drop_persist >= 0.40
+        ):
+            final_score = min(final_score, 0.24)
+            _suppressed_by.append('static_floor_like_suppressor')
+
         # 2) Aspect-only suppressor — aspect change w/o vertical descent → suppress
-        _ac = peak_feats.get('aspect_change', 0.0)
-        if abs(_ac) >= 0.05 and _cdy < 0.015 and _mds < 0.10:
+        #    But skip if frontal-fall pattern detected
+        if abs(_ac) >= 0.05 and _cdy < 0.015 and _mds < 0.10 and not _frontal_fall and not _strong_pose_collapse and not _directional_collapse_override:
             final_score = min(final_score, 0.30)
             _suppressed_by.append('aspect_only_suppressor')
 
@@ -4587,7 +10062,7 @@ class VideoAnalysis:
         _dur = vid_meta.get('duration', 0)
         _short_clip = _dur > 0 and _dur < 2.0
         if _short_clip and len(windows) <= 3:
-            _short_thr = self._XG_FALL_THRESHOLD + 0.10
+            _short_thr = _confirm_thr + 0.10
             if final_score < _short_thr:
                 _suppressed_by.append('short_clip_strict')
 
@@ -4607,14 +10082,15 @@ class VideoAnalysis:
             _suppressed_by.append('controlled_lie_suppressor')
 
         # Apply short-clip threshold override for fall_detected decision
-        _effective_thr = self._XG_FALL_THRESHOLD
+        _effective_thr = _confirm_thr
         if _short_clip and len(windows) <= 3:
-            _effective_thr = self._XG_FALL_THRESHOLD + 0.10
+            _effective_thr = _confirm_thr + 0.10
 
         final_score = round(max(0.0, min(0.999999, final_score)), 6)
-        fall_detected = final_score >= _effective_thr if motion_gate_passed else False
+        fall_band = self._fall_decision_band(final_score, motion_gate_passed, _short_clip and len(windows) <= 3)
+        fall_detected = fall_band == 'confirmed'
 
-        risk_level = 'high' if final_score >= 0.75 else ('medium' if final_score >= _effective_thr else 'low')
+        risk_level = 'high' if final_score >= _thresholds['high'] else ('medium' if fall_band in ['confirmed', 'suspected'] else 'low')
         risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
 
         # Events from top windows
@@ -4645,6 +10121,9 @@ class VideoAnalysis:
             ('descent_duration', '하강 지속시간', '연속 하강 프레임의 지속시간.'),
             ('stillness', '정지 비율', '움직이지 않는 프레임 비율.'),
             ('height_ratio', '높이 변화율', 'bbox 높이 변화 비율.'),
+            ('floor_contact_ratio', '바닥 접촉 비율', '낮은 자세/바닥 근처 상태가 얼마나 지속됐는지.'),
+            ('height_drop_persistence', '높이 감소 지속비', '낮아진 자세가 윈도우에서 얼마나 오래 유지됐는지.'),
+            ('slow_descent_ratio', '완만 하강 비율', '천천히 아래로 이동한 프레임 비율.'),
             ('pose_knee_bend_min', '최소 무릎 굽힘', '무릎 관절의 최소 각도.'),
             ('speed_std', '하강속도 표준편차', '하강 속도의 변동성.'),
         ]
@@ -4662,9 +10141,9 @@ class VideoAnalysis:
             })
         analysis_basis.sort(key=lambda x: feature_importances.get(x['feature'], 0), reverse=True)
 
-        behavior_class = 'fall' if fall_detected else 'non-fall'
-        behavior_label = '낙상' if fall_detected else '비낙상'
-        summary_text = 'XG-Fall 37-feature 분석 결과 낙상 가능성이 높습니다.' if fall_detected else 'XG-Fall 37-feature 분석 결과 즉시 낙상 가능성은 낮습니다.'
+        behavior_class = 'fall' if fall_detected else ('fall-suspected' if fall_band == 'suspected' else 'non-fall')
+        behavior_label = '낙상' if fall_detected else ('낙상 의심' if fall_band == 'suspected' else '비낙상')
+        summary_text = 'XG-Fall 분석 결과 낙상 가능성이 높습니다.' if fall_detected else ('XG-Fall 분석 결과 낙상 의심 구간이 있습니다.' if fall_band == 'suspected' else 'XG-Fall 분석 결과 즉시 낙상 가능성은 낮습니다.')
 
         _perf['total'] = round(_time.time() - _t_total, 3)
         return {
@@ -4683,6 +10162,8 @@ class VideoAnalysis:
             'runtime_inference': {
                 'fall_score': final_score,
                 'fall_detected': fall_detected,
+                'fall_band': fall_band,
+                'thresholds': _thresholds,
                 'max_probability': round(max_prob, 4),
                 'mean_probability': round(mean_prob, 4),
                 'fall_window_ratio': round(fall_ratio, 4),
@@ -4715,8 +10196,8 @@ class VideoAnalysis:
         }
 
     # ── FN-0011: XG-Dual Inference Pipeline ─────────────────────────────
-    def _infer_xg_dual(self, video_path, filename='', analysis_profile='balanced', input_source='upload', duration_hint=0):
-        """Dual-model inference: XG-Fall (binary) + XG-Posture (6-class) on shared timeseries.
+    def _infer_xg_dual(self, video_path, filename='', analysis_profile='balanced', input_source='upload', duration_hint=0, realtime_context=None):
+        """Dual-model inference: XG-Fall (binary) + XG-Posture behavior classifier on shared timeseries.
 
         Returns combined result with fall_detected, posture_label, posture_probs,
         decision_state, and explain.
@@ -4726,6 +10207,7 @@ class VideoAnalysis:
 
         _perf = {}
         _t_total = _time.time()
+        _is_realtime = input_source in ('webcam-live', 'webcam', 'realtime')
 
         # ── Shared timeseries extraction (once) ──
         _t = _time.time()
@@ -4735,6 +10217,65 @@ class VideoAnalysis:
 
         timeseries = ts_result['timeseries']
         vid_meta = ts_result['vid_meta']
+
+        # ── Rolling memory: stitch previous chunk's tail for inter-chunk continuity ──
+        _stitched_count = 0
+        if _is_realtime and timeseries:
+            import re
+            cache_map = self.__class__._rt_rolling_cache if isinstance(self.__class__._rt_rolling_cache, dict) else {}
+            now_ts = _time.time()
+            _rt_ctx = realtime_context or {}
+            _session_id = str(_rt_ctx.get('session_id', '') or '').strip() or 'default'
+            _current_chunk_id = _rt_ctx.get('chunk_id', None)
+            try:
+                _current_chunk_id = int(_current_chunk_id) if _current_chunk_id is not None else None
+            except Exception:
+                _current_chunk_id = None
+            if _current_chunk_id is None:
+                _chunk_match = re.search(r'chunk_(\d+)', str(filename or ''))
+                _current_chunk_id = int(_chunk_match.group(1)) if _chunk_match else None
+            cache = self._load_rt_session_cache(_session_id) if _session_id else None
+            if cache is None:
+                cache = cache_map.get(_session_id)
+            # Prepend previous chunk's tail if fresh enough (< 8 seconds ago)
+            if cache and _current_chunk_id is not None and (now_ts - cache.get('ts', 0)) < 8.0:
+                _prev_chunk_id = cache.get('chunk_id')
+                prev_tail = cache.get('timeseries_tail', [])
+                if prev_tail and _prev_chunk_id is not None and _current_chunk_id == (_prev_chunk_id + 1):
+                    # Shift previous tail times to be before current chunk's first time
+                    first_time = timeseries[0]['time_sec']
+                    tail_duration = prev_tail[-1]['time_sec'] - prev_tail[0]['time_sec'] if len(prev_tail) > 1 else 0.5
+                    time_offset = first_time - tail_duration - 0.01
+                    shifted_tail = []
+                    for pt in prev_tail:
+                        shifted = dict(pt)
+                        shifted['time_sec'] = round(time_offset + (pt['time_sec'] - prev_tail[0]['time_sec']), 4)
+                        shifted['bbox'] = dict(pt['bbox'])
+                        if pt.get('keypoints'):
+                            shifted['keypoints'] = [dict(kp) for kp in pt['keypoints']]
+                        shifted['_from_rolling'] = True
+                        shifted_tail.append(shifted)
+                    timeseries = shifted_tail + timeseries
+                    _stitched_count = len(shifted_tail)
+            # Save current chunk's tail for next chunk
+            tail_sec = self.__class__._RT_ROLLING_TAIL_SEC
+            if len(timeseries) >= 2:
+                t_end = timeseries[-1]['time_sec']
+                tail_entries = [e for e in timeseries if e['time_sec'] >= t_end - tail_sec and not e.get('_from_rolling')]
+                if _current_chunk_id is not None:
+                    new_cache = {
+                        'timeseries_tail': tail_entries[-10:],  # cap to 10 entries max
+                        'chunk_id': _current_chunk_id,
+                        'ts': now_ts,
+                    }
+                    cache_map[_session_id] = new_cache
+                    self.__class__._rt_rolling_cache = cache_map
+                    self._save_rt_session_cache(_session_id, new_cache)
+                else:
+                    cache_map.pop(_session_id, None)
+                    self.__class__._rt_rolling_cache = cache_map
+                    self._clear_rt_session_cache(_session_id)
+            _perf['rolling_stitched'] = _stitched_count
 
         if len(timeseries) < 2:
             _perf['total'] = round(_time.time() - _t_total, 3)
@@ -4761,7 +10302,9 @@ class VideoAnalysis:
 
             max_prob = float(np.max(fall_proba))
             mean_prob = float(np.mean(fall_proba))
-            fall_ratio = float(np.sum(fall_proba >= self._XG_FALL_THRESHOLD)) / len(fall_proba)
+            _thresholds = self._xg_fall_thresholds()
+            _confirm_thr = _thresholds['confirm']
+            fall_ratio = float(np.sum(fall_proba >= _confirm_thr)) / len(fall_proba)
 
             peak_idx = int(np.argmax(fall_proba))
             pf = fall_windows[peak_idx]
@@ -4769,33 +10312,110 @@ class VideoAnalysis:
             _hr = pf.get('height_ratio', 0.0)
             _mds = pf.get('max_down_speed', 0.0)
             _cdy = pf.get('center_dy', 0.0)
+            _ac = pf.get('aspect_change', 0.0)
+            _area_chg = pf.get('area_change', 0.0)
+            _tilt_max = pf.get('pose_tilt_max', 0.0)
             _fp_boost = min(1.0, max(0.0, (_fp - 0.5) / 0.5)) if _fp > 0.5 else 0.0
             _hr_boost = min(1.0, max(0.0, (-_hr - 0.05) / 0.25)) if _hr < -0.05 else 0.0
-            fall_score = max_prob * 0.45 + mean_prob * 0.25 + fall_ratio * 0.15 + _fp_boost * 0.10 + _hr_boost * 0.05
+            _floor_contact = pf.get('floor_contact_ratio', 0.0)
+            _drop_persist = pf.get('height_drop_persistence', 0.0)
+            _pose_hr_min = pf.get('pose_height_ratio_min', 1.0)
+            _slow_descent_ratio = pf.get('slow_descent_ratio', 0.0)
+            # Frontal/rear fall boost: require stronger collapse evidence to avoid bed-rise false positives.
+            _frontal_fall = abs(_ac) >= 0.12 and (
+                (_area_chg < -0.10 and _hr <= -0.04)
+                or (_tilt_max >= 55.0 and _pose_hr_min <= 0.12)
+                or (_floor_contact >= 0.35 and _drop_persist >= 0.45)
+            )
+            _ac_boost = min(1.0, abs(_ac) / 0.3) * 0.5 if _frontal_fall else 0.0
+            # Peak-dominant boost: when max_prob is very high, the fall is concentrated
+            # in a brief moment — give extra weight to the peak signal
+            _peak_boost = min(0.08, (max_prob - 0.80) * 0.4) if max_prob >= 0.80 else 0.0
+            fall_score = max_prob * 0.40 + mean_prob * 0.22 + fall_ratio * 0.13 + _fp_boost * 0.08 + _hr_boost * 0.05 + _ac_boost * 0.07 + _peak_boost
 
-            # Motion gate
+            # Motion gate (enhanced for frontal/rear falls)
             gate_checks = {
                 'max_down_speed': _mds >= 0.15,
                 'center_dy': _cdy >= 0.03,
-                'pose_change': (_hr <= -0.05 or pf.get('aspect_change', 0.0) >= 0.05 or _fp >= 0.78),
+                'pose_change': (_hr <= -0.05 or abs(_ac) >= 0.05 or _fp >= 0.78),
+                'frontal_fall': _frontal_fall,
             }
             _gate_pass = sum(1 for v in gate_checks.values() if v) >= 2
             _floor_override = _fp >= 0.85 and _hr <= -0.08
             _speed_override = _fp >= 0.75 and _mds >= 0.3
-            motion_gate_passed = _gate_pass or _floor_override or _speed_override
+            # Frontal fall override: large AR change + significant area/height change
+            _frontal_override = _frontal_fall and max_prob >= 0.50
+            _strong_pose_collapse = (
+                max_prob >= 0.84
+                and mean_prob >= 0.45
+                and fall_ratio >= 0.45
+                and _pose_hr_min <= 0.12
+                and (_tilt_max >= 25.0 or abs(_hr) >= 0.10 or abs(_ac) >= 0.08)
+            )
+            _directional_collapse_override = (
+                max_prob >= 0.84
+                and mean_prob >= 0.45
+                and fall_ratio >= 0.45
+                and _cdy >= 0.03
+                and _fp >= 0.50
+                and _tilt_max >= 45.0
+            )
+            _still_post_fall_override = (
+                max_prob >= 0.84
+                and mean_prob >= 0.45
+                and fall_ratio >= 0.45
+                and pf.get('stillness', 0.0) >= 0.95
+                and _fp >= 0.20 and _fp <= 0.40
+                and _tilt_max <= 20.0
+                and _drop_persist < 0.15
+            )
+            _slow_fall_override = (
+                max_prob >= 0.80
+                and _tilt_max >= 60.0
+                and _pose_hr_min <= 0.10
+                and _hr <= -0.10
+                and _slow_descent_ratio >= 0.20
+            )
+            motion_gate_passed = _gate_pass or _floor_override or _speed_override or _frontal_override or _slow_fall_override or _strong_pose_collapse or _directional_collapse_override or _still_post_fall_override
 
             if not motion_gate_passed:
                 fall_score = min(fall_score, max_prob * 0.35, mean_prob * 0.45, 0.35)
 
             # Suppressors (same as FN-0010 in _infer_xg_fall)
             _still = pf.get('stillness', 0.0)
-            _tilt_max = pf.get('pose_tilt_max', 0.0)
             _speed_std = pf.get('speed_std', 0.0)
             if _still >= 0.75 and _tilt_max <= 12.0 and _mds < 0.12 and _speed_std < 0.05:
                 fall_score = min(fall_score, 0.30)
                 _suppressed_by.append('stationary_suppressor')
-            _ac = pf.get('aspect_change', 0.0)
-            if abs(_ac) >= 0.05 and _cdy < 0.015 and _mds < 0.10:
+            if (
+                _still >= 0.85 and _mds < 0.03 and abs(_cdy) < 0.01
+                and _fp < 0.55 and _tilt_max >= 20.0 and _tilt_max <= 55.0
+                and _pose_hr_min >= 0.18 and _floor_contact < 0.25
+            ):
+                fall_score = min(fall_score, 0.22)
+                _suppressed_by.append('bed_rise_suppressor')
+            if (
+                max_prob >= 0.84 and mean_prob < 0.22 and fall_ratio < 0.12
+                and _tilt_max < 35.0 and _floor_contact < 0.15 and _drop_persist < 0.15
+            ):
+                fall_score = min(fall_score, 0.24)
+                _suppressed_by.append('spike_only_suppressor')
+            if (
+                _cdy <= 0.0 and _mds < 0.05 and _tilt_max < 40.0 and _fp < 0.70
+                and not _frontal_fall and not _strong_pose_collapse and not _directional_collapse_override and not _still_post_fall_override
+            ):
+                fall_score = min(fall_score, 0.24)
+                _suppressed_by.append('reverse_motion_suppressor')
+            _desc_dur = pf.get('descent_duration', 0.0)
+            _post_still = pf.get('post_descent_stillness', 0.0)
+            if (
+                _mds < 0.01 and abs(_cdy) < 0.025 and _tilt_max < 35.0 and _desc_dur <= 0.02
+                and _floor_contact == 0.0 and _pose_hr_min <= 0.02 and _drop_persist >= 0.40
+            ):
+                fall_score = min(fall_score, 0.24)
+                _suppressed_by.append('static_floor_like_suppressor')
+            # Aspect-only suppressor: only suppress when there's NO frontal-fall pattern
+            if abs(_ac) >= 0.05 and _cdy < 0.015 and _mds < 0.10 and not _frontal_fall and not _strong_pose_collapse and not _directional_collapse_override:
                 fall_score = min(fall_score, 0.30)
                 _suppressed_by.append('aspect_only_suppressor')
             _dur = vid_meta.get('duration', 0)
@@ -4808,22 +10428,23 @@ class VideoAnalysis:
             if _knee_min <= 90.0 and _tilt_mean <= 20.0 and _spread_max < 0.15:
                 fall_score = min(fall_score, 0.40)
                 _suppressed_by.append('fast_sit_suppressor')
-            _desc_dur = pf.get('descent_duration', 0.0)
-            _post_still = pf.get('post_descent_stillness', 0.0)
             if _desc_dur >= 1.5 and _mds < 0.20 and _post_still >= 0.5:
                 fall_score = min(fall_score, 0.40)
                 _suppressed_by.append('controlled_lie_suppressor')
 
-            _effective_thr = self._XG_FALL_THRESHOLD + (0.10 if (_short_clip and len(fall_windows) <= 3) else 0.0)
+            _effective_thr = _confirm_thr + (0.10 if (_short_clip and len(fall_windows) <= 3) else 0.0)
             fall_score = round(max(0.0, min(0.999999, fall_score)), 6)
-            fall_detected = fall_score >= _effective_thr if motion_gate_passed else False
+            fall_band = self._fall_decision_band(fall_score, motion_gate_passed, _short_clip and len(fall_windows) <= 3)
+            fall_detected = fall_band == 'confirmed'
         else:
             motion_gate_passed = False
             max_prob = 0.0
             mean_prob = 0.0
             fall_ratio = 0.0
+            fall_band = 'non-fall'
+            _thresholds = self._xg_fall_thresholds()
 
-        # ── XG-Posture: 1.5s windows → 6-class prediction ──
+        # ── XG-Posture: 1.5s windows → behavior prediction ──
         posture_label = 'stand'
         posture_score = 0.0
         posture_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
@@ -4864,7 +10485,30 @@ class VideoAnalysis:
                 for wi in range(len(posture_windows)):
                     probs_dict = {c: float(raw_probs[wi, ci]) for ci, c in enumerate(p_classes)}
                     lbl = p_classes[int(np.argmax(raw_probs[wi]))]
-                    pw_list.append({'label': lbl, 'probs': probs_dict})
+                    pw_list.append({
+                        'label': lbl,
+                        'probs': probs_dict,
+                        'center_x_span': float(posture_windows[wi].get('center_x_span', 0.0)),
+                        'center_dx_abs_mean': float(posture_windows[wi].get('center_dx_abs_mean', 0.0)),
+                        'vert_horiz_ratio': float(posture_windows[wi].get('vert_horiz_ratio', 0.0)),
+                        'speed_std': float(posture_windows[wi].get('speed_std', 0.0)),
+                        'avg_conf': float(posture_windows[wi].get('avg_conf', 0.0)),
+                        'lower_body_visibility': float(posture_windows[wi].get('lower_body_visibility', 0.0)),
+                        'lie_geometry_score': float(posture_windows[wi].get('lie_geometry_score', 0.0)),
+                        'flatness_score': float(posture_windows[wi].get('flatness_score', 0.0)),
+                        'upright_geometry_score': float(posture_windows[wi].get('upright_geometry_score', 0.0)),
+                        'sit_geometry_score': float(posture_windows[wi].get('sit_geometry_score', 0.0)),
+                        'low_height_floor_score': float(posture_windows[wi].get('low_height_floor_score', 0.0)),
+                        'floor_height_ratio': float(posture_windows[wi].get('floor_height_ratio', 0.0)),
+                        'horizontal_pose_score': float(posture_windows[wi].get('horizontal_pose_score', 0.0)),
+                        'lie_stand_separation_score': float(posture_windows[wi].get('lie_stand_separation_score', 0.0)),
+                        'pose_spread_max': float(posture_windows[wi].get('pose_spread_max', 0.0)),
+                        'apparent_depth_score': float(posture_windows[wi].get('apparent_depth_score', 0.0)),
+                        'horizontal_flat_pose_score': float(posture_windows[wi].get('horizontal_flat_pose_score', 0.0)),
+                        'low_flat_still_score': float(posture_windows[wi].get('low_flat_still_score', 0.0)),
+                        'sit_lie_depth_contrast': float(posture_windows[wi].get('sit_lie_depth_contrast', 0.0)),
+                        'width_height_volume_proxy': float(posture_windows[wi].get('width_height_volume_proxy', 0.0)),
+                    })
 
                 # Temporal smoothing
                 _t = _time.time()
@@ -4873,21 +10517,27 @@ class VideoAnalysis:
 
                 if smoothed:
                     # Aggregate: pick most frequent smoothed label, average probs
-                    label_counts = {}
-                    avg_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
+                    posture_classes = [c for c in self._LABEL_L2_CLASSES if c in set(p_classes)]
+                    avg_probs = {c: 0.0 for c in posture_classes}
                     for s in smoothed:
-                        lbl = s['label']
-                        label_counts[lbl] = label_counts.get(lbl, 0) + 1
-                        for c in self._LABEL_L2_CLASSES:
+                        for c in posture_classes:
                             avg_probs[c] += s['probs'].get(c, 0.0)
-                    posture_label = max(label_counts, key=label_counts.get)
                     avg_probs = {c: v / len(smoothed) for c, v in avg_probs.items()}
                     total = sum(avg_probs.values())
                     if total > 0:
                         avg_probs = {c: v / total for c, v in avg_probs.items()}
-                    posture_probs = avg_probs
+                    posture_label, posture_probs = self._resolve_posture_sequence_label(smoothed, avg_probs)
                     posture_score = posture_probs.get(posture_label, 0.0)
                     _posture_available = True
+
+        # FN-stand-fix: 모델이 실제로 예측하지 않은 경우 기본값 'stand' 대신 빈값
+        if not _posture_available:
+            posture_label = ''
+            posture_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
+            posture_score = 0.0
+
+        # NOTE: posture model does NOT modify final fall decision.
+        # It is used only for explanation / operator context.
 
         # ── Decision arbitration ──
         fall_result_for_arb = {
@@ -4900,7 +10550,7 @@ class VideoAnalysis:
         explain = arbitration['explain']
 
         # Risk level
-        risk_level = 'high' if fall_score >= 0.75 else ('medium' if fall_score >= self._XG_FALL_THRESHOLD else 'low')
+        risk_level = 'high' if fall_score >= _thresholds['high'] else ('medium' if fall_band in ['confirmed', 'suspected'] else 'low')
         risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
 
         # Override: if decision is safe or posture_only, downgrade risk
@@ -4917,6 +10567,8 @@ class VideoAnalysis:
 
         if fall_detected:
             summary_text = f'XG-Dual 분석 결과 낙상 가능성이 높습니다. (상태: {decision_state})'
+        elif fall_band == 'suspected':
+            summary_text = f'XG-Dual 분석 결과 낙상 의심 구간이 있습니다. (상태: {decision_state})'
         elif posture_label == 'fall' and posture_score >= 0.40:
             summary_text = f'자세 분류에서 낙상 가능성이 감지되나 이진 Fall 모델에서 확인되지 않았습니다. (상태: {decision_state})'
         else:
@@ -4945,6 +10597,8 @@ class VideoAnalysis:
             'runtime_inference': {
                 'fall_score': round(fall_score, 4),
                 'fall_detected': fall_detected,
+                'fall_band': fall_band,
+                'thresholds': _thresholds,
                 'max_probability': round(max_prob, 4),
                 'mean_probability': round(mean_prob, 4),
                 'fall_window_ratio': round(fall_ratio, 4),
@@ -5019,6 +10673,1159 @@ class VideoAnalysis:
                 'width': vid_meta.get('width', 0),
                 'height': vid_meta.get('height', 0),
                 'fps': vid_meta.get('fps', 0),
+            },
+        }
+
+    # ── RF-Dual: RF-Pipeline (binary fall) + XG-Posture behavior classifier ──
+
+    def _infer_rf_dual(self, video_path, filename='', analysis_profile='balanced', input_source='upload',
+                        duration_hint=0, realtime_context=None):
+        """Dual-model inference: RF-Pipeline (binary fall) + XG-Posture behavior classifier.
+
+        Uses RF for fast fall detection (13 statistical bbox features) and
+        XG-Posture for posture classification (unified timeseries).
+        Returns combined result in the same format as xg-dual.
+
+        FN-20260413-0003: Single YOLO pass — unified timeseries is extracted once
+        and used for both RF feature derivation and posture classification.
+        FN-20260413-0004: Rolling cache for inter-chunk continuity in realtime mode.
+        """
+        import numpy as np
+        import time as _time
+
+        _perf = {}
+        _t_total = _time.time()
+        _is_realtime = input_source in ('webcam-live', 'webcam', 'realtime')
+        _device_used = self._get_yolo_device()
+
+        # ── Single YOLO pass: extract unified timeseries ──
+        # Upload posture classification needs denser temporal evidence than the
+        # RF fall model. RF features are downsampled after the shared extraction,
+        # while allowing XG-Posture to see gait/sit/lie windows at higher fps.
+        _rf_target_fps = self._RF_TARGET_FPS
+        _posture_target_fps = self._POSTURE_REALTIME_TARGET_FPS if _is_realtime else self._POSTURE_UPLOAD_TARGET_FPS
+        _extract_target_fps = max(_rf_target_fps, _posture_target_fps)
+        _rt_duration_hint = float(duration_hint or 0.0)
+        _rt_expected_frames = int((_rt_duration_hint * _extract_target_fps) + 0.999) if _rt_duration_hint > 0 else 30
+        _rt_cap_frames = int(self._REALTIME_STEADY_CHUNK_SEC * _extract_target_fps)
+        _rf_max_frames = min(max(_rt_expected_frames, 8), max(_rt_cap_frames, 16)) if _is_realtime else None
+        _t = _time.time()
+        ts_result = self._extract_unified_timeseries(
+            video_path, input_source=input_source,
+            duration_hint=duration_hint,
+            target_fps_override=_extract_target_fps,
+            max_frames_override=_rf_max_frames,
+        )
+        _perf.update(ts_result.get('perf', {}))
+        _perf['single_pass_extract'] = round(_time.time() - _t, 3)
+
+        timeseries = ts_result['timeseries']
+        vid_meta = ts_result['vid_meta']
+        total_sampled = ts_result.get('total_sampled', len(timeseries))
+        _decode_warning = ts_result.get('decode_warning')
+        _frame_sampling = ts_result.get('frame_sampling', {})
+        vid_width = vid_meta.get('width', 0)
+        vid_height = vid_meta.get('height', 0)
+        vid_duration = vid_meta.get('duration', 0)
+        orig_fps = vid_meta.get('fps', 0)
+
+        # ── FN-0004: Rolling memory — stitch previous chunk's tail ──
+        _stitched_count = 0
+        if _is_realtime and timeseries:
+            import re as _re
+            cache_map = self.__class__._rt_rolling_cache if isinstance(self.__class__._rt_rolling_cache, dict) else {}
+            now_ts = _time.time()
+            _rt_ctx = realtime_context or {}
+            _session_id = 'rd_' + (str(_rt_ctx.get('session_id', '') or '').strip() or 'default')  # rd_ prefix to avoid xg-dual collision
+            _current_chunk_id = _rt_ctx.get('chunk_id', None)
+            try:
+                _current_chunk_id = int(_current_chunk_id) if _current_chunk_id is not None else None
+            except Exception:
+                _current_chunk_id = None
+            if _current_chunk_id is None:
+                _chunk_match = _re.search(r'chunk_(\d+)', str(filename or ''))
+                _current_chunk_id = int(_chunk_match.group(1)) if _chunk_match else None
+            cache = self._load_rt_session_cache(_session_id) if _session_id else None
+            if cache is None:
+                cache = cache_map.get(_session_id)
+            # Prepend previous chunk's tail if fresh enough (< 8 seconds ago)
+            if cache and _current_chunk_id is not None and (now_ts - cache.get('ts', 0)) < 8.0:
+                _prev_chunk_id = cache.get('chunk_id')
+                prev_tail = cache.get('timeseries_tail', [])
+                if prev_tail and _prev_chunk_id is not None and _current_chunk_id == (_prev_chunk_id + 1):
+                    first_time = timeseries[0]['time_sec']
+                    tail_duration = prev_tail[-1]['time_sec'] - prev_tail[0]['time_sec'] if len(prev_tail) > 1 else 0.5
+                    time_offset = first_time - tail_duration - 0.01
+                    shifted_tail = []
+                    for pt in prev_tail:
+                        shifted = dict(pt)
+                        shifted['time_sec'] = round(time_offset + (pt['time_sec'] - prev_tail[0]['time_sec']), 4)
+                        shifted['bbox'] = dict(pt['bbox'])
+                        if pt.get('keypoints'):
+                            shifted['keypoints'] = [dict(kp) for kp in pt['keypoints']]
+                        shifted['_from_rolling'] = True
+                        shifted_tail.append(shifted)
+                    timeseries = shifted_tail + timeseries
+                    _stitched_count = len(shifted_tail)
+            # Save current chunk's tail for next chunk
+            tail_sec = self.__class__._RT_ROLLING_TAIL_SEC
+            if len(timeseries) >= 2:
+                t_end = timeseries[-1]['time_sec']
+                tail_entries = [e for e in timeseries if e['time_sec'] >= t_end - tail_sec and not e.get('_from_rolling')]
+                if _current_chunk_id is not None:
+                    new_cache = {
+                        'timeseries_tail': tail_entries[-10:],
+                        'chunk_id': _current_chunk_id,
+                        'ts': now_ts,
+                    }
+                    cache_map[_session_id] = new_cache
+                    self.__class__._rt_rolling_cache = cache_map
+                    self._save_rt_session_cache(_session_id, new_cache)
+                else:
+                    cache_map.pop(_session_id, None)
+                    self.__class__._rt_rolling_cache = cache_map
+                    self._clear_rt_session_cache(_session_id)
+            _perf['rolling_stitched'] = _stitched_count
+
+        # ── Step 1: RF fall detection (derived from RF-rate timeseries) ──
+        rf_timeseries = timeseries
+        if _extract_target_fps > _rf_target_fps:
+            rf_timeseries = self._downsample_timeseries_by_fps(timeseries, _rf_target_fps)
+        rf_total_sampled = len([e for e in rf_timeseries if not e.get('_from_rolling')]) or len(rf_timeseries) or total_sampled
+        _t = _time.time()
+        rf_model = self._get_rf_model()
+        rf_derived = self._compute_rf_features_from_timeseries(rf_timeseries, vid_meta, rf_total_sampled)
+        feat = rf_derived['feat']
+        feat_df = rf_derived['feat_df']
+        _det_count = rf_derived['det_count']
+        _perf['rf_feature_derive'] = round(_time.time() - _t, 3)
+
+        # RF prediction. The legacy 13-feature model stays as a fallback; the
+        # occlusion-aware v2 model becomes the active fall classifier when present.
+        _t = _time.time()
+        _legacy_input = feat_df.to_numpy(dtype=float)
+        pred = int(rf_model.predict(_legacy_input)[0])
+        fall_prob = None
+        if hasattr(rf_model, 'predict_proba'):
+            proba = rf_model.predict_proba(_legacy_input)[0]
+            classes = list(rf_model.classes_)
+            prob_map = {int(c): float(p) for c, p in zip(classes, proba)}
+            fall_prob = prob_map.get(1, 0.0)
+        fall_score = fall_prob if fall_prob is not None else float(pred)
+        _legacy_fall_prob = float(fall_score)
+        _legacy_pred = int(pred)
+        _fall_model_version = 'rf-legacy-13'
+        _fall_model_path = self._rf_active_model_path()
+        _v2_info = {
+            'available': False,
+            'used': False,
+            'probability': None,
+            'thresholds': {},
+            'features': {},
+            'error': '',
+        }
+        _v2_confirm_threshold = None
+        _v2_suspect_threshold = None
+        if self._rf_fall_v2_available():
+            try:
+                _v2_bundle = self._get_rf_fall_v2_model()
+                _v2_model = _v2_bundle.get('model') if isinstance(_v2_bundle, dict) else _v2_bundle
+                _v2_cols = _v2_bundle.get('feature_cols', self._RF_FALL_V2_FEATURE_COLUMNS) if isinstance(_v2_bundle, dict) else self._RF_FALL_V2_FEATURE_COLUMNS
+                _v2_thresholds = _v2_bundle.get('thresholds', {}) if isinstance(_v2_bundle, dict) else {}
+                _v2_confirm_threshold = float(_v2_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold())
+                _v2_suspect_threshold = float(_v2_thresholds.get('suspect', max(0.10, _v2_confirm_threshold - 0.12)) or max(0.10, _v2_confirm_threshold - 0.12))
+                _v2_derived = self._compute_rf_fall_v2_features_from_timeseries(timeseries, vid_meta, total_sampled)
+                _v2_feat = _v2_derived['feat']
+                _v2_feat_df = _v2_derived['feat_df'].reindex(columns=_v2_cols, fill_value=0.0)
+                _v2_input = _v2_feat_df.to_numpy(dtype=float)
+                _v2_pred = int(_v2_model.predict(_v2_input)[0])
+                _v2_prob = float(_v2_pred)
+                if hasattr(_v2_model, 'predict_proba'):
+                    _v2_proba = _v2_model.predict_proba(_v2_input)[0]
+                    _v2_classes = list(_v2_model.classes_)
+                    _v2_prob_map = {int(c): float(p) for c, p in zip(_v2_classes, _v2_proba)}
+                    _v2_prob = _v2_prob_map.get(1, 0.0)
+                pred = _v2_pred
+                fall_prob = _v2_prob
+                fall_score = _v2_prob
+                _fall_model_version = 'rf-fall-v2'
+                _fall_model_path = self._rf_fall_v2_model_path()
+                _v2_info = {
+                    'available': True,
+                    'used': True,
+                    'probability': round(_v2_prob, 4),
+                    'thresholds': {
+                        'confirm': round(_v2_confirm_threshold, 4),
+                        'suspect': round(_v2_suspect_threshold, 4),
+                    },
+                    'features': {
+                        'fall_kinematic_score': round(float(_v2_feat.get('fall_kinematic_score', 0.0) or 0.0), 4),
+                        'occlusion_fall_risk': round(float(_v2_feat.get('occlusion_fall_risk', 0.0) or 0.0), 4),
+                        'center_y_drop_ratio': round(float(_v2_feat.get('center_y_drop_ratio', 0.0) or 0.0), 4),
+                        'lower_body_visibility': round(float(_v2_feat.get('lower_body_visibility', 0.0) or 0.0), 4),
+                        'torso_tilt_max': round(float(_v2_feat.get('torso_tilt_max', 0.0) or 0.0), 4),
+                        'floor_contact_ratio': round(float(_v2_feat.get('floor_contact_ratio', 0.0) or 0.0), 4),
+                    },
+                    'error': '',
+                }
+            except Exception as _v2e:
+                _perf['rf_fall_v2_error'] = str(_v2e)
+                _v2_info['available'] = True
+                _v2_info['error'] = str(_v2e)
+        _perf['rf_predict'] = round(_time.time() - _t, 3)
+
+        # Short-clip detection
+        _n_det_frames = int(feat.get('n_frames', 0))
+        _is_short_clip = _n_det_frames < self._SHORT_CLIP_N_FRAMES
+        _confidence_level = 'high'
+        if _n_det_frames < self._SHORT_CLIP_MIN_FRAMES:
+            _confidence_level = 'insufficient'
+
+        # Adaptive threshold (same as rf-pipeline)
+        _rf_confirm_threshold = _v2_confirm_threshold if _v2_confirm_threshold is not None else self._rf_confirm_threshold()
+        _short_clip_threshold_max = max(_rf_confirm_threshold + 0.12, 0.60) if _fall_model_version == 'rf-fall-v2' else self._rf_short_clip_threshold_max()
+        _effective_threshold = _rf_confirm_threshold
+        if _is_short_clip and _n_det_frames >= self._SHORT_CLIP_MIN_FRAMES:
+            _range = self._SHORT_CLIP_N_FRAMES - self._SHORT_CLIP_MIN_FRAMES
+            _ratio = (_n_det_frames - self._SHORT_CLIP_MIN_FRAMES) / max(_range, 1)
+            _effective_threshold = _short_clip_threshold_max - _ratio * (_short_clip_threshold_max - _rf_confirm_threshold)
+            _confidence_level = 'medium' if _n_det_frames >= 5 else 'low'
+        if _is_realtime and _fall_model_version == 'rf-fall-v2':
+            _effective_threshold = max(_effective_threshold, 0.62)
+
+        fall_detected = fall_score >= _effective_threshold
+
+        # Motion guard (reuse same logic as rf-pipeline)
+        _mg_mul = 0.7 if _is_short_clip else 1.0
+        _motion_checks = {
+            'delta_y_mean': feat.get('delta_y_mean', 0) < 5.0 * _mg_mul,
+            'delta_y_max': feat.get('delta_y_max', 0) < 12.0 * _mg_mul,
+            'delta_height_mean': feat.get('delta_height_mean', 0) < 5.0 * _mg_mul,
+            'delta_width_mean': feat.get('delta_width_mean', 0) < 3.0 * _mg_mul,
+            'delta_area_mean': feat.get('delta_area_mean', 0) < 150.0 * _mg_mul,
+            'center_y_std': feat.get('center_y_std', 0) < 10.0 * _mg_mul,
+            'height_std': feat.get('height_std', 0) < 8.0 * _mg_mul,
+        }
+        _is_stationary = all(_motion_checks.values())
+        _motion_guard_applied = False
+        _suppressed_by = []
+        _stationary_guard_override = False
+
+        if _is_stationary and fall_detected:
+            _fhr_stationary = feat.get('final_height_ratio', 1.0)
+            _dym_stationary = feat.get('delta_y_max', 0)
+            _accel_stationary = feat.get('delta_y_accel_max', 0)
+            _stationary_guard_override = (
+                fall_score >= max(_effective_threshold + 0.18, 0.55)
+                and (
+                    _fhr_stationary <= 0.42
+                    or _dym_stationary >= 18.0
+                    or _accel_stationary >= 10.0
+                )
+            )
+
+        if _is_stationary and fall_detected and not _stationary_guard_override:
+            fall_score = min(fall_score, 0.10)
+            fall_detected = False
+            pred = 0
+            _motion_guard_applied = True
+        elif _is_realtime and fall_detected and fall_score < 0.85:
+            _fhr = feat.get('final_height_ratio', 1.0)
+            _dym = feat.get('delta_y_max', 0)
+            _cys = feat.get('center_y_std', 0)
+            _v2_guard_features = _v2_info.get('features') or {}
+            _v2_guard_kinematic = float(_v2_guard_features.get('fall_kinematic_score', 0.0) or 0.0)
+            _v2_guard_center_drop = float(_v2_guard_features.get('center_y_drop_ratio', 0.0) or 0.0)
+            _v2_guard_tilt = float(_v2_guard_features.get('torso_tilt_max', 0.0) or 0.0)
+            _v2_guard_floor = float(_v2_guard_features.get('floor_contact_ratio', 0.0) or 0.0)
+            _v2_guard_fall_evidence = (
+                _fall_model_version == 'rf-fall-v2'
+                and (
+                    (_v2_guard_kinematic >= 0.58 and (_v2_guard_center_drop >= 0.30 or _v2_guard_tilt >= 42.0 or _v2_guard_floor >= 0.20))
+                    or (_v2_guard_center_drop >= 0.40 and _v2_guard_tilt >= 42.0)
+                    or (_v2_guard_tilt >= 58.0 and _v2_guard_floor >= 0.22)
+                )
+            )
+            if _fhr > 0.48 and _dym < 28.0 and _cys < 32.0 and not _v2_guard_fall_evidence:
+                fall_score = min(fall_score, 0.25)
+                fall_detected = False
+                pred = 0
+                _motion_guard_applied = True
+            elif _v2_guard_fall_evidence:
+                _suppressed_by.append('realtime_motion_guard_bypassed_by_v2_evidence')
+        elif fall_detected and fall_score < 0.72:
+            _dym2 = feat.get('delta_y_max', 0)
+            _fhr2 = feat.get('final_height_ratio', 1.0)
+            _accel = feat.get('delta_y_accel_max', 0)
+            _height_std2 = feat.get('height_std', 0)
+            # FP-fix: score threshold raised 0.55→0.62 so moderate RF scores don't bypass
+            # FP-fix: height_std alone no longer sufficient — must also have real downward motion (dym>=15)
+            _guard_soft_override = (
+                fall_score >= max(_effective_threshold + 0.20, 0.62)
+            ) or (
+                _height_std2 >= 45.0 and _dym2 >= 15.0
+            )
+            if _dym2 < 28.0 and _fhr2 > 0.52 and _accel < 13.0 and not _guard_soft_override:
+                fall_score = min(fall_score, 0.40)
+                fall_detected = False
+                pred = 0
+                _motion_guard_applied = True
+
+        # FP-fix: fhr_rise_suppressor — bbox height INCREASED vs initial → non-fall natural posture
+        # Real falls almost always end with a smaller/lower bbox; fhr > 1.08 is strong non-fall evidence.
+        if (
+            fall_detected and not _motion_guard_applied
+            and feat.get('final_height_ratio', 1.0) > 1.08
+            and fall_score < 0.65
+        ):
+            fall_score = min(fall_score, 0.38)
+            fall_detected = False
+            pred = 0
+            _suppressed_by.append('fhr_rise_suppressor')
+
+        if _motion_guard_applied:
+            _suppressed_by.append('motion_guard')
+        if _confidence_level == 'insufficient':
+            fall_detected = False
+            pred = 0
+            fall_score = min(fall_score, 0.10)
+            _suppressed_by.append('insufficient_data')
+
+        # ── Step 2: XG-Posture behavior classification from shared timeseries ──
+        posture_label = 'stand'
+        posture_score = 0.0
+        posture_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
+        posture_probs['stand'] = 1.0
+        posture_raw_label = 'stand'
+        posture_raw_score = 0.0
+        posture_raw_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
+        posture_raw_probs['stand'] = 1.0
+        posture_candidate_label = 'stand'
+        posture_candidate_probs = {c: 0.0 for c in self._LABEL_L2_CLASSES}
+        posture_candidate_probs['stand'] = 1.0
+        _posture_probs_source = 'default'
+        _posture_available = False
+        _posture_windows_count = 0
+        _posture_avg_conf = 0.0
+        _posture_lower_body_visibility = 0.0
+        _posture_body_width_score = 0.0
+        _posture_vertical_occlusion_risk = False
+        _occlusion_confidence_damp = False
+        _posture_calibration = {'applied': False}
+        _posture_occlusion_aux = {
+            'available': self._xg_posture_occlusion_aux_available(),
+            'triggered': False,
+            'used': False,
+        }
+        posture_windows = []
+
+        if self._xg_posture_available() and len(timeseries) >= 2:
+            try:
+                _posture_win_sec = 1.25 if _is_realtime else 1.5
+                _posture_stride_sec = 1.0 if _is_realtime else 0.5
+                _t = _time.time()
+                posture_windows = self._build_xg_feature_windows(timeseries, vid_meta, window_sec=_posture_win_sec, stride_sec=_posture_stride_sec)
+                _perf['posture_window_build'] = round(_time.time() - _t, 3)
+                _posture_windows_count = len(posture_windows)
+
+                if len(posture_windows) > 0:
+                    _posture_avg_conf = float(np.mean([float(w.get('avg_conf', 0.0) or 0.0) for w in posture_windows]))
+                    _posture_lower_body_visibility = float(np.mean([float(w.get('lower_body_visibility', 0.0) or 0.0) for w in posture_windows]))
+                    _posture_body_width_score = float(np.mean([
+                        (
+                            float(w.get('shoulder_width', 0.0) or 0.0)
+                            + float(w.get('hip_width', 0.0) or 0.0)
+                            + float(w.get('wrist_width', 0.0) or 0.0)
+                            + float(w.get('knee_width', 0.0) or 0.0)
+                            + float(w.get('ankle_width', 0.0) or 0.0)
+                        ) / 5.0
+                        for w in posture_windows
+                    ]))
+                    _posture_vertical_occlusion_risk = bool(
+                        _posture_avg_conf < 0.62
+                        and _posture_body_width_score < 0.055
+                        and _posture_lower_body_visibility >= 0.18
+                    )
+                    posture_bundle = self._get_xg_posture_model()
+                    p_model = posture_bundle.get('model') if isinstance(posture_bundle, dict) else posture_bundle
+                    p_classes = posture_bundle.get('classes', self._LABEL_L2_CLASSES) if isinstance(posture_bundle, dict) else self._LABEL_L2_CLASSES
+                    p_feat_cols = posture_bundle.get('feature_cols', self._XG_FEATURE_COLUMNS) if isinstance(posture_bundle, dict) else self._XG_FEATURE_COLUMNS
+
+                    X_posture = np.array([[w.get(col, 0.0) for col in p_feat_cols] for w in posture_windows])
+                    X_posture = np.nan_to_num(X_posture, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    _t = _time.time()
+                    if hasattr(p_model, 'predict_proba'):
+                        raw_probs = p_model.predict_proba(X_posture)
+                    else:
+                        raw_preds = p_model.predict(X_posture)
+                        raw_probs = np.zeros((len(raw_preds), len(p_classes)))
+                        for i, p_val in enumerate(raw_preds):
+                            idx = list(p_classes).index(p_val) if p_val in p_classes else 0
+                            raw_probs[i, idx] = 1.0
+                    _perf['posture_predict'] = round(_time.time() - _t, 3)
+
+                    raw_probs = self._posture_heuristic_boost(raw_probs, posture_windows, p_classes)
+
+                    pw_list = []
+                    for wi in range(len(posture_windows)):
+                        probs_dict = {c: float(raw_probs[wi, ci]) for ci, c in enumerate(p_classes)}
+                        lbl = p_classes[int(np.argmax(raw_probs[wi]))]
+                        pw_list.append({
+                            'label': lbl,
+                            'probs': probs_dict,
+                            'center_x_span': float(posture_windows[wi].get('center_x_span', 0.0)),
+                            'center_dx_abs_mean': float(posture_windows[wi].get('center_dx_abs_mean', 0.0)),
+                            'vert_horiz_ratio': float(posture_windows[wi].get('vert_horiz_ratio', 0.0)),
+                            'speed_std': float(posture_windows[wi].get('speed_std', 0.0)),
+                            'avg_conf': float(posture_windows[wi].get('avg_conf', 0.0)),
+                            'lower_body_visibility': float(posture_windows[wi].get('lower_body_visibility', 0.0)),
+                            'lie_geometry_score': float(posture_windows[wi].get('lie_geometry_score', 0.0)),
+                            'flatness_score': float(posture_windows[wi].get('flatness_score', 0.0)),
+                            'upright_geometry_score': float(posture_windows[wi].get('upright_geometry_score', 0.0)),
+                            'sit_geometry_score': float(posture_windows[wi].get('sit_geometry_score', 0.0)),
+                            'low_height_floor_score': float(posture_windows[wi].get('low_height_floor_score', 0.0)),
+                            'floor_height_ratio': float(posture_windows[wi].get('floor_height_ratio', 0.0)),
+                            'horizontal_pose_score': float(posture_windows[wi].get('horizontal_pose_score', 0.0)),
+                            'lie_stand_separation_score': float(posture_windows[wi].get('lie_stand_separation_score', 0.0)),
+                            'pose_spread_max': float(posture_windows[wi].get('pose_spread_max', 0.0)),
+                            'apparent_depth_score': float(posture_windows[wi].get('apparent_depth_score', 0.0)),
+                            'horizontal_flat_pose_score': float(posture_windows[wi].get('horizontal_flat_pose_score', 0.0)),
+                            'low_flat_still_score': float(posture_windows[wi].get('low_flat_still_score', 0.0)),
+                            'sit_lie_depth_contrast': float(posture_windows[wi].get('sit_lie_depth_contrast', 0.0)),
+                            'width_height_volume_proxy': float(posture_windows[wi].get('width_height_volume_proxy', 0.0)),
+                        })
+
+                    _t = _time.time()
+                    smoothed = self._smooth_posture_sequence(
+                        pw_list,
+                        window_size=3 if _is_realtime else 5,
+                        ema_alpha=0.45 if _is_realtime else 0.3,
+                    )
+                    _perf['posture_smooth'] = round(_time.time() - _t, 3)
+
+                    if smoothed:
+                        posture_classes = [c for c in self._LABEL_L2_CLASSES if c in set(p_classes)]
+                        avg_probs = {c: 0.0 for c in posture_classes}
+                        for s in smoothed:
+                            for c in posture_classes:
+                                avg_probs[c] += s['probs'].get(c, 0.0)
+                        avg_probs = {c: v / len(smoothed) for c, v in avg_probs.items()}
+                        total_p = sum(avg_probs.values())
+                        if total_p > 0:
+                            avg_probs = {c: v / total_p for c, v in avg_probs.items()}
+                        posture_candidate_label, posture_candidate_probs = self._resolve_posture_sequence_label(smoothed, avg_probs)
+                        posture_candidate_probs = {k: float(v or 0.0) for k, v in posture_candidate_probs.items()}
+                        posture_raw_label, posture_raw_probs = posture_candidate_label, dict(posture_candidate_probs)
+                        posture_raw_label, posture_raw_probs, _posture_calibration = self._runtime_posture_calibration(
+                            posture_raw_label, posture_raw_probs, posture_windows, p_classes, is_realtime=_is_realtime
+                        )
+                        _posture_probs_source = 'calibrated'
+                        posture_raw_score = posture_raw_probs.get(posture_raw_label, 0.0)
+                        _posture_available = True
+            except Exception as _pe:
+                _perf['posture_error'] = str(_pe)
+
+        if len(posture_windows) > 0 and self._xg_posture_occlusion_aux_available():
+            _safe_aux_classes = ('stand', 'walk', 'run', 'sit', 'lie')
+            _current_ranked_for_aux = sorted(
+                [(k, float(posture_raw_probs.get(k, 0.0) or 0.0)) for k in _safe_aux_classes],
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            _current_margin_for_aux = (
+                _current_ranked_for_aux[0][1] - _current_ranked_for_aux[1][1]
+                if len(_current_ranked_for_aux) >= 2 else 0.0
+            )
+            _aux_trigger = (
+                not _posture_available
+                or posture_raw_label == 'unknown'
+                or _posture_avg_conf < 0.38
+                or _posture_lower_body_visibility < 0.42
+                or _posture_vertical_occlusion_risk
+                or _current_margin_for_aux < 0.07
+            )
+            _posture_occlusion_aux.update({
+                'triggered': bool(_aux_trigger),
+                'current_label': posture_raw_label,
+                'current_score': round(float(posture_raw_score or 0.0), 4),
+                'current_margin': round(float(_current_margin_for_aux or 0.0), 4),
+                'avg_conf': round(float(_posture_avg_conf or 0.0), 4),
+                'lower_body_visibility': round(float(_posture_lower_body_visibility or 0.0), 4),
+                'body_width_score': round(float(_posture_body_width_score or 0.0), 4),
+                'vertical_occlusion_risk': bool(_posture_vertical_occlusion_risk),
+            })
+            if _aux_trigger:
+                try:
+                    _t = _time.time()
+                    aux_bundle = self._get_xg_posture_occlusion_aux_model()
+                    aux_model = aux_bundle.get('model') if isinstance(aux_bundle, dict) else aux_bundle
+                    aux_classes = aux_bundle.get('classes', self._LABEL_L2_CLASSES) if isinstance(aux_bundle, dict) else self._LABEL_L2_CLASSES
+                    aux_feat_cols = aux_bundle.get('feature_cols', self._XG_FEATURE_COLUMNS) if isinstance(aux_bundle, dict) else self._XG_FEATURE_COLUMNS
+                    X_aux = np.array([[w.get(col, 0.0) for col in aux_feat_cols] for w in posture_windows])
+                    X_aux = np.nan_to_num(X_aux, nan=0.0, posinf=0.0, neginf=0.0)
+                    if hasattr(aux_model, 'predict_proba'):
+                        aux_raw_probs = aux_model.predict_proba(X_aux)
+                    else:
+                        aux_preds = aux_model.predict(X_aux)
+                        aux_raw_probs = np.zeros((len(aux_preds), len(aux_classes)))
+                        for i, aux_pred in enumerate(aux_preds):
+                            idx = list(aux_classes).index(aux_pred) if aux_pred in aux_classes else 0
+                            aux_raw_probs[i, idx] = 1.0
+                    aux_raw_probs = self._posture_heuristic_boost(aux_raw_probs, posture_windows, aux_classes)
+                    aux_avg_probs = {c: 0.0 for c in _safe_aux_classes}
+                    for ci, cls in enumerate(aux_classes):
+                        if cls in aux_avg_probs:
+                            aux_avg_probs[cls] = float(np.mean(aux_raw_probs[:, ci]))
+                    aux_total = sum(aux_avg_probs.values())
+                    if aux_total > 0:
+                        aux_avg_probs = {k: v / aux_total for k, v in aux_avg_probs.items()}
+                    aux_ranked = sorted(aux_avg_probs.items(), key=lambda kv: kv[1], reverse=True)
+                    aux_label = aux_ranked[0][0] if aux_ranked else 'stand'
+                    aux_score = float(aux_ranked[0][1]) if aux_ranked else 0.0
+                    aux_margin = float(aux_ranked[0][1] - aux_ranked[1][1]) if len(aux_ranked) >= 2 else aux_score
+                    _avg_upright = float(np.mean([float(w.get('upright_geometry_score', 0.0) or 0.0) for w in posture_windows]))
+                    _avg_lie_geom = float(np.mean([float(w.get('lie_geometry_score', 0.0) or 0.0) for w in posture_windows]))
+                    _avg_flat = float(np.mean([float(w.get('flatness_score', 0.0) or 0.0) for w in posture_windows]))
+                    _avg_center_span = float(np.mean([float(w.get('center_x_span', 0.0) or 0.0) for w in posture_windows]))
+                    _avg_center_dx = float(np.mean([float(w.get('center_dx_abs_mean', 0.0) or 0.0) for w in posture_windows]))
+                    _reject_reason = ''
+                    _aux_accept = (
+                        aux_label in _safe_aux_classes
+                        and (
+                            not _posture_available
+                            or posture_raw_label == 'unknown'
+                            or aux_score >= float(posture_raw_score or 0.0) + 0.06
+                            or (_current_margin_for_aux < 0.07 and aux_score >= 0.28)
+                            or (_posture_lower_body_visibility < 0.30 and aux_score >= 0.24 and aux_margin >= 0.02)
+                            or (_posture_vertical_occlusion_risk and aux_score >= 0.24 and aux_margin >= 0.02)
+                        )
+                    )
+                    if aux_label == 'lie' and _avg_lie_geom < max(0.42, _avg_upright + 0.10) and _avg_flat < 0.55:
+                        _aux_accept = False
+                        _reject_reason = 'lie_geometry_not_enough'
+                    if aux_label == 'walk' and _avg_center_span < 0.035 and _avg_center_dx < 0.010:
+                        _aux_accept = False
+                        _reject_reason = 'walk_motion_not_enough'
+                    if aux_label == 'run' and _avg_center_span < 0.045 and _avg_center_dx < 0.016:
+                        _aux_accept = False
+                        _reject_reason = 'run_motion_not_enough'
+                    if _aux_accept:
+                        current_safe = {c: float(posture_raw_probs.get(c, 0.0) or 0.0) for c in _safe_aux_classes}
+                        current_total = sum(current_safe.values())
+                        if current_total > 0:
+                            current_safe = {k: v / current_total for k, v in current_safe.items()}
+                        blend_aux_weight = 0.72 if (not _posture_available or posture_raw_label == 'unknown' or _posture_lower_body_visibility < 0.30 or _posture_vertical_occlusion_risk) else 0.58
+                        blended = {
+                            c: (current_safe.get(c, 0.0) * (1.0 - blend_aux_weight) + aux_avg_probs.get(c, 0.0) * blend_aux_weight)
+                            for c in _safe_aux_classes
+                        }
+                        blended_total = sum(blended.values())
+                        if blended_total > 0:
+                            blended = {k: v / blended_total for k, v in blended.items()}
+                        posture_raw_probs = blended
+                        posture_raw_label = max(blended, key=blended.get)
+                        posture_raw_score = float(posture_raw_probs.get(posture_raw_label, 0.0) or 0.0)
+                        _posture_available = True
+                        _posture_probs_source = str(_posture_probs_source or 'calibrated') + '|occlusion_aux'
+                        _posture_calibration = dict(_posture_calibration or {})
+                        _posture_calibration.update({
+                            'applied': True,
+                            'occlusion_aux_used': True,
+                            'occlusion_aux_label': aux_label,
+                            'occlusion_aux_score': round(aux_score, 4),
+                            'occlusion_aux_margin': round(aux_margin, 4),
+                            'reason': str(_posture_calibration.get('reason') or 'occlusion_aux_blend'),
+                            'description': '가림 또는 마진 저하가 감지되어 가림 보조 모델을 조건부로 블렌딩했습니다.',
+                        })
+                    _posture_occlusion_aux.update({
+                        'used': bool(_aux_accept),
+                        'label': aux_label,
+                        'score': round(aux_score, 4),
+                        'margin': round(aux_margin, 4),
+                        'reject_reason': _reject_reason,
+                        'probs': {k: round(float(v or 0.0), 4) for k, v in aux_avg_probs.items()},
+                        'geometry': {
+                            'upright': round(_avg_upright, 4),
+                            'lie': round(_avg_lie_geom, 4),
+                            'flatness': round(_avg_flat, 4),
+                            'center_x_span': round(_avg_center_span, 4),
+                            'center_dx_abs_mean': round(_avg_center_dx, 4),
+                            'body_width_score': round(float(_posture_body_width_score or 0.0), 4),
+                        },
+                    })
+                    _perf['posture_occlusion_aux_predict'] = round(_time.time() - _t, 3)
+                except Exception as _aux_e:
+                    _posture_occlusion_aux.update({'error': str(_aux_e)})
+
+        if _is_realtime and (posture_raw_label == 'unknown' or not _posture_available):
+            _upper_fallback = self._realtime_upper_body_posture_estimate(
+                posture_windows,
+                rf_feat=feat,
+                classes=('stand', 'walk', 'run', 'sit', 'lie'),
+            )
+            _fallback_label = _upper_fallback.get('label', '')
+            if _fallback_label:
+                posture_raw_label = _fallback_label
+                posture_raw_probs = _upper_fallback.get('probs', posture_raw_probs)
+                posture_raw_score = float(posture_raw_probs.get(posture_raw_label, 0.0) or 0.0)
+                _posture_available = True
+                _posture_calibration = _upper_fallback.get('diagnostics', _posture_calibration)
+                _posture_probs_source = str((_posture_calibration or {}).get('reason', 'upper_body_estimate') or 'upper_body_estimate')
+                _posture_avg_conf = float((_posture_calibration or {}).get('avg_conf', _posture_avg_conf) or 0.0)
+                _posture_lower_body_visibility = float((_posture_calibration or {}).get('lower_body_visibility', _posture_lower_body_visibility) or 0.0)
+
+        # RF-Dual policy: posture model is behavior-only (5-class non-fall).
+        # Fall-specific decisions come from the RF binary layer and motion guards.
+        _safe_posture_keys = ('stand', 'walk', 'run', 'sit', 'lie')
+        _safe_posture_total = 0.0
+        posture_probs = {}
+        _display_posture_probs = posture_raw_probs
+        if posture_raw_label == 'unknown':
+            _candidate_total = sum(float(posture_candidate_probs.get(_cls, 0.0) or 0.0) for _cls in _safe_posture_keys)
+            if _candidate_total > 0:
+                _display_posture_probs = posture_candidate_probs
+                _posture_probs_source = 'candidate_when_unknown'
+        for _cls in _safe_posture_keys:
+            _prob = float(_display_posture_probs.get(_cls, 0.0) or 0.0)
+            posture_probs[_cls] = _prob
+            _safe_posture_total += _prob
+        if _safe_posture_total > 0:
+            posture_probs = {k: (v / _safe_posture_total) for k, v in posture_probs.items()}
+        else:
+            posture_probs = {k: 0.0 for k in _safe_posture_keys}
+            posture_probs['stand'] = 1.0
+            _posture_probs_source = 'default_stand'
+        if posture_raw_label == 'unknown':
+            posture_label = 'unknown'
+            posture_score = max(posture_probs.values()) if posture_probs else 0.0
+        else:
+            posture_label = max(posture_probs, key=posture_probs.get) if len(posture_probs) > 0 else 'stand'
+            posture_score = float(posture_probs.get(posture_label, 0.0) or 0.0)
+        _posture_ranked = sorted(posture_probs.items(), key=lambda kv: kv[1], reverse=True)
+        _posture_margin = 0.0
+        if len(_posture_ranked) >= 2:
+            _posture_margin = float(_posture_ranked[0][1] - _posture_ranked[1][1])
+
+        # FN-stand-fix: 모델이 실제로 예측하지 않은 경우 기본값 'stand' 대신 빈값
+        _realtime_provisional_behavior = False
+        if not _posture_available:
+            if _is_realtime:
+                posture_label = 'stand'
+                posture_probs = {'stand': 0.46, 'walk': 0.135, 'run': 0.135, 'sit': 0.135, 'lie': 0.135}
+                posture_score = 0.46
+                _posture_margin = 0.325
+                _posture_probs_source = 'realtime_no_pose_default'
+                _posture_available = True
+                _realtime_provisional_behavior = True
+                _posture_calibration = {
+                    'applied': True,
+                    'reason': 'realtime_no_pose_default',
+                    'description': '실시간 청크에서 자세 모델 근거가 부족해 미확인 대신 기본 직립 행동으로 표시했습니다.',
+                    'provisional_behavior': True,
+                }
+            else:
+                posture_label = ''
+                posture_probs = {k: 0.0 for k in _safe_posture_keys}
+                posture_score = 0.0
+                _posture_margin = 0.0
+                _posture_probs_source = 'not_available'
+
+        if _is_realtime and _posture_available and posture_label == 'unknown':
+            _candidate_ranked = sorted(
+                [(k, float(v or 0.0)) for k, v in posture_probs.items() if k in _safe_posture_keys],
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            if _candidate_ranked and _candidate_ranked[0][1] >= 0.18:
+                posture_label = _candidate_ranked[0][0]
+                posture_score = _candidate_ranked[0][1]
+                _posture_margin = (
+                    _candidate_ranked[0][1] - _candidate_ranked[1][1]
+                    if len(_candidate_ranked) >= 2 else _candidate_ranked[0][1]
+                )
+                _realtime_provisional_behavior = True
+                _posture_probs_source = str(_posture_probs_source or 'candidate') + '|realtime_provisional'
+                _posture_calibration = dict(_posture_calibration or {})
+                _posture_calibration.update({
+                    'applied': True,
+                    'reason': str(_posture_calibration.get('reason') or 'realtime_provisional_behavior'),
+                    'provisional_behavior': True,
+                    'description': '실시간 모드에서는 비낙상 청크의 행동 표시를 유지하기 위해 후보 확률 1순위 행동을 임시 채택했습니다.',
+                })
+
+        _occlusion_like = (
+            _posture_available
+            and (
+                _posture_avg_conf < 0.35
+                or _posture_lower_body_visibility < 0.30
+            )
+        )
+        _v2_occlusion_risk = float((_v2_info.get('features') or {}).get('occlusion_fall_risk', 0.0) or 0.0)
+        _v2_fall_kinematic = float((_v2_info.get('features') or {}).get('fall_kinematic_score', 0.0) or 0.0)
+        _occlusion_hold = (
+            _fall_model_version == 'rf-fall-v2'
+            and _v2_suspect_threshold is not None
+            and fall_score >= _v2_suspect_threshold
+            and (_v2_occlusion_risk >= 0.45 or _v2_fall_kinematic >= 0.45)
+        )
+        if _occlusion_like and fall_score < max(_effective_threshold + 0.12, 0.68) and not _occlusion_hold:
+            _occlusion_confidence_damp = True
+            fall_score = max(0.0, fall_score - 0.08)
+            if fall_detected and fall_score < _effective_threshold:
+                fall_detected = False
+                pred = 0
+            _suppressed_by.append('occlusion_confidence_damp')
+        elif _occlusion_hold:
+            _suppressed_by.append('occlusion_fall_risk_hold')
+        _rescue_diag_reason = str((_posture_calibration or {}).get('reason', '') or '')
+        _rescue_diag_standing = float((_posture_calibration or {}).get('standing_skeleton_score', 0.0) or 0.0)
+        _rescue_diag_lying = float((_posture_calibration or {}).get('lying_skeleton_score', 0.0) or 0.0)
+        _rescue_diag_torso_vertical = float((_posture_calibration or {}).get('torso_verticality', 0.0) or 0.0)
+        _rescue_diag_leg_vertical = float((_posture_calibration or {}).get('leg_verticality', 0.0) or 0.0)
+        _rescue_upright_safe = (
+            posture_label in ('stand', 'walk', 'run')
+            and (
+                _rescue_diag_reason in ('runtime_stand_geometry', 'runtime_walk_motion', 'runtime_run_motion')
+                or (
+                    _rescue_diag_standing >= 1.20
+                    and _rescue_diag_lying <= 0.35
+                    and _rescue_diag_torso_vertical >= 0.72
+                    and _rescue_diag_leg_vertical >= 0.70
+                )
+            )
+        )
+        _v2_center_y_drop_ratio = float((_v2_info.get('features') or {}).get('center_y_drop_ratio', 0.0) or 0.0)
+        _v2_torso_tilt_max = float((_v2_info.get('features') or {}).get('torso_tilt_max', 0.0) or 0.0)
+        _realtime_v2_fall_evidence = (
+            _is_realtime
+            and (
+                (_v2_fall_kinematic >= 0.50 and _v2_center_y_drop_ratio >= 0.32)
+                or (_v2_torso_tilt_max >= 50.0 and _v2_center_y_drop_ratio >= 0.30)
+                or (_v2_occlusion_risk >= 0.52 and _v2_fall_kinematic >= 0.45)
+            )
+        )
+        if (
+            not fall_detected
+            and _fall_model_version == 'rf-fall-v2'
+            and _v2_suspect_threshold is not None
+            and fall_score >= _v2_suspect_threshold
+            and not _rescue_upright_safe
+            and (
+                _v2_fall_kinematic >= 0.58
+                or _v2_occlusion_risk >= 0.62
+                or _v2_center_y_drop_ratio >= 0.55
+                or _realtime_v2_fall_evidence
+            )
+        ):
+            fall_detected = True
+            pred = 1
+            _confidence_level = 'medium' if _confidence_level == 'high' else _confidence_level
+            _suppressed_by.append('v2_suspect_evidence_rescue')
+        elif _rescue_upright_safe and fall_score >= (_v2_suspect_threshold or 1.0) and not fall_detected:
+            _suppressed_by.append('upright_rescue_block')
+
+        _realtime_active_nonfall = (
+            _is_realtime
+            and fall_detected
+            and fall_score < 0.75
+            and _posture_available
+            and posture_label in ('walk', 'run')
+            and _rescue_diag_reason in ('runtime_walk_motion', 'runtime_run_motion')
+            and _v2_center_y_drop_ratio < 0.25
+            and _v2_torso_tilt_max < 35.0
+            and float((_v2_info.get('features') or {}).get('floor_contact_ratio', 0.0) or 0.0) < 0.15
+            and _v2_occlusion_risk < 0.45
+            and float(feat.get('final_height_ratio', 1.0) or 1.0) > 0.72
+        )
+        if _realtime_active_nonfall:
+            fall_score = min(fall_score, 0.30)
+            fall_detected = False
+            pred = 0
+            _suppressed_by.append('realtime_active_motion_suppressor')
+
+        _posture_fall_prob = float(posture_raw_probs.get('fall', 0.0) or 0.0)
+        _realtime_upper_body_nonfall_veto = (
+            _is_realtime
+            and fall_detected
+            and fall_score < 0.75
+            and _posture_available
+            and posture_label in ('stand', 'walk', 'run')
+            and posture_score >= 0.50
+            and str((_posture_calibration or {}).get('reason', '') or '').startswith('upper_body_')
+            and _v2_center_y_drop_ratio < 0.12
+            and _v2_fall_kinematic < 0.46
+            and _posture_fall_prob <= 0.10
+        )
+        if _realtime_upper_body_nonfall_veto:
+            fall_score = min(fall_score, 0.30)
+            fall_detected = False
+            pred = 0
+            _suppressed_by.append('upper_body_nonfall_veto')
+
+        # ── Final decision split: RF decides fall, posture is accepted only on non-fall ──
+        _safe_posture_label = posture_label
+        _safe_posture_prob = posture_score
+        _fhr_posture = float(feat.get('final_height_ratio', 1.0) or 1.0)
+        _dym_posture = float(feat.get('delta_y_max', 0.0) or 0.0)
+        _cys_posture = float(feat.get('center_y_std', 0.0) or 0.0)
+        _posture_safe_veto = False
+        # FP-fix: posture can veto only "suspected" falls, not confirmed falls.
+        # This prevents sit/stand/walk stillness from surfacing as fall when RF bbox jitter is high.
+        if fall_detected and fall_score < 0.75 and _posture_available and _posture_fall_prob <= 0.10:
+            if _safe_posture_label == 'sit':
+                _posture_safe_veto = _safe_posture_prob >= 0.30 and _fhr_posture >= 0.95
+            elif _safe_posture_label in ('stand', 'walk'):
+                _posture_safe_veto = (
+                    _safe_posture_prob >= 0.40
+                    and _fhr_posture >= 1.05
+                    and (_dym_posture <= 25.0 or _cys_posture <= 20.0)
+                )
+            elif _safe_posture_label == 'lie':
+                _posture_safe_veto = (
+                    _safe_posture_prob >= 0.40
+                    and _fhr_posture >= 1.12
+                    and _cys_posture <= 20.0
+                )
+            _v2_center_drop_ratio = float((_v2_info.get('features') or {}).get('center_y_drop_ratio', 0.0) or 0.0)
+            _diag_reason = str((_posture_calibration or {}).get('reason', '') or '')
+            _diag_standing = float((_posture_calibration or {}).get('standing_skeleton_score', 0.0) or 0.0)
+            _diag_lying = float((_posture_calibration or {}).get('lying_skeleton_score', 0.0) or 0.0)
+            _diag_torso_vertical = float((_posture_calibration or {}).get('torso_verticality', 0.0) or 0.0)
+            _diag_leg_vertical = float((_posture_calibration or {}).get('leg_verticality', 0.0) or 0.0)
+            _runtime_upright_safe = (
+                _diag_reason in ('runtime_stand_geometry', 'runtime_walk_motion', 'runtime_run_motion')
+                or (
+                    _diag_standing >= 1.20
+                    and _diag_lying <= 0.35
+                    and _diag_torso_vertical >= 0.72
+                    and _diag_leg_vertical >= 0.70
+                )
+            )
+            if (
+                _fall_model_version == 'rf-fall-v2'
+                and _safe_posture_label in ('stand', 'walk', 'run')
+                and _runtime_upright_safe
+                and fall_score < _effective_threshold
+                and fall_score < 0.75
+                and _v2_fall_kinematic < 0.58
+                and _v2_occlusion_risk < 0.48
+                and _v2_center_drop_ratio < 0.45
+            ):
+                _posture_safe_veto = True
+                _suppressed_by.append('upright_runtime_veto')
+        if _posture_safe_veto:
+            fall_score = min(fall_score, 0.30 if _is_realtime else 0.39)
+            fall_detected = False
+            pred = 0
+            if 'posture_safe_veto' not in _suppressed_by:
+                _suppressed_by.append('posture_safe_veto')
+
+        _realtime_low_fall_evidence_damp = (
+            _is_realtime
+            and fall_detected is False
+            and fall_score > 0.24
+            and _posture_available
+            and posture_label in ('stand', 'walk', 'run', 'sit')
+            and _v2_fall_kinematic < 0.45
+            and _v2_center_y_drop_ratio < 0.25
+            and float(feat.get('delta_y_max', 0.0) or 0.0) < 14.0
+            and float(feat.get('center_y_std', 0.0) or 0.0) < 18.0
+            and float(feat.get('final_height_ratio', 1.0) or 1.0) > 0.70
+            and (
+                _v2_torso_tilt_max < 42.0
+                or str((_posture_calibration or {}).get('reason', '') or '').startswith('upper_body_')
+            )
+        )
+        if _realtime_low_fall_evidence_damp:
+            _nonfall_cap = 0.32 if posture_label in ('walk', 'run') else 0.24
+            if _v2_occlusion_risk >= 0.45:
+                _nonfall_cap = max(_nonfall_cap, 0.30)
+            fall_score = min(fall_score, _nonfall_cap)
+            if 'realtime_low_fall_evidence_damp' not in _suppressed_by:
+                _suppressed_by.append('realtime_low_fall_evidence_damp')
+
+        _facial_state = self._facial_aux_default('not_triggered', '실시간에서는 표정 상태를 주기적으로 분석하고, 낙상 의심 구간에서는 정밀 표정 보조 분석을 실행합니다.')
+        try:
+            _t = _time.time()
+            _facial_state = self._analyze_facial_state_aux(
+                ts_result.get('raw_frames', []),
+                timeseries,
+                vid_meta,
+                fall_score,
+                fall_detected=fall_detected,
+                suspect_threshold=_v2_suspect_threshold,
+                effective_threshold=_effective_threshold,
+                is_realtime=_is_realtime,
+                realtime_context=realtime_context,
+            )
+            _facial_support = float(_facial_state.get('support_score', 0.0) or 0.0)
+            _facial_body_gate = (
+                fall_detected
+                or fall_score >= float(_facial_state.get('trigger_threshold', _v2_suspect_threshold or max(0.15, _effective_threshold - 0.12)) or 0.0)
+                or (
+                    bool(_facial_state.get('near_miss_rescue_candidate'))
+                    and fall_score >= max(0.28, _effective_threshold - 0.14)
+                )
+            )
+            _facial_clear_nonfall_gate = (
+                _rescue_upright_safe
+                or _posture_safe_veto
+                or 'realtime_active_motion_suppressor' in _suppressed_by
+                or (
+                    posture_label in ('stand', 'walk', 'run')
+                    and _v2_fall_kinematic < 0.40
+                    and _v2_center_y_drop_ratio < 0.18
+                    and fall_score < _effective_threshold
+                )
+            )
+            if _facial_support > 0 and _facial_body_gate and not _facial_clear_nonfall_gate:
+                _facial_state['applied'] = True
+                _facial_state['pre_fall_score'] = round(float(fall_score), 4)
+                fall_score = min(0.9999, fall_score + min(_facial_support, self._FACIAL_AUX_SCORE_CAP))
+                _facial_state['post_fall_score'] = round(float(fall_score), 4)
+                if 'facial_state_support' not in _suppressed_by:
+                    _suppressed_by.append('facial_state_support')
+                if not fall_detected and fall_score >= _effective_threshold:
+                    fall_detected = True
+                    pred = 1
+                    _confidence_level = 'medium' if _confidence_level == 'high' else _confidence_level
+            elif _facial_support > 0 and _facial_clear_nonfall_gate:
+                _facial_state['blocked_by'] = 'clear_body_nonfall'
+            _perf['facial_state_aux'] = round(_time.time() - _t, 3)
+        except Exception as _face_e:
+            _facial_state = self._facial_aux_default('error', str(_face_e))
+            _perf['facial_state_aux_error'] = str(_face_e)
+
+        risk_level = 'high' if fall_score >= 0.75 else ('medium' if fall_detected else 'low')
+        risk_label = {'low': '안정', 'medium': '주의', 'high': '고위험'}.get(risk_level, '안정')
+
+        accepted_behavior_classes = ('stand', 'walk', 'run', 'sit', 'lie')
+        behavior_label_map = {
+            'fall': '낙상', 'stand': '서기', 'walk': '걷기', 'run': '뛰기',
+            'sit': '앉기', 'lie': '눕기', 'non-fall': '비낙상',
+        }
+
+        _posture_accept_threshold = 0.30 if _is_realtime else 0.25
+        _posture_margin_threshold = 0.025 if _is_realtime else 0.020
+        behavior_result_accepted = (
+            fall_detected is False
+            and posture_label in accepted_behavior_classes
+            and _posture_available
+            and (
+                (
+                    posture_score >= _posture_accept_threshold
+                    and (_posture_margin >= _posture_margin_threshold or posture_score >= 0.34)
+                )
+                or (
+                    _is_realtime
+                    and posture_score >= 0.18
+                )
+            )
+        )
+        if fall_detected:
+            decision_state = 'fall_confirmed' if fall_score >= 0.75 else 'fall_suspected'
+            explain = [f'RF 이진 낙상 모델이 최종 낙상으로 판정했습니다. (점수: {fall_score:.2f})']
+            if len(_suppressed_by) > 0:
+                explain.append('적용된 억제/보정: ' + ', '.join(_suppressed_by))
+            behavior_class = 'fall'
+        else:
+            if behavior_result_accepted:
+                decision_state = 'posture_only'
+                explain = [f'RF 이진 모델에서 비낙상으로 판정되어 행동분류 결과({posture_label})를 채택했습니다.']
+                behavior_class = posture_label
+            else:
+                decision_state = 'safe'
+                explain = ['RF 이진 모델에서 비낙상으로 판정했습니다. 행동분류 결과는 참고값으로만 유지합니다.']
+                behavior_class = 'non-fall'
+        if _facial_state.get('applied'):
+            explain.append(
+                f"표정 보조 모델이 {(_facial_state.get('label') or '표정 이상 가능')} 근거로 "
+                f"+{float(_facial_state.get('support_score', 0.0) or 0.0):.2f} 점수를 보강했습니다."
+            )
+        elif _facial_state.get('available') and _facial_state.get('support_score', 0) > 0:
+            explain.append('표정 보조 근거가 있었지만 자세/동작 근거가 비낙상에 가까워 최종 점수에는 반영하지 않았습니다.')
+        elif _facial_state.get('reason') == 'face_not_detected' and fall_detected:
+            explain.append('표정 보조 모델은 얼굴을 안정적으로 검출하지 못해 최종 판단에는 반영하지 않았습니다.')
+        if _decode_warning:
+            explain.append(_decode_warning.get('description', '입력 영상 일부만 디코딩되어 결과 신뢰도가 낮을 수 있습니다.'))
+
+        behavior_label = behavior_label_map.get(behavior_class, '비낙상')
+
+        if fall_detected:
+            summary_text = f'RF 이진 모델 기준 낙상 가능성이 높습니다. (상태: {decision_state})'
+        elif behavior_result_accepted:
+            summary_text = f'RF 이진 모델 기준 비낙상입니다. 감지된 행동: {behavior_label}. (상태: {decision_state})'
+        else:
+            summary_text = f'RF 이진 모델 기준 비낙상입니다. 행동분류는 참고값으로만 유지합니다. (상태: {decision_state})'
+
+        _analysis_basis = []
+        if _facial_state.get('available') or _facial_state.get('reason') == 'face_not_detected':
+            _facial_support_pct = round(float(_facial_state.get('support_score', 0.0) or 0.0) * 100.0, 1)
+            _analysis_basis.append({
+                'label': '표정 상태 보조',
+                'value': _facial_support_pct,
+                'unit': '%p',
+                'level': 'warning' if _facial_state.get('applied') or _facial_support_pct > 0 else 'normal',
+                'description': _facial_state.get('description') or _facial_state.get('label') or '',
+                'contribution_score': float(_facial_state.get('support_score', 0.0) or 0.0),
+            })
+        _analysis_basis = self._sort_analysis_basis(_analysis_basis)
+
+        _perf['total'] = round(_time.time() - _t_total, 3)
+
+        return {
+            'fall_detected': fall_detected,
+            'behavior_class': behavior_class,
+            'behavior_label': behavior_label,
+            'risk_score': round(fall_score, 4),
+            'risk_level': risk_level,
+            'risk_label': risk_label,
+            'summary': summary_text,
+            'events': [],
+            'reference_matches': [],
+            'analysis_basis': _analysis_basis,
+            'runtime_key': 'rf-dual',
+            'runtime_label': 'RF-Dual (Fall+Posture) 분석',
+            'posture_label': posture_label,
+            'posture_score': round(posture_score, 4),
+            'posture_probs': {k: round(v, 4) for k, v in posture_probs.items()},
+            'posture_raw_label': posture_raw_label,
+            'posture_raw_score': round(posture_raw_score, 4),
+            'posture_raw_probs': {k: round(v, 4) for k, v in posture_raw_probs.items()},
+            'posture_candidate_label': posture_candidate_label,
+            'posture_candidate_probs': {k: round(float(v or 0.0), 4) for k, v in posture_candidate_probs.items()},
+            'decision_state': decision_state,
+            'explain': explain,
+            'fall_result': {
+                'source': _fall_model_version,
+                'detected': fall_detected,
+                'score': round(fall_score, 4),
+                'risk_level': risk_level,
+                'risk_label': risk_label,
+                'effective_threshold': round(_effective_threshold, 4),
+                'suppressed_by': list(_suppressed_by),
+            },
+            'facial_state': _facial_state,
+            'behavior_result': {
+                'source': 'xg-posture+occlusion-aux' if _posture_occlusion_aux.get('used') else 'xg-posture',
+                'computed': _posture_available,
+                'accepted': behavior_result_accepted,
+                'class': posture_label if posture_label in accepted_behavior_classes else 'non-fall',
+                'label': behavior_label_map.get(posture_label if posture_label in accepted_behavior_classes else 'non-fall', '비낙상'),
+                'score': round(posture_score, 4),
+                'raw_class': posture_raw_label,
+                'raw_score': round(posture_raw_score, 4),
+                'raw_fall_prob': round(_posture_fall_prob, 4),
+                'margin': round(_posture_margin, 4),
+                'accept_threshold': round(_posture_accept_threshold, 4),
+                'probs_source': _posture_probs_source,
+                'provisional': _realtime_provisional_behavior,
+            },
+            'runtime_inference': {
+                'fall_score': round(fall_score, 4),
+                'fall_detected': fall_detected,
+                'rf_fall_probability': round(fall_prob if fall_prob is not None else float(pred), 4),
+                'fall_model_version': _fall_model_version,
+                'legacy_rf_fall_probability': round(_legacy_fall_prob, 4),
+                'legacy_rf_prediction': _legacy_pred,
+                'rf_fall_v2': _v2_info,
+                'effective_threshold': round(_effective_threshold, 4),
+                'motion_guard': {
+                    'applied': _motion_guard_applied,
+                    'is_stationary': _is_stationary,
+                    'checks': _motion_checks,
+                },
+                'occlusion': {
+                    'avg_conf': round(_posture_avg_conf, 4),
+                    'lower_body_visibility': round(_posture_lower_body_visibility, 4),
+                    'confidence_damp_applied': _occlusion_confidence_damp,
+                    'auxiliary_model': _posture_occlusion_aux,
+                },
+                'facial_state': _facial_state,
+                'facial_support_score': round(float(_facial_state.get('support_score', 0.0) or 0.0), 4),
+                'posture_diagnostics': _posture_calibration,
+                'suppressed_by': _suppressed_by,
+                'posture_label': posture_label,
+                'posture_score': round(posture_score, 4),
+                'posture_probs': {k: round(v, 4) for k, v in posture_probs.items()},
+                'posture_raw_label': posture_raw_label,
+                'posture_raw_score': round(posture_raw_score, 4),
+                'posture_raw_probs': {k: round(v, 4) for k, v in posture_raw_probs.items()},
+                'posture_candidate_label': posture_candidate_label,
+                'posture_candidate_probs': {k: round(float(v or 0.0), 4) for k, v in posture_candidate_probs.items()},
+                'posture_available': _posture_available,
+                'posture_accepted': behavior_result_accepted,
+                'posture_margin': round(_posture_margin, 4),
+                'posture_accept_threshold': round(_posture_accept_threshold, 4),
+                'posture_probs_source': _posture_probs_source,
+                'posture_provisional': _realtime_provisional_behavior,
+                'decision_state': decision_state,
+                'input_quality': {
+                    'frame_sampling': _frame_sampling,
+                    'warning': _decode_warning,
+                },
+                'short_clip': {
+                    'is_short_clip': _is_short_clip,
+                    'n_det_frames': _n_det_frames,
+                    'effective_threshold': round(_effective_threshold, 4),
+                    'confidence_level': _confidence_level,
+                },
+                'features': {k: (None if (lambda fv: fv != fv or fv == float('inf') or fv == float('-inf'))(float(v)) else round(float(v), 4)) if isinstance(v, (int, float)) else v for k, v in feat.items()},
+                'perf': _perf,
+                'device': _device_used,
+                'single_pass': True,  # FN-0003: marker for single-pass mode
+                'detected_person_frames': _det_count,
+                'extracted_frames': total_sampled,
+                'rf_feature_frames': len(rf_timeseries),
+                'posture_feature_frames': len(timeseries),
+                'rf_target_fps': _rf_target_fps,
+                'posture_target_fps': _posture_target_fps,
+                'frame_sampling': _frame_sampling,
+                'input_quality_warning': _decode_warning,
+            },
+            'behavior_inference': {
+                'code': behavior_class,
+                'label': behavior_label,
+                'source': 'rf-dual',
+                'fallback': False,
+            },
+            'model_runtime': {
+                'label': 'RF-Dual (Fall+Posture) 분석',
+                'fall_model_version': _fall_model_version,
+                'rf_model_path': _fall_model_path,
+                'legacy_rf_model_path': self._rf_active_model_path(),
+                'rf_fall_v2_model_path': self._project_relative_path(self._rf_fall_v2_model_path()) if self._rf_fall_v2_available() else None,
+                'posture_classifier': self._project_relative_path(self._xg_posture_model_path()) if self._xg_posture_available() else None,
+                'posture_occlusion_aux_classifier': self._project_relative_path(self._xg_posture_occlusion_aux_model_path()) if self._xg_posture_occlusion_aux_available() else None,
+                'posture_occlusion_aux_used': bool(_posture_occlusion_aux.get('used')),
+                'facial_state_aux': {
+                    'model': _facial_state.get('model'),
+                    'available': _facial_state.get('available'),
+                    'applied': _facial_state.get('applied'),
+                    'support_score': round(float(_facial_state.get('support_score', 0.0) or 0.0), 4),
+                    'policy': _facial_state.get('score_policy'),
+                },
+                'fall_probability': round(fall_score, 4),
+                'feature_count': len(self._RF_FALL_V2_FEATURE_COLUMNS) if _fall_model_version == 'rf-fall-v2' else len(self._RF_FEATURE_COLUMNS),
+                'legacy_feature_count': len(self._RF_FEATURE_COLUMNS),
+                'posture_windows': _posture_windows_count,
+                'posture_available': _posture_available,
+                'detected_person_frames': _det_count,
+                'extracted_frames': total_sampled,
+                'rf_feature_frames': len(rf_timeseries),
+                'posture_feature_frames': len(timeseries),
+                'rf_target_fps': _rf_target_fps,
+                'posture_target_fps': _posture_target_fps,
+                'frame_sampling': _frame_sampling,
+                'input_quality_warning': _decode_warning,
+                'detection_frames': ts_result.get('detection_frames', []),
+            },
+            'video_meta': {
+                'duration': vid_meta.get('duration', vid_duration),
+                'width': vid_meta.get('width', vid_width),
+                'height': vid_meta.get('height', vid_height),
+                'fps': vid_meta.get('fps', orig_fps),
             },
         }
 
@@ -5255,84 +12062,669 @@ class VideoAnalysis:
             knee_cycle = w.get('knee_angle_cycle_strength', 0.0)
             speed_std = w.get('speed_std', 0.0)
             upper_motion = w.get('upper_body_motion', 0.0)
-            osc_count = w.get('oscillation_count', 0.0)
+            upper_temporal_motion = w.get('upper_body_temporal_motion', 0.0)
+            upper_motion_energy = w.get('upper_motion_energy', upper_temporal_motion)
+            upper_center_x_span = w.get('upper_center_x_span', 0.0)
+            upper_center_dx = w.get('upper_center_dx_abs_mean', 0.0)
+            upper_center_y_std = w.get('upper_center_y_std', 0.0)
+            shoulder_center_x_span = w.get('shoulder_center_x_span', 0.0)
+            shoulder_center_dx = w.get('shoulder_center_dx_abs_mean', 0.0)
+            torso_tilt_std = w.get('torso_tilt_std', 0.0)
             pose_knee = w.get('pose_knee_bend_mean', 0.0)
             pose_tilt = w.get('pose_tilt_mean', 0.0)
+            pose_tilt_max = w.get('pose_tilt_max', pose_tilt)
             pose_height = w.get('pose_height_ratio_mean', 0.0)
-            area_change = w.get('area_change', 0.0)
+            pose_height_min = w.get('pose_height_ratio_min', pose_height)
+            pose_spread = w.get('pose_spread_mean', 0.0)
+            spread_after = w.get('spread_after_descent', pose_spread)
+            floor_prox = w.get('floor_proximity', 0.0)
+            floor_contact = w.get('floor_contact_ratio', 0.0)
             vert_horiz = w.get('vert_horiz_ratio', 0.0)
+            center_dx_abs_mean = w.get('center_dx_abs_mean', 0.0)
+            center_x_span = w.get('center_x_span', 0.0)
+            lower_body_visibility = w.get('lower_body_visibility', 0.0)
+            straight_leg_ratio = w.get('straight_leg_ratio', 0.0)
+            support_leg_ratio = w.get('support_leg_ratio', straight_leg_ratio)
+            bent_leg_ratio = w.get('bent_leg_ratio', 0.0)
+            pose_knee_min = w.get('pose_knee_bend_min', 180.0)
+            pose_knee_support = w.get('pose_knee_support_mean', pose_knee)
+            collapse_impulse = w.get('collapse_impulse', 0.0)
+            slow_descent_ratio = w.get('slow_descent_ratio', 0.0)
+            tilt_change_duration = w.get('tilt_change_duration', 0.0)
+            n_points = w.get('n_points', 0.0)
+            avg_conf = w.get('avg_conf', 0.0)
+            full_skel_aspect = w.get('full_skeleton_aspect', 0.0)
+            torso_verticality = w.get('torso_verticality', 0.0)
+            leg_verticality = w.get('leg_verticality', 0.0)
+            lower_body_extension = w.get('lower_body_extension', 0.0)
+            standing_skel = w.get('standing_skeleton_score', 0.0)
+            lying_skel = w.get('lying_skeleton_score', 0.0)
 
             cur_label = classes[int(np.argmax(adjusted[wi]))]
 
+            legs_visible = lower_body_visibility >= 0.30 and (pose_knee < 179.5 or pose_knee_support < 179.5)
+            knees_straight = legs_visible and (
+                pose_knee_support >= 145.0
+                or pose_knee_min >= 140.0
+                or straight_leg_ratio >= 0.55
+                or support_leg_ratio >= 0.30
+            )
+            knees_bent = legs_visible and not knees_straight and (
+                pose_knee <= 120.0
+                or pose_knee_min <= 105.0
+                or bent_leg_ratio >= 0.70
+            )
+            upper_walk_signal = (
+                upper_temporal_motion >= 0.030
+                or upper_motion_energy >= 0.045
+                or upper_center_x_span >= 0.040
+                or upper_center_dx >= 0.012
+                or shoulder_center_x_span >= 0.032
+                or shoulder_center_dx >= 0.010
+            )
+            upper_run_signal = (
+                upper_temporal_motion >= 0.070
+                or upper_motion_energy >= 0.095
+                or upper_center_x_span >= 0.095
+                or upper_center_dx >= 0.030
+                or upper_center_y_std >= 0.030
+            )
+            upper_static_signal = (
+                upper_temporal_motion < 0.020
+                and upper_center_x_span < 0.028
+                and upper_center_dx < 0.010
+                and upper_center_y_std < 0.018
+                and torso_tilt_std < 8.0
+            )
+            _body_span_min = 0.120 if lower_body_visibility < 0.25 else 0.070
+            _body_dx_min = 0.032 if lower_body_visibility < 0.25 else 0.018
+            _weak_span_min = 0.075 if lower_body_visibility < 0.25 else 0.045
+            _weak_dx_min = 0.018 if lower_body_visibility < 0.25 else 0.012
+            if lower_body_visibility < 0.25:
+                body_translation_signal = (center_x_span >= _body_span_min and center_dx_abs_mean >= 0.018) or center_x_span >= 0.180
+                weak_body_translation_signal = (center_x_span >= _weak_span_min and center_dx_abs_mean >= 0.010) or center_x_span >= 0.100
+            else:
+                body_translation_signal = (
+                    center_x_span >= _body_span_min
+                    or center_dx_abs_mean >= _body_dx_min
+                    or (speed_std >= 0.012 and center_x_span >= max(0.045, _weak_span_min))
+                )
+                weak_body_translation_signal = (
+                    center_x_span >= _weak_span_min
+                    or center_dx_abs_mean >= _weak_dx_min
+                    or (speed_std >= 0.008 and center_x_span >= max(0.030, _weak_span_min * 0.70))
+                )
+            walk_displacement_signal = self._walk_displacement_signal(
+                center_x_span, center_dx_abs_mean, speed_std, lower_body_visibility
+            )
+            lower_gait_signal = (
+                walk_displacement_signal
+                and (
+                    cy_period >= 0.22
+                    or (step_period > 0.0 and step_period <= 0.34)
+                    or knee_cycle >= 0.16
+                )
+            )
+            upper_only_motion = upper_walk_signal and not walk_displacement_signal and not lower_gait_signal
+            gait_active = (
+                (cy_period >= 0.18 and walk_displacement_signal)
+                or knee_cycle >= 0.12
+                or (speed_std >= 0.018 and walk_displacement_signal)
+                or (upper_motion >= 0.070 and stillness < 0.35 and body_translation_signal)
+                or (upper_walk_signal and walk_displacement_signal and stillness < 0.72 and pose_tilt <= 34.0)
+            )
+            gait_posture = pose_tilt <= 30.0 and floor_prox <= 0.60 and pose_height >= 0.22
+            fast_gait_signal = (
+                cy_period >= 0.52
+                or (step_period > 0.0 and step_period <= 0.20)
+                or (speed_std >= 0.010 and body_translation_signal)
+                or (upper_run_signal and body_translation_signal)
+            )
+            dynamic_fall_signal = (
+                upper_motion >= 0.075
+                or spread_after >= 0.085
+                or speed_std >= 0.018
+                or collapse_impulse >= 0.00015
+            )
+            strong_run_motion = center_x_span >= 0.250 or center_dx_abs_mean >= 0.120
+            low_profile_posture = pose_height <= 0.18 or pose_height_min <= 0.16
+            low_evidence_static = (
+                stillness >= 0.90
+                and upper_motion <= 0.02
+                and speed_std <= 0.005
+                and tilt_change_duration <= 0.05
+                and slow_descent_ratio <= 0.10
+            )
+            upright_partial_stand = (
+                pose_tilt >= 8.0
+                and pose_tilt <= 27.0
+                and pose_height >= 0.16
+                and floor_prox >= 0.40
+                and floor_prox <= 0.56
+                and cy_period < 0.18
+                and step_period == 0.0
+                and speed_std < 0.015
+            )
+            upright_sit_guard = (
+                pose_tilt <= 22.0
+                and pose_tilt_max <= 30.0
+                and pose_height >= 0.22
+                and floor_contact <= 0.58
+                and (
+                    knees_bent
+                    or (legs_visible and pose_knee_support <= 140.0)
+                    or (floor_prox < 0.72 and pose_height >= 0.28)
+                )
+            )
+            hard_upright_geometry = (
+                standing_skel >= 1.15
+                or (
+                    full_skel_aspect > 0.0
+                    and full_skel_aspect <= 0.82
+                    and torso_verticality >= 0.72
+                    and leg_verticality >= 0.70
+                    and lower_body_extension >= 0.16
+                )
+            )
+
+            # ── Rule -1: Upright posture → Stand prior boost ──
+            # 원인: 기존엔 stand를 적극적으로 살리는 규칙이 거의 없어서,
+            # raw 확률이 sit 쪽으로 조금만 기울어도 smoothing까지 거치며 stand가 사라졌다.
+            upright_posture = pose_tilt <= 20.0 and pose_height >= 0.18 and floor_prox < 0.70 and floor_contact < 0.42
+            hard_stand_evidence = (
+                upright_posture
+                and not gait_active
+                and (
+                    (knees_straight and pose_tilt <= 10.0 and pose_height >= 0.22)
+                    or (upright_partial_stand and support_leg_ratio >= 0.20)
+                )
+            )
+            if hard_stand_evidence and upper_static_signal and cur_label in ('sit', 'lie', 'walk', 'run') and 'stand' in cls_idx:
+                wi_stand = cls_idx['stand']
+                source_idx = cls_idx[cur_label]
+                transfer = min(0.72, adjusted[wi, source_idx] * 0.88)
+                adjusted[wi, wi_stand] += transfer
+                adjusted[wi, source_idx] -= transfer
+                cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            stand_candidate = upright_posture and not knees_bent and cur_label != 'fall'
+            if stand_candidate and 'stand' in cls_idx:
+                stand_gain = 0.0
+                if pose_tilt <= 16.0:
+                    stand_gain += min((16.0 - pose_tilt) * 0.010, 0.12)
+                if pose_height >= 0.18:
+                    stand_gain += min((pose_height - 0.18) * 0.70, 0.18)
+                if not legs_visible:
+                    stand_gain += 0.05
+                elif knees_straight:
+                    stand_gain += 0.08
+                elif support_leg_ratio >= 0.20:
+                    stand_gain += 0.06
+                if stillness >= 0.78:
+                    stand_gain += 0.06
+                if not gait_active or upper_static_signal:
+                    stand_gain += 0.06
+                if upright_partial_stand:
+                    stand_gain += 0.10
+
+                stand_gain = min(stand_gain, 0.34)
+                if stand_gain > 0.04 and cur_label != 'stand':
+                    wi_stand = cls_idx['stand']
+                    source_idx = cls_idx.get(cur_label)
+                    if source_idx is not None and source_idx != wi_stand:
+                        transfer = min(stand_gain, adjusted[wi, source_idx] * 0.65)
+                        adjusted[wi, wi_stand] += transfer
+                        adjusted[wi, source_idx] -= transfer
+                        cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 0: Sit/Lie → Stand rescue for upright posture ──
+            # 기존 로직은 sit로 기운 경우 stand로 돌아오는 길이 너무 좁았다.
+            stand_ready = upright_posture and (
+                knees_straight
+                or not legs_visible
+                or pose_height >= 0.34
+                or (pose_height >= 0.20 and pose_tilt <= 18.0 and upper_motion <= 0.055 and not gait_active)
+                or upright_partial_stand
+            )
+            sit_to_stand_guard = not (
+                cur_label == 'sit'
+                and (
+                    knees_bent
+                    or (legs_visible and pose_knee_support < 138.0)
+                    or pose_height < 0.24
+                    or floor_prox >= 0.62
+                )
+            )
+            if cur_label in ('sit', 'lie') and 'stand' in cls_idx and stand_ready and sit_to_stand_guard:
+                stand_boost = 0.0
+                if pose_knee >= 150.0:
+                    stand_boost += min((pose_knee - 150.0) * 0.010, 0.16)
+                if pose_knee_support >= 145.0:
+                    stand_boost += min((pose_knee_support - 145.0) * 0.006, 0.12)
+                if straight_leg_ratio >= 0.60:
+                    stand_boost += min((straight_leg_ratio - 0.60) * 0.35, 0.10)
+                if support_leg_ratio >= 0.20:
+                    stand_boost += min((support_leg_ratio - 0.20) * 0.35, 0.10)
+                if pose_tilt <= 18.0:
+                    stand_boost += min((18.0 - pose_tilt) * 0.006, 0.08)
+                if pose_height >= 0.18:
+                    stand_boost += min((pose_height - 0.18) * 0.55, 0.12)
+                if pose_height >= 0.34:
+                    stand_boost += min((pose_height - 0.34) * 0.65, 0.10)
+                if not legs_visible:
+                    stand_boost += 0.05
+                if not knees_bent:
+                    stand_boost += 0.06
+                if not gait_active:
+                    stand_boost += 0.05
+                if upright_partial_stand:
+                    stand_boost += 0.12
+
+                stand_boost = min(stand_boost, 0.48)
+                if stand_boost > 0.06:
+                    wi_stand = cls_idx['stand']
+                    source_label = 'sit' if cur_label == 'sit' else 'lie'
+                    source_idx = cls_idx[source_label]
+                    transfer_cap = 0.55 if source_label == 'sit' else 0.70
+                    transfer = min(stand_boost, adjusted[wi, source_idx] * transfer_cap)
+                    adjusted[wi, wi_stand] += transfer
+                    adjusted[wi, source_idx] -= transfer
+                    cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 0.5: Walk/Lie/Sit → Stand override for upright static partial-body pose ──
+            # 최근 튜닝에서 stand가 0으로 무너진 핵심 원인은
+            # lower-body noisy knee(min) + 약한 상체 흔들림 때문에 walk/lie로 빨려간 점이었다.
+            if cur_label in ('walk', 'lie') and 'stand' in cls_idx and upright_partial_stand:
+                static_stand_signal = (
+                    cy_period < 0.10
+                    and step_period == 0.0
+                    and speed_std < 0.012
+                    and (
+                        support_leg_ratio >= 0.30
+                        or pose_knee_support >= 130.0
+                        or (pose_height >= 0.18 and pose_tilt <= 25.0 and (upper_motion <= 0.10 or upper_static_signal))
+                    )
+                )
+                if static_stand_signal:
+                    wi_stand = cls_idx['stand']
+                    source_idx = cls_idx[cur_label]
+                    stand_override = 0.18
+                    if support_leg_ratio >= 0.30:
+                        stand_override += min((support_leg_ratio - 0.30) * 0.40, 0.12)
+                    if pose_knee_support >= 130.0:
+                        stand_override += min((pose_knee_support - 130.0) * 0.005, 0.12)
+                    if pose_height >= 0.18:
+                        stand_override += min((pose_height - 0.18) * 0.40, 0.08)
+                    if pose_tilt <= 25.0:
+                        stand_override += min((25.0 - pose_tilt) * 0.006, 0.08)
+                    if cur_label == 'walk':
+                        stand_override += 0.06
+                    if cur_label == 'lie':
+                        stand_override += 0.04
+                    stand_override = min(stand_override, 0.50)
+                    transfer = min(stand_override, adjusted[wi, source_idx] * 0.80)
+                    adjusted[wi, wi_stand] += transfer
+                    adjusted[wi, source_idx] -= transfer
+                    cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 0.6: Walk/run requires body displacement ──
+            # 4초 실시간 청크에서는 다리 리듬이나 상체 흔들림만으로 보행/뛰기를
+            # 확정하지 않는다. bbox 중심이 충분히 이동한 경우에만 walk/run을 허용한다.
+            if cur_label in ('walk', 'run') and not walk_displacement_signal and 'stand' in cls_idx:
+                target_label = 'stand'
+                if 'sit' in cls_idx and (
+                    knees_bent
+                    or upright_sit_guard
+                    or (pose_height < 0.34 and floor_prox >= 0.50 and pose_tilt <= 28.0)
+                ):
+                    target_label = 'sit'
+                target_idx = cls_idx.get(target_label)
+                source_idx = cls_idx.get(cur_label)
+                if target_idx is not None and source_idx is not None and target_idx != source_idx:
+                    transfer = min(0.26 if cur_label == 'walk' else 0.34, adjusted[wi, source_idx] * 0.72)
+                    adjusted[wi, target_idx] += transfer
+                    adjusted[wi, source_idx] -= transfer
+                    cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 3 FIRST: Stand → Sit boost (priority over walk) ──
+            # Bent knees + relatively upright torso + low height ratio + still → sitting
+            # Evaluated BEFORE walk boost so stationary sitting isn't mistaken for walking
+            _sit_applied = False
+            if cur_label == 'stand' and stillness > 0.55 and 'sit' in cls_idx:
+                sit_boost = 0.0
+                if legs_visible:
+                    if knees_bent:
+                        sit_boost += 0.12
+                        if pose_knee <= 125.0:
+                            sit_boost += min((125.0 - pose_knee) * 0.003, 0.12)
+                        if bent_leg_ratio >= 0.50:
+                            sit_boost += min((bent_leg_ratio - 0.50) * 0.25, 0.08)
+                        if pose_tilt < 20.0:
+                            sit_boost += 0.08
+                        if pose_height < 0.55:
+                            sit_boost += 0.10
+                        if stillness > 0.80:
+                            sit_boost += 0.05
+                    else:
+                        sit_boost = 0.0
+                else:
+                    if pose_height < 0.48 and pose_tilt < 18.0:
+                        sit_boost += 0.08
+                    if stillness > 0.85 and pose_height < 0.45:
+                        sit_boost += 0.05
+                    if floor_prox >= 0.62 and pose_height < 0.38 and pose_tilt < 20.0:
+                        sit_boost += 0.08
+                    if upper_static_signal and floor_prox >= 0.50 and pose_height < 0.44 and pose_tilt < 28.0:
+                        sit_boost += 0.06
+                    if upper_walk_signal and pose_height >= 0.24:
+                        sit_boost = max(0.0, sit_boost - 0.08)
+
+                if legs_visible and floor_prox >= 0.60 and pose_height < 0.52:
+                    sit_boost += 0.04
+
+                sit_boost = min(sit_boost, 0.30)
+                if sit_boost > 0.06:
+                    wi_sit = cls_idx['sit']
+                    wi_stand = cls_idx['stand']
+                    transfer = min(sit_boost, adjusted[wi, wi_stand] * 0.6)
+                    adjusted[wi, wi_sit] += transfer
+                    adjusted[wi, wi_stand] -= transfer
+                    _sit_applied = True
+
             # ── Rule 1: Stand → Walk boost ──
             # Not still + rhythmic vertical movement → likely walking
-            is_moving = stillness < 0.6
-            has_gait_rhythm = cy_period > 0.15 or knee_cycle > 0.1
-            has_body_motion = upper_motion > 0.01 or speed_std > 0.005
+            # Requires STRONG movement evidence to prevent webcam bbox noise false triggers
+            is_moving = stillness < 0.65              # tightened from 0.85: must be clearly moving
+            has_gait_rhythm = (
+                walk_displacement_signal
+                and (
+                    cy_period > 0.20
+                    or (knee_cycle > 0.15 and lower_body_visibility >= 0.30)
+                )
+            )
+            has_body_motion = (
+                walk_displacement_signal
+                or (has_gait_rhythm and weak_body_translation_signal)
+                or (upper_walk_signal and walk_displacement_signal and speed_std > 0.006)
+            )
 
-            if cur_label == 'stand' and is_moving and (has_gait_rhythm or has_body_motion):
+            if not _sit_applied and cur_label == 'stand' and is_moving and (has_gait_rhythm or has_body_motion):
                 boost = 0.0
-                if cy_period > 0.15:
-                    boost += min(cy_period * 0.8, 0.3)       # periodic bounce
+                if cy_period > 0.20:
+                    boost += min(cy_period * 0.6, 0.20)
                 if stillness < 0.3:
-                    boost += 0.15                              # clearly not still
-                elif stillness < 0.5:
-                    boost += 0.08
-                if knee_cycle > 0.1:
-                    boost += min(knee_cycle * 0.5, 0.15)      # periodic knee bend
-                if upper_motion > 0.02:
+                    boost += 0.10
+                elif stillness < 0.45:
                     boost += 0.05
+                if knee_cycle > 0.15:
+                    boost += min(knee_cycle * 0.4, 0.10)
+                if upper_motion > 0.05:
+                    boost += 0.03
+                if upper_walk_signal and (walk_displacement_signal or lower_gait_signal):
+                    boost += min(upper_motion_energy * 0.9 + upper_center_x_span * 0.7 + upper_center_dx * 1.2, 0.12)
+                if lower_body_visibility < 0.25 and upper_only_motion and pose_tilt <= 28.0:
+                    boost = max(0.0, boost - 0.08)
 
-                boost = min(boost, 0.45)  # cap total boost
+                boost = min(boost, 0.25)  # lowered cap from 0.35
                 if boost > 0.05 and 'walk' in cls_idx:
                     wi_walk = cls_idx['walk']
                     wi_stand = cls_idx['stand']
-                    # Transfer probability from stand to walk
-                    transfer = min(boost, adjusted[wi, wi_stand] * 0.6)
+                    transfer = min(boost, adjusted[wi, wi_stand] * 0.5)
                     adjusted[wi, wi_walk] += transfer
                     adjusted[wi, wi_stand] -= transfer
 
             # ── Rule 2: Walk → Run boost ──
-            # Fast gait + high bounce + short step period → likely running
-            elif cur_label == 'walk':
+            # Requires MULTIPLE strong signals to prevent false run detection
+            elif cur_label == 'walk' and stillness < 0.40 and walk_displacement_signal:    # must be clearly in motion
+                run_signals = 0
                 run_boost = 0.0
-                if step_period > 0.0 and step_period < 0.4:    # fast cadence < 0.4s
-                    run_boost += 0.15
-                if cy_period > 0.3:                              # strong bounce
-                    run_boost += min((cy_period - 0.3) * 1.0, 0.2)
-                if speed_std > 0.015:                            # high speed variation
-                    run_boost += 0.1
-                if upper_motion > 0.04:                          # vigorous body motion
-                    run_boost += 0.1
+                if step_period > 0.0 and step_period < 0.35:
+                    run_boost += 0.12
+                    run_signals += 1
+                if cy_period > 0.35:
+                    run_boost += min((cy_period - 0.35) * 0.8, 0.15)
+                    run_signals += 1
+                if speed_std > 0.025:
+                    run_boost += 0.08
+                    run_signals += 1
+                if upper_motion > 0.06:
+                    run_boost += 0.08
+                    run_signals += 1
+                if upper_run_signal and walk_displacement_signal:
+                    run_boost += 0.10
+                    run_signals += 1
 
-                run_boost = min(run_boost, 0.4)
-                if run_boost > 0.1 and 'run' in cls_idx:
+                run_boost = min(run_boost, 0.30)  # lowered cap from 0.40
+                if run_boost > 0.10 and run_signals >= 2 and 'run' in cls_idx:  # need 2+ signals
                     wi_run = cls_idx['run']
                     wi_walk = cls_idx['walk']
-                    transfer = min(run_boost, adjusted[wi, wi_walk] * 0.5)
+                    transfer = min(run_boost, adjusted[wi, wi_walk] * 0.4)
                     adjusted[wi, wi_run] += transfer
                     adjusted[wi, wi_walk] -= transfer
 
-            # ── Rule 3: Stand → Sit boost (FN-0025) ──
-            # Bent knees + relatively upright torso + low height ratio → sitting
-            elif cur_label == 'stand':
-                sit_boost = 0.0
-                if pose_knee > 0.25:                             # significant knee bend
-                    sit_boost += min((pose_knee - 0.25) * 1.5, 0.25)
-                if pose_tilt < 20.0 and pose_knee > 0.2:        # upright but knees bent
-                    sit_boost += 0.1
-                if pose_height < 0.55 and pose_knee > 0.15:     # short apparent height
-                    sit_boost += 0.1
-                if stillness > 0.6 and pose_knee > 0.2:         # still + bent knees
-                    sit_boost += 0.08
+            # ── Rule 2.5: Lie/Stand/Sit → Walk/Run rescue for gait-like posture ──
+            # 검출이 듬성듬성한 클립은 raw가 lie/stand로 쏠리지만,
+            # 실제로는 서서 이동 중인 경우가 많아 gait posture + motion으로 복구한다.
+            walk_motion_signal = (
+                walk_displacement_signal
+                and (
+                    cy_period >= 0.22
+                    or (step_period > 0.0 and step_period <= 0.30)
+                    or speed_std >= 0.012
+                    or upper_walk_signal
+                    or lower_gait_signal
+                )
+            )
+            if cur_label in ('lie', 'stand', 'sit') and gait_posture and walk_motion_signal and 'walk' in cls_idx:
+                walk_rescue = 0.0
+                if stillness < 0.50:
+                    walk_rescue += 0.08
+                if upper_motion >= 0.045:
+                    walk_rescue += min((upper_motion - 0.045) * 2.2, 0.10)
+                if upper_walk_signal and (walk_displacement_signal or lower_gait_signal):
+                    walk_rescue += min(upper_motion_energy * 0.8 + upper_center_x_span * 0.5 + upper_center_dx * 1.0, 0.14)
+                if cy_period >= 0.22:
+                    walk_rescue += min((cy_period - 0.22) * 0.70, 0.16)
+                if step_period > 0.0 and step_period <= 0.30:
+                    walk_rescue += 0.08
+                if speed_std >= 0.006:
+                    walk_rescue += min((speed_std - 0.006) * 4.0, 0.10)
+                if lower_body_visibility >= 0.60:
+                    walk_rescue += 0.04
+                elif lower_body_visibility < 0.25 and upper_only_motion and not knees_bent:
+                    walk_rescue = max(0.0, walk_rescue - 0.08)
+                if pose_height >= 0.28:
+                    walk_rescue += 0.04
+                if pose_tilt <= 24.0:
+                    walk_rescue += 0.04
+                if knees_bent:
+                    walk_rescue = max(0.0, walk_rescue - 0.08)
 
-                sit_boost = min(sit_boost, 0.4)
-                if sit_boost > 0.08 and 'sit' in cls_idx:
-                    wi_sit = cls_idx['sit']
-                    wi_stand = cls_idx['stand']
-                    transfer = min(sit_boost, adjusted[wi, wi_stand] * 0.5)
-                    adjusted[wi, wi_sit] += transfer
-                    adjusted[wi, wi_stand] -= transfer
+                walk_rescue = min(walk_rescue, 0.34)
+                if walk_rescue > 0.08:
+                    wi_walk = cls_idx['walk']
+                    source_idx = cls_idx.get(cur_label)
+                    if source_idx is not None and source_idx != wi_walk:
+                        transfer = min(walk_rescue, adjusted[wi, source_idx] * 0.62)
+                        adjusted[wi, wi_walk] += transfer
+                        adjusted[wi, source_idx] -= transfer
+                        cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            if cur_label in ('stand', 'walk', 'lie') and gait_posture and (fast_gait_signal or strong_run_motion) and stillness < 0.45 and 'run' in cls_idx:
+                run_rescue = 0.0
+                if cy_period >= 0.52:
+                    run_rescue += min((cy_period - 0.52) * 0.90, 0.20)
+                if step_period > 0.0 and step_period <= 0.20:
+                    run_rescue += 0.12
+                if speed_std >= 0.008:
+                    run_rescue += min((speed_std - 0.008) * 5.0, 0.12)
+                if upper_motion >= 0.045:
+                    run_rescue += min((upper_motion - 0.045) * 1.8, 0.10)
+                if upper_run_signal and body_translation_signal:
+                    run_rescue += 0.10
+                if strong_run_motion:
+                    run_rescue += min(max(center_x_span - 0.250, 0.0) * 0.45 + max(center_dx_abs_mean - 0.120, 0.0) * 0.60, 0.26)
+                if pose_height >= 0.32:
+                    run_rescue += 0.04
+                if lower_body_visibility >= 0.60:
+                    run_rescue += 0.03
+
+                run_rescue = min(run_rescue, 0.38)
+                if run_rescue > 0.10:
+                    wi_run = cls_idx['run']
+                    source_idx = cls_idx.get(cur_label)
+                    if source_idx is not None and source_idx != wi_run:
+                        transfer = min(run_rescue, adjusted[wi, source_idx] * 0.68)
+                        adjusted[wi, wi_run] += transfer
+                        adjusted[wi, source_idx] -= transfer
+                        cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 4: Relaxed sit/lie boundary using torso tilt + floor contact ──
+            # 부분적으로 기대어 눕는 경우도 lie 쪽으로 조금 더 쉽게 이동시킨다.
+            if 'sit' in cls_idx and 'lie' in cls_idx:
+                wi_sit = cls_idx['sit']
+                wi_lie = cls_idx['lie']
+
+                if cur_label in ('sit', 'stand'):
+                    lie_boost = 0.0
+                    strong_lie_posture = (pose_tilt >= 45.0 or pose_tilt_max >= 50.0) and not (
+                        hard_upright_geometry and lying_skel <= 0.55
+                    )
+                    if strong_lie_posture:
+                        if pose_tilt >= 45.0:
+                            lie_boost += min((pose_tilt - 45.0) * 0.014, 0.22)
+                        if pose_tilt_max >= 50.0:
+                            lie_boost += min((pose_tilt_max - 50.0) * 0.010, 0.14)
+                    if pose_height <= 0.56:
+                        lie_boost += min((0.56 - pose_height) * 0.55, 0.12)
+                    if pose_height_min <= 0.50:
+                        lie_boost += min((0.50 - pose_height_min) * 0.65, 0.10)
+                    if floor_prox >= 0.70:
+                        lie_boost += min((floor_prox - 0.70) * 0.35, 0.07)
+                    if floor_contact >= 0.42:
+                        lie_boost += min((floor_contact - 0.42) * 0.22, 0.07)
+                    if pose_spread >= 0.26 or spread_after >= 0.30:
+                        lie_boost += 0.05
+                    if stillness >= 0.68 and vert_horiz < 1.35:
+                        lie_boost += 0.04
+                    if not strong_lie_posture:
+                        lie_boost *= 0.35
+                    if upright_sit_guard and not strong_lie_posture:
+                        lie_boost = max(0.0, lie_boost - 0.22)
+                    if pose_tilt < 38.0:
+                        lie_boost = max(0.0, lie_boost - 0.12)
+                    if knees_bent:
+                        lie_boost = max(0.0, lie_boost - 0.10)
+                    if hard_upright_geometry and lying_skel <= 0.55:
+                        lie_boost = 0.0
+
+                    lie_boost = min(lie_boost, 0.30)
+                    if lie_boost > 0.04:
+                        source_idx = wi_sit if cur_label == 'sit' else cls_idx.get('stand', wi_sit)
+                        transfer_cap = 0.62 if cur_label == 'sit' else 0.42
+                        transfer = min(lie_boost, adjusted[wi, source_idx] * transfer_cap)
+                        adjusted[wi, wi_lie] += transfer
+                        adjusted[wi, source_idx] -= transfer
+
+                elif cur_label == 'lie':
+                    sit_boost = 0.0
+                    if pose_tilt <= 18.0:
+                        sit_boost += min((18.0 - pose_tilt) * 0.012, 0.14)
+                    if pose_tilt_max <= 24.0:
+                        sit_boost += min((24.0 - pose_tilt_max) * 0.007, 0.08)
+                    if pose_tilt < 35.0:
+                        sit_boost += min((35.0 - pose_tilt) * 0.010, 0.16)
+                    if pose_height >= 0.52:
+                        sit_boost += min((pose_height - 0.52) * 0.45, 0.08)
+                    if pose_height_min >= 0.46:
+                        sit_boost += min((pose_height_min - 0.46) * 0.55, 0.06)
+                    if knees_bent:
+                        sit_boost += 0.06
+                    elif knees_straight:
+                        sit_boost = max(0.0, sit_boost - 0.05)
+                    if pose_tilt >= 45.0 or pose_tilt_max >= 50.0:
+                        sit_boost = max(0.0, sit_boost - 0.12)
+                    if floor_prox < 0.72:
+                        sit_boost += 0.03
+                    if vert_horiz >= 1.35:
+                        sit_boost += 0.03
+                    if upright_sit_guard:
+                        sit_boost += 0.06
+                        if pose_knee_support <= 138.0:
+                            sit_boost += min((138.0 - pose_knee_support) * 0.004, 0.05)
+
+                    sit_boost = min(sit_boost, 0.22)
+                    if sit_boost > 0.05:
+                        transfer = min(sit_boost, adjusted[wi, wi_lie] * 0.45)
+                        adjusted[wi, wi_sit] += transfer
+                        adjusted[wi, wi_lie] -= transfer
+
+            # ── Rule 5: Static low-profile posture → Lie rescue ──
+            # lie 샘플 중에는 torso tilt가 작게 잡히지만 높이가 매우 낮고 거의 정지된 경우가 많다.
+            if 'lie' in cls_idx and cur_label in ('sit', 'fall'):
+                low_profile_lie = low_profile_posture and floor_prox >= 0.38 and stillness >= 0.72
+                if upright_sit_guard and pose_tilt_max <= 30.0 and floor_contact < 0.68 and spread_after < 0.20:
+                    low_profile_lie = False
+                if low_profile_lie:
+                    lie_rescue = 0.0
+                    if pose_height <= 0.18:
+                        lie_rescue += min((0.18 - pose_height) * 0.90, 0.16)
+                    if pose_height_min <= 0.14:
+                        lie_rescue += min((0.14 - pose_height_min) * 1.20, 0.12)
+                    if pose_tilt_max >= 45.0:
+                        lie_rescue += min((pose_tilt_max - 45.0) * 0.008, 0.12)
+                    elif pose_tilt <= 25.0:
+                        lie_rescue += 0.08
+                    if upper_motion <= 0.03:
+                        lie_rescue += 0.05
+                    if speed_std <= 0.01:
+                        lie_rescue += 0.04
+                    if low_evidence_static and (pose_height <= 0.02 or (n_points <= 6.0 and avg_conf <= 0.55)):
+                        lie_rescue += 0.10
+
+                    lie_rescue = min(lie_rescue, 0.34)
+                    if lie_rescue > 0.08:
+                        wi_lie = cls_idx['lie']
+                        source_idx = cls_idx.get(cur_label)
+                        if source_idx is not None and source_idx != wi_lie:
+                            transfer = min(lie_rescue, adjusted[wi, source_idx] * 0.62)
+                            adjusted[wi, wi_lie] += transfer
+                            adjusted[wi, source_idx] -= transfer
+                            cur_label = classes[int(np.argmax(adjusted[wi]))]
+
+            # ── Rule 6: Dynamic collapse / floor-spread → Fall rescue ──
+            # 합성 낙상 데이터는 tilt가 작아도 low-profile + upper motion + spread-after 패턴이 강하다.
+            if 'fall' in cls_idx and cur_label in ('sit', 'lie', 'stand'):
+                fall_candidate = (
+                    dynamic_fall_signal
+                    and floor_prox >= 0.36
+                    and (pose_height <= 0.14 or pose_height == 0.0 or lower_body_visibility < 0.35 or spread_after >= 0.10)
+                    and not (stillness >= 0.92 and upper_motion <= 0.02 and speed_std <= 0.005)
+                )
+                if fall_candidate:
+                    fall_boost = 0.0
+                    if upper_motion >= 0.075:
+                        fall_boost += min((upper_motion - 0.075) * 2.4, 0.16)
+                    if spread_after >= 0.085:
+                        fall_boost += min((spread_after - 0.085) * 1.2, 0.14)
+                    if speed_std >= 0.018:
+                        fall_boost += min((speed_std - 0.018) * 2.0, 0.12)
+                    if pose_height <= 0.10 or pose_height == 0.0:
+                        fall_boost += 0.10
+                    if lower_body_visibility < 0.25:
+                        fall_boost += 0.05
+                    if stillness <= 0.55:
+                        fall_boost += 0.05
+
+                    fall_boost = min(fall_boost, 0.38)
+                    if fall_boost > 0.08:
+                        wi_fall = cls_idx['fall']
+                        source_idx = cls_idx.get(cur_label)
+                        if source_idx is not None and source_idx != wi_fall:
+                            transfer = min(fall_boost, adjusted[wi, source_idx] * 0.68)
+                            adjusted[wi, wi_fall] += transfer
+                            adjusted[wi, source_idx] -= transfer
+                            cur_label = classes[int(np.argmax(adjusted[wi]))]
 
             # ── Re-normalize per window ──
             row_sum = adjusted[wi].sum()
@@ -5341,12 +12733,836 @@ class VideoAnalysis:
 
         return adjusted
 
+    def _realtime_upper_body_posture_estimate(self, feature_windows=None, rf_feat=None, classes=None):
+        """Estimate posture for realtime chunks when lower-body keypoints are occluded."""
+        import numpy as np
+
+        feature_windows = list(feature_windows or [])
+        rf_feat = dict(rf_feat or {})
+        cls = [c for c in (classes or ['stand', 'walk', 'run', 'sit', 'lie']) if c in ('stand', 'walk', 'run', 'sit', 'lie')]
+        if not cls:
+            cls = ['stand', 'walk', 'run', 'sit', 'lie']
+
+        def _avg(key, default=0.0):
+            vals = []
+            for w in feature_windows:
+                try:
+                    vals.append(float(w.get(key, default) or 0.0))
+                except Exception:
+                    vals.append(float(default or 0.0))
+            return float(np.mean(vals)) if vals else float(default or 0.0)
+
+        def _num(source, key, default=0.0):
+            try:
+                return float(source.get(key, default) or 0.0)
+            except Exception:
+                return float(default or 0.0)
+
+        def _make_probs(target, confidence):
+            base = max(0.0, min(0.86, float(confidence)))
+            remaining = max(0.0, 1.0 - base)
+            out = {c: 0.0 for c in cls}
+            if target in out:
+                out[target] = base
+            others = [c for c in cls if c != target]
+            share = remaining / max(len(others), 1)
+            for c in others:
+                out[c] = share
+            return out
+
+        avg_conf = _avg('avg_conf', 0.0)
+        lower_vis = _avg('lower_body_visibility', 0.0)
+        center_span = _avg('center_x_span', 0.0)
+        center_dx = _avg('center_dx_abs_mean', 0.0)
+        speed_std = _avg('speed_std', 0.0)
+        stillness = _avg('stillness', 1.0)
+        upper_temporal_motion = _avg('upper_body_temporal_motion', 0.0)
+        upper_motion_energy = _avg('upper_motion_energy', upper_temporal_motion)
+        upper_center_span = _avg('upper_center_x_span', 0.0)
+        upper_center_dx = _avg('upper_center_dx_abs_mean', 0.0)
+        upper_center_y_std = _avg('upper_center_y_std', 0.0)
+        upper_center_dy = _avg('upper_center_dy_abs_mean', 0.0)
+        shoulder_span = _avg('shoulder_center_x_span', 0.0)
+        shoulder_dx = _avg('shoulder_center_dx_abs_mean', 0.0)
+        torso_tilt_std = _avg('torso_tilt_std', 0.0)
+        torso_verticality = _avg('torso_verticality', 0.0)
+        full_skel_aspect = _avg('full_skeleton_aspect', 0.0)
+        full_skel_height = _avg('full_skeleton_height', 0.0)
+        upper_body_aspect = _avg('upper_body_aspect', 0.0)
+        pose_height = _avg('pose_height_ratio_mean', 0.0)
+        tilt = _avg('pose_tilt_mean', 0.0)
+        upright_score = _avg('upright_geometry_score', 0.0)
+        lie_score = _avg('lie_geometry_score', 0.0)
+        horizontal_pose = _avg('horizontal_pose_score', 0.0)
+        low_flat = _avg('low_flat_still_score', 0.0)
+        floor_contact = _avg('floor_contact_ratio', 0.0)
+
+        n_frames = int(_num(rf_feat, 'n_frames', 0.0))
+        final_height_ratio = _num(rf_feat, 'final_height_ratio', 1.0)
+        delta_y_max = _num(rf_feat, 'delta_y_max', 0.0)
+        center_y_std = _num(rf_feat, 'center_y_std', 0.0)
+        aspect_ratio_mean = _num(rf_feat, 'aspect_ratio_mean', 0.0)
+        aspect_ratio_std = _num(rf_feat, 'aspect_ratio_std', 0.0)
+
+        has_any_evidence = bool(feature_windows) or n_frames >= 1
+        if not has_any_evidence:
+            return {'label': '', 'probs': {}, 'diagnostics': {'applied': False, 'reason': 'no_upper_body_evidence'}}
+
+        body_span_min = 0.120 if lower_vis < 0.25 else 0.070
+        body_dx_min = 0.032 if lower_vis < 0.25 else 0.018
+        weak_span_min = 0.075 if lower_vis < 0.25 else 0.045
+        weak_dx_min = 0.018 if lower_vis < 0.25 else 0.012
+        if lower_vis < 0.25:
+            body_translation_signal = (center_span >= body_span_min and center_dx >= 0.018) or center_span >= 0.180
+            weak_body_translation_signal = (center_span >= weak_span_min and center_dx >= 0.010) or center_span >= 0.100
+        else:
+            body_translation_signal = (
+                center_span >= body_span_min
+                or center_dx >= body_dx_min
+                or (speed_std >= 0.012 and center_span >= max(0.045, weak_span_min))
+            )
+            weak_body_translation_signal = (
+                center_span >= weak_span_min
+                or center_dx >= weak_dx_min
+                or (speed_std >= 0.008 and center_span >= max(0.030, weak_span_min * 0.70))
+            )
+        walk_displacement_signal = self._walk_displacement_signal(center_span, center_dx, speed_std, lower_vis)
+        center_y_periodicity = _avg('center_y_periodicity', 0.0)
+        gait_dynamic_score = _avg('gait_dynamic_score', 0.0)
+        lower_gait_signal = (
+            walk_displacement_signal
+            and (
+                center_y_periodicity >= 0.22
+                or gait_dynamic_score >= 0.18
+            )
+        )
+        upper_motion_signal = (
+            upper_motion_energy >= 0.045
+            or upper_center_span >= 0.040
+            or upper_center_dx >= 0.012
+            or shoulder_span >= 0.032
+            or shoulder_dx >= 0.010
+        )
+        upper_only_motion = upper_motion_signal and not walk_displacement_signal and not lower_gait_signal
+        translation_score = center_span * 1.8 + center_dx * 3.2 + (speed_std * 1.8 if weak_body_translation_signal else 0.0)
+        upper_motion_score = (
+            upper_motion_energy * 1.1
+            + upper_center_span * 0.8
+            + upper_center_dx * 1.6
+            + upper_center_y_std * 0.5
+            + shoulder_span * 0.5
+            + shoulder_dx * 1.0
+        )
+        motion_score = (
+            translation_score
+            + (upper_motion_score if (walk_displacement_signal or lower_gait_signal) else upper_motion_score * 0.32)
+        )
+        upright_score_ub = (
+            max(0.0, final_height_ratio - 0.55) * 0.9
+            + max(0.0, torso_verticality - 0.42) * 0.6
+            + max(0.0, upright_score - 0.35) * 0.4
+            + (0.15 if full_skel_aspect > 0.0 and full_skel_aspect <= 1.10 else 0.0)
+            + (0.10 if pose_height >= 0.12 else 0.0)
+        )
+        low_profile_score = (
+            max(0.0, 0.84 - final_height_ratio) * 0.9
+            + max(0.0, 0.50 - pose_height) * 0.4
+            + max(0.0, floor_contact - 0.18) * 0.5
+            + max(0.0, low_flat - 0.18) * 0.5
+        )
+        lie_score_ub = (
+            max(0.0, full_skel_aspect - 1.08) * 0.8
+            + max(0.0, horizontal_pose - 0.48) * 0.7
+            + max(0.0, aspect_ratio_mean - 0.78) * 0.35
+            + max(0.0, 0.64 - final_height_ratio) * 0.8
+            + max(0.0, floor_contact - 0.24) * 0.7
+            - max(0.0, torso_verticality - 0.52) * 0.45
+            - max(0.0, upright_score - 0.55) * 0.40
+        )
+        sit_score_ub = (
+            low_profile_score
+            + max(0.0, torso_verticality - 0.38) * 0.35
+            + max(0.0, upright_score - 0.42) * 0.25
+            + (0.12 if 0.52 <= final_height_ratio <= 0.84 else 0.0)
+            + (0.10 if stillness >= 0.62 else 0.0)
+            - max(0.0, motion_score - 0.11) * 0.9
+            - max(0.0, lie_score_ub - 0.42) * 0.6
+        )
+        walk_score_ub = (
+            motion_score
+            + (0.12 if final_height_ratio >= 0.68 else 0.0)
+            + (0.08 if tilt <= 34.0 else 0.0)
+            + (0.06 if stillness < 0.76 else 0.0)
+            + (0.16 if body_translation_signal else 0.0)
+            + (0.12 if walk_displacement_signal else 0.0)
+            + (0.08 if lower_gait_signal else 0.0)
+            - max(0.0, lie_score_ub - 0.50) * 0.8
+            - max(0.0, sit_score_ub - 0.55) * 0.5
+            - (0.28 if upper_only_motion else 0.0)
+            - (0.22 if not walk_displacement_signal else 0.0)
+        )
+        run_score_ub = (
+            motion_score * 1.15
+            + max(0.0, center_span - 0.10) * 1.6
+            + max(0.0, center_dx - 0.030) * 3.0
+            + max(0.0, speed_std - 0.012) * 2.0
+            + (0.10 if walk_displacement_signal and lower_gait_signal else 0.0)
+            - (0.36 if upper_only_motion else 0.0)
+            - (0.28 if not walk_displacement_signal else 0.0)
+            - 0.10
+        )
+        stand_score_ub = (
+            upright_score_ub
+            + (0.18 if stillness >= 0.62 else 0.0)
+            + max(0.0, 0.12 - motion_score) * 1.1
+            - max(0.0, low_profile_score - 0.48) * 0.5
+            - max(0.0, lie_score_ub - 0.45) * 0.7
+        )
+
+        # Tight lie gate: with lower-body occlusion, do not call lying unless the
+        # upper body and bbox are both clearly horizontal/low.
+        if lie_score_ub < 0.55 or (torso_verticality >= 0.58 and upright_score >= 0.45):
+            lie_score_ub *= 0.45
+        if lower_vis < 0.25 and final_height_ratio >= 0.75 and full_skel_aspect < 1.05:
+            lie_score_ub *= 0.25
+
+        scores = {
+            'stand': stand_score_ub,
+            'walk': walk_score_ub,
+            'run': run_score_ub,
+            'sit': sit_score_ub,
+            'lie': lie_score_ub,
+        }
+        label = max(scores, key=scores.get)
+        if label in ('walk', 'run') and upper_only_motion:
+            if sit_score_ub >= stand_score_ub + 0.04 or low_profile_score >= 0.46:
+                label = 'sit'
+            else:
+                label = 'stand'
+        if label in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal):
+            label = 'sit' if sit_score_ub >= stand_score_ub + 0.08 else 'stand'
+        if label == 'run' and (run_score_ub < 0.34 or run_score_ub < walk_score_ub + 0.10):
+            label = 'walk'
+        if label == 'lie' and lie_score_ub < 0.62:
+            label = 'sit' if sit_score_ub >= stand_score_ub + 0.08 else 'stand'
+        if label == 'sit' and motion_score >= 0.16 and final_height_ratio >= 0.62 and (walk_displacement_signal or lower_gait_signal):
+            label = 'walk'
+        if label == 'walk' and (motion_score < 0.075 or not (walk_displacement_signal or lower_gait_signal)) and stand_score_ub >= walk_score_ub - 0.03:
+            label = 'stand'
+
+        top_score = float(scores.get(label, 0.0) or 0.0)
+        confidence = max(0.42, min(0.70, 0.44 + top_score * 0.32))
+
+        diagnostics = {
+            'applied': True,
+            'reason': 'upper_body_occlusion_estimate',
+            'description': '하체 키포인트가 부족해 상체 기울기, bbox 높이 변화, 중심 이동량으로 행동을 추정했습니다.',
+            'avg_conf': round(avg_conf, 4),
+            'lower_body_visibility': round(lower_vis, 4),
+            'n_frames': n_frames,
+            'final_height_ratio': round(final_height_ratio, 4),
+            'delta_y_max': round(delta_y_max, 4),
+            'center_y_std': round(center_y_std, 4),
+            'center_x_span': round(center_span, 4),
+            'center_dx_abs_mean': round(center_dx, 4),
+            'speed_std': round(speed_std, 4),
+            'motion_score': round(motion_score, 4),
+            'translation_score': round(translation_score, 4),
+            'upper_motion_score': round(upper_motion_score, 4),
+            'body_translation_signal': bool(body_translation_signal),
+            'weak_body_translation_signal': bool(weak_body_translation_signal),
+            'walk_displacement_signal': bool(walk_displacement_signal),
+            'lower_gait_signal': bool(lower_gait_signal),
+            'upper_only_motion': bool(upper_only_motion),
+            'upper_body_temporal_motion': round(upper_temporal_motion, 4),
+            'upper_motion_energy': round(upper_motion_energy, 4),
+            'upper_center_x_span': round(upper_center_span, 4),
+            'upper_center_dx_abs_mean': round(upper_center_dx, 4),
+            'upper_center_y_std': round(upper_center_y_std, 4),
+            'upper_center_dy_abs_mean': round(upper_center_dy, 4),
+            'shoulder_center_x_span': round(shoulder_span, 4),
+            'shoulder_center_dx_abs_mean': round(shoulder_dx, 4),
+            'torso_tilt_std': round(torso_tilt_std, 4),
+            'torso_verticality': round(torso_verticality, 4),
+            'full_skeleton_aspect': round(full_skel_aspect, 4),
+            'upper_body_aspect': round(upper_body_aspect, 4),
+            'upper_body_scores': {k: round(float(v or 0.0), 4) for k, v in scores.items()},
+            'short_clip_estimate': n_frames > 0 and n_frames <= 3,
+        }
+        return {'label': label, 'probs': _make_probs(label, confidence), 'diagnostics': diagnostics}
+
+    def _runtime_posture_calibration(self, label, probs, feature_windows, classes, is_realtime=False):
+        """Calibrate runtime posture when the statistical model is low-confidence."""
+        import numpy as np
+
+        if not feature_windows and is_realtime:
+            return 'stand', {'stand': 0.46, 'walk': 0.135, 'run': 0.135, 'sit': 0.135, 'lie': 0.135}, {
+                'applied': True,
+                'reason': 'realtime_no_windows_stand_default',
+                'description': '실시간 청크에서 자세 윈도우를 만들지 못해 미확인 대신 기본 직립 행동으로 표시했습니다.',
+                'provisional_behavior': True,
+            }
+        if not feature_windows:
+            return label, probs, {'applied': False, 'reason': 'no_windows'}
+
+        def _avg(key, default=0.0):
+            vals = []
+            for w in feature_windows:
+                try:
+                    vals.append(float(w.get(key, default) or 0.0))
+                except Exception:
+                    vals.append(float(default or 0.0))
+            return float(np.mean(vals)) if vals else float(default or 0.0)
+
+        avg_conf = _avg('avg_conf')
+        lower_vis = _avg('lower_body_visibility')
+        stillness = _avg('stillness', 1.0)
+        center_span = _avg('center_x_span')
+        center_dx = _avg('center_dx_abs_mean')
+        speed_std = _avg('speed_std')
+        upper_temporal_motion = _avg('upper_body_temporal_motion')
+        upper_motion_energy = _avg('upper_motion_energy', upper_temporal_motion)
+        upper_center_x_span = _avg('upper_center_x_span')
+        upper_center_dx = _avg('upper_center_dx_abs_mean')
+        upper_center_y_std = _avg('upper_center_y_std')
+        shoulder_center_x_span = _avg('shoulder_center_x_span')
+        shoulder_center_dx = _avg('shoulder_center_dx_abs_mean')
+        torso_tilt_std = _avg('torso_tilt_std')
+        gait_dynamic = _avg('gait_dynamic_score')
+        run_stride = _avg('run_stride_score')
+        tilt = _avg('pose_tilt_mean')
+        pose_height = _avg('pose_height_ratio_mean')
+        knee_mean = _avg('pose_knee_bend_mean', 180.0)
+        bent_leg = _avg('bent_leg_ratio')
+        support_leg = _avg('support_leg_ratio')
+        straight_leg = _avg('straight_leg_ratio')
+        floor_contact = _avg('floor_contact_ratio')
+        upright_score = _avg('upright_geometry_score')
+        sit_score = _avg('sit_geometry_score')
+        lie_score = _avg('lie_geometry_score')
+        flatness = _avg('flatness_score')
+        horizontal_pose = _avg('horizontal_pose_score')
+        low_flat = _avg('low_flat_still_score')
+        lie_sep = _avg('lie_stand_separation_score')
+        full_skel_aspect = _avg('full_skeleton_aspect')
+        full_skel_height = _avg('full_skeleton_height')
+        upper_body_aspect = _avg('upper_body_aspect')
+        lower_body_aspect = _avg('lower_body_aspect')
+        upper_lower_gap = _avg('upper_lower_center_gap')
+        torso_verticality = _avg('torso_verticality')
+        leg_verticality = _avg('leg_verticality')
+        lower_body_extension = _avg('lower_body_extension')
+        standing_skel = _avg('standing_skeleton_score')
+        lying_skel = _avg('lying_skeleton_score')
+        sitting_skel = _avg('sitting_skeleton_score')
+
+        diagnostics = {
+            'applied': False,
+            'reason': '',
+            'avg_conf': round(avg_conf, 4),
+            'lower_body_visibility': round(lower_vis, 4),
+            'upright_geometry_score': round(upright_score, 4),
+            'sit_geometry_score': round(sit_score, 4),
+            'lie_geometry_score': round(lie_score, 4),
+            'center_x_span': round(center_span, 4),
+            'center_dx_abs_mean': round(center_dx, 4),
+            'speed_std': round(speed_std, 4),
+            'upper_body_temporal_motion': round(upper_temporal_motion, 4),
+            'upper_motion_energy': round(upper_motion_energy, 4),
+            'upper_center_x_span': round(upper_center_x_span, 4),
+            'upper_center_dx_abs_mean': round(upper_center_dx, 4),
+            'upper_center_y_std': round(upper_center_y_std, 4),
+            'shoulder_center_x_span': round(shoulder_center_x_span, 4),
+            'shoulder_center_dx_abs_mean': round(shoulder_center_dx, 4),
+            'torso_tilt_std': round(torso_tilt_std, 4),
+            'stillness': round(stillness, 4),
+            'gait_dynamic_score': round(gait_dynamic, 4),
+            'run_stride_score': round(run_stride, 4),
+            'full_skeleton_aspect': round(full_skel_aspect, 4),
+            'full_skeleton_height': round(full_skel_height, 4),
+            'upper_body_aspect': round(upper_body_aspect, 4),
+            'lower_body_aspect': round(lower_body_aspect, 4),
+            'upper_lower_center_gap': round(upper_lower_gap, 4),
+            'torso_verticality': round(torso_verticality, 4),
+            'leg_verticality': round(leg_verticality, 4),
+            'lower_body_extension': round(lower_body_extension, 4),
+            'standing_skeleton_score': round(standing_skel, 4),
+            'lying_skeleton_score': round(lying_skel, 4),
+            'sitting_skeleton_score': round(sitting_skel, 4),
+        }
+
+        cls = [c for c in classes if c in ('stand', 'walk', 'run', 'sit', 'lie')]
+        if not cls:
+            cls = ['stand', 'walk', 'run', 'sit', 'lie']
+
+        def _make_probs(target, confidence):
+            base = max(0.0, min(0.92, float(confidence)))
+            remaining = max(0.0, 1.0 - base)
+            others = [c for c in cls if c != target]
+            out = {c: 0.0 for c in cls}
+            if target in out:
+                out[target] = base
+            share = remaining / max(len(others), 1)
+            for c in others:
+                out[c] = share
+            return out
+
+        raw_rank = sorted([(c, float(probs.get(c, 0.0) or 0.0)) for c in cls], key=lambda kv: kv[1], reverse=True)
+        raw_margin = raw_rank[0][1] - raw_rank[1][1] if len(raw_rank) > 1 else raw_rank[0][1] if raw_rank else 0.0
+        top_label = raw_rank[0][0] if raw_rank else label
+        top_prob = raw_rank[0][1] if raw_rank else float(probs.get(label, 0.0) or 0.0)
+        diagnostics['raw_margin'] = round(raw_margin, 4)
+
+        body_span_min = 0.120 if lower_vis < 0.25 else 0.070
+        body_dx_min = 0.032 if lower_vis < 0.25 else 0.018
+        weak_span_min = 0.075 if lower_vis < 0.25 else 0.045
+        weak_dx_min = 0.018 if lower_vis < 0.25 else 0.012
+        if lower_vis < 0.25:
+            body_translation_signal = (center_span >= body_span_min and center_dx >= 0.018) or center_span >= 0.180
+            weak_body_translation_signal = (center_span >= weak_span_min and center_dx >= 0.010) or center_span >= 0.100
+        else:
+            body_translation_signal = (
+                center_span >= body_span_min
+                or center_dx >= body_dx_min
+                or (speed_std >= 0.012 and center_span >= max(0.045, weak_span_min))
+            )
+            weak_body_translation_signal = (
+                center_span >= weak_span_min
+                or center_dx >= weak_dx_min
+                or (speed_std >= 0.008 and center_span >= max(0.030, weak_span_min * 0.70))
+            )
+        walk_displacement_signal = self._walk_displacement_signal(center_span, center_dx, speed_std, lower_vis)
+        lower_gait_signal = (
+            walk_displacement_signal
+            and (
+                gait_dynamic >= 0.18
+                or run_stride >= 0.16
+            )
+        )
+        upper_motion_signal = (
+            upper_temporal_motion >= 0.030
+            or upper_motion_energy >= 0.045
+            or upper_center_x_span >= 0.040
+            or upper_center_dx >= 0.012
+            or shoulder_center_x_span >= 0.032
+            or shoulder_center_dx >= 0.010
+        )
+        upper_only_motion = upper_motion_signal and not walk_displacement_signal and not lower_gait_signal
+        diagnostics.update({
+            'body_translation_signal': bool(body_translation_signal),
+            'weak_body_translation_signal': bool(weak_body_translation_signal),
+            'walk_displacement_signal': bool(walk_displacement_signal),
+            'lower_gait_signal': bool(lower_gait_signal),
+            'upper_only_motion': bool(upper_only_motion),
+        })
+
+        def _realtime_best_effort(default_label='stand', reason='realtime_best_effort_behavior', description='실시간 청크에서 확정 근거는 약하지만 후보 행동 중 가장 그럴듯한 라벨을 표시했습니다.'):
+            target = top_label if top_label in cls and top_label != 'unknown' else label if label in cls and label != 'unknown' else default_label
+            if target in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal):
+                target = 'sit' if (sit_score >= max(0.80, upright_score + 0.15) or sitting_skel >= 0.75) else 'stand'
+            if target == 'lie' and (
+                upright_score >= 0.55
+                or standing_skel >= 0.95
+                or (torso_verticality >= 0.58 and lie_score < 1.80)
+            ):
+                target = 'stand'
+            if target == 'sit' and walk_displacement_signal and center_dx >= 0.014 and speed_std >= 0.005 and lie_score < 0.90:
+                target = 'walk'
+            conf = max(0.36, min(0.58, float(probs.get(target, top_prob) or top_prob or 0.0)))
+            diagnostics.update({
+                'applied': True,
+                'reason': reason,
+                'description': description,
+                'provisional_behavior': True,
+                'best_effort_target': target,
+            })
+            return target, _make_probs(target, conf), diagnostics
+
+        static_upright_evidence = (
+            is_realtime
+            and standing_skel >= 1.35
+            and lying_skel <= 0.35
+            and torso_verticality >= 0.72
+            and (leg_verticality >= 0.68 or lower_body_extension >= 0.12)
+            and stillness >= 0.78
+            and center_span < 0.025
+            and center_dx < 0.012
+            and speed_std < 0.006
+            and upper_center_x_span < 0.035
+            and upper_center_dx < 0.012
+            and upper_temporal_motion < 0.030
+        )
+        if static_upright_evidence:
+            diagnostics.update({
+                'applied': True,
+                'reason': 'runtime_static_upright_guard',
+                'description': '실시간 짧은 청크에서 보행 점수가 튀었지만 전신 세로 정렬과 중심 안정성이 뚜렷해 서기로 보정했습니다.',
+            })
+            return 'stand', _make_probs('stand', 0.66), diagnostics
+
+        upright_motion_noise_guard = (
+            is_realtime
+            and lower_vis >= 0.70
+            and standing_skel >= 1.65
+            and lying_skel <= 0.05
+            and torso_verticality >= 0.88
+            and stillness >= 0.58
+            and speed_std < 0.012
+            and center_dx < 0.026
+            and upper_center_dx < 0.026
+            and upper_motion_energy < 0.22
+        )
+        if upright_motion_noise_guard:
+            diagnostics.update({
+                'applied': True,
+                'reason': 'runtime_upright_motion_noise_guard',
+                'description': '상체와 bbox가 조금 흔들렸지만 전신 직립 정렬이 강해 보행 노이즈 대신 서기로 보정했습니다.',
+            })
+            return 'stand', _make_probs('stand', 0.66), diagnostics
+
+        unknown_gate = {
+            'avg_conf_min': 0.24 if is_realtime else 0.30,
+            'lower_body_visibility_min': 0.08 if is_realtime else 0.15,
+            'paired_lower_body_visibility_min': 0.22 if is_realtime else 0.30,
+            'paired_avg_conf_min': 0.40 if is_realtime else 0.48,
+        }
+        diagnostics['unknown_gate'] = unknown_gate
+
+        poor_pose_evidence = (
+            avg_conf < unknown_gate['avg_conf_min']
+            or lower_vis < unknown_gate['lower_body_visibility_min']
+            or (
+                lower_vis < unknown_gate['paired_lower_body_visibility_min']
+                and avg_conf < unknown_gate['paired_avg_conf_min']
+            )
+        )
+        diagnostics['poor_pose_evidence'] = bool(poor_pose_evidence)
+
+        run_votes = 0
+        if center_span >= 0.12 and (center_dx >= 0.025 or (speed_std >= 0.018 and stillness < 0.55)):
+            run_votes += 1
+        if center_dx >= 0.050:
+            run_votes += 1
+        if speed_std >= 0.014 and stillness < 0.62:
+            run_votes += 1
+        if run_stride >= 0.16 and (center_dx >= 0.028 or (center_span >= 0.070 and speed_std >= 0.010 and stillness < 0.52)):
+            run_votes += 1
+        if gait_dynamic >= 0.30 and center_dx >= 0.035:
+            run_votes += 1
+        if (upper_center_x_span >= 0.095 or upper_center_dx >= 0.030 or upper_motion_energy >= 0.095) and body_translation_signal:
+            run_votes += 1
+        walk_votes = 0
+        if center_span >= 0.070:
+            walk_votes += 1
+        if center_dx >= 0.026:
+            walk_votes += 1
+        if speed_std >= 0.006 and stillness < 0.80 and walk_displacement_signal:
+            walk_votes += 1
+        if gait_dynamic >= 0.14 and walk_displacement_signal:
+            walk_votes += 1
+        if (
+            upper_motion_signal
+            and (walk_displacement_signal or lower_gait_signal)
+        ):
+            walk_votes += 1
+        strong_lie_geometry = lie_score >= 1.25 and upright_score <= 0.65 and standing_skel <= 0.85
+        strong_sit_hold = (
+            sit_score >= 1.20
+            and stillness >= 0.55
+            and center_dx < 0.020
+            and upper_center_dx < 0.014
+            and upper_motion_energy < 0.070
+        )
+        dynamic_run = (
+            run_votes >= 2
+            and body_translation_signal
+            and walk_displacement_signal
+            and not strong_lie_geometry
+            and not strong_sit_hold
+        )
+        dynamic_walk = walk_votes >= 2 and walk_displacement_signal
+        diagnostics['motion_votes'] = {'walk': walk_votes, 'run': run_votes}
+        if dynamic_run:
+            diagnostics.update({'applied': True, 'reason': 'runtime_run_motion', 'description': '프레임 간 중심 이동과 속도 변화가 커서 뛰기로 보정했습니다.'})
+            return 'run', _make_probs('run', 0.68), diagnostics
+        moving_sit_override = (
+            walk_votes >= 3
+            and stillness <= 0.45
+            and walk_displacement_signal
+            and (speed_std >= 0.006 or center_dx >= 0.012)
+            and lie_score < 0.85
+        )
+        if dynamic_walk and not (lie_score >= 0.85 or (sit_score >= 1.35 and not moving_sit_override)):
+            diagnostics.update({'applied': True, 'reason': 'runtime_walk_motion', 'description': '수평 이동량과 보행 동적 특징이 감지되어 걷기로 보정했습니다.'})
+            return 'walk', _make_probs('walk', 0.62), diagnostics
+
+        upright_lower_body_ok = (
+            lower_vis >= (0.22 if is_realtime else 0.35)
+            or (
+                is_realtime
+                and avg_conf >= 0.26
+                and full_skel_aspect > 0.0
+                and full_skel_aspect <= 0.88
+                and torso_verticality >= 0.70
+                and (leg_verticality >= 0.58 or lower_body_extension >= 0.12 or standing_skel >= 1.05)
+            )
+        )
+        moving_upright_candidate = (
+            is_realtime
+            and top_label in ('walk', 'run')
+            and (stillness <= 0.50 or speed_std >= 0.004 or gait_dynamic >= 0.12)
+            and not upper_only_motion
+            and walk_displacement_signal
+        )
+        upright_clear = (
+            upright_lower_body_ok
+            and not moving_upright_candidate
+            and (
+                upright_score >= 0.95
+                or standing_skel >= 1.05
+                or (
+                    full_skel_aspect > 0.0
+                    and full_skel_aspect <= 0.82
+                    and torso_verticality >= 0.72
+                    and leg_verticality >= 0.70
+                )
+            )
+            and (support_leg >= 0.28 or leg_verticality >= 0.62 or lower_body_extension >= 0.14 or (is_realtime and standing_skel >= 1.12))
+            and (straight_leg >= 0.20 or lower_body_extension >= 0.12 or support_leg >= 0.28 or (is_realtime and torso_verticality >= 0.74))
+            and bent_leg <= (0.50 if is_realtime else 0.42)
+            and (tilt <= 34.0 or torso_verticality >= 0.72)
+            and floor_contact <= 0.45
+            and pose_height >= 0.14
+            and (full_skel_aspect <= 0.95 or standing_skel >= 1.35)
+            and lying_skel <= 0.45
+        )
+        lie_geometry_core = (
+            full_skel_aspect >= 1.18
+            or lying_skel >= 1.18
+            or horizontal_pose >= 0.68
+            or low_flat >= 0.52
+        )
+        lie_not_upright = (
+            standing_skel <= 0.78
+            and upright_score <= 0.60
+            and support_leg <= 0.35
+            and torso_verticality <= 0.58
+            and leg_verticality <= 0.62
+        )
+        lie_clear = (
+            lower_vis >= 0.40
+            and (
+                (lie_geometry_core and (low_flat >= 0.28 or floor_contact >= 0.35 or full_skel_height <= 0.16))
+                or (lie_score >= 1.35 and flatness >= 0.95 and lie_sep >= 0.50)
+                or (label == 'lie' and lie_score >= 2.00 and upright_score <= 0.35 and standing_skel <= 0.85 and torso_verticality <= 0.62)
+            )
+            and lie_not_upright
+            and not upright_clear
+        )
+        sit_clear = (
+            lower_vis >= 0.30
+            and (sit_score >= 1.20 or sitting_skel >= 0.85)
+            and (bent_leg >= 0.35 or knee_mean <= 145.0)
+            and not lie_clear
+        )
+        strong_lie_model_geometry = (
+            label == 'lie'
+            and lower_vis >= 0.40
+            and lie_score >= 2.00
+            and upright_score <= 0.35
+            and standing_skel <= 1.15
+            and not upright_clear
+        )
+
+        if upright_clear:
+            diagnostics.update({'applied': True, 'reason': 'runtime_stand_geometry', 'description': '몸통과 다리의 세로 정렬, 키포인트 높이, 직립 점수가 충분해 서기로 보정했습니다.'})
+            return 'stand', _make_probs('stand', 0.66), diagnostics
+        if label == 'lie' and not lie_clear:
+            if strong_lie_model_geometry:
+                diagnostics.update({'applied': True, 'reason': 'runtime_lie_model_geometry', 'description': '원 모델이 눕기를 선택했고 직립 점수가 낮으며 눕기 기하 점수가 충분해 눕기로 확정했습니다.'})
+                return 'lie', _make_probs('lie', 0.66), diagnostics
+            realtime_lie_to_stand_guard = (
+                is_realtime
+                and standing_skel >= 1.20
+                and lying_skel <= 0.35
+                and torso_verticality >= 0.70
+                and leg_verticality >= 0.68
+                and full_skel_aspect > 0.0
+                and full_skel_aspect <= 0.95
+            )
+            realtime_lie_to_upright_partial = (
+                is_realtime
+                and avg_conf >= 0.18
+                and (
+                    upright_score >= 0.80
+                    or standing_skel >= 0.90
+                    or (
+                        full_skel_aspect > 0.0
+                        and full_skel_aspect <= 1.02
+                        and torso_verticality >= 0.58
+                    )
+                    or (
+                        pose_height >= 0.18
+                        and tilt <= 34.0
+                    )
+                )
+                and lying_skel <= 0.85
+                and floor_contact <= 0.35
+                and low_flat <= 0.40
+                and horizontal_pose <= 0.82
+            )
+            if realtime_lie_to_stand_guard:
+                diagnostics.update({
+                    'applied': True,
+                    'reason': 'runtime_lie_to_stand_guard',
+                    'description': '원 모델은 눕기에 기울었지만 전신 세로비와 몸통/다리 정렬이 직립에 가까워 서기로 보정했습니다.',
+                })
+                return 'stand', _make_probs('stand', 0.64), diagnostics
+            if realtime_lie_to_upright_partial:
+                diagnostics.update({
+                    'applied': True,
+                    'reason': 'runtime_lie_to_upright_partial',
+                    'description': '실시간 입력에서 하반신 근거는 약하지만 상체/bbox가 직립에 가까워 눕기 대신 서기로 보정했습니다.',
+                })
+                return 'stand', _make_probs('stand', 0.54), diagnostics
+            diagnostics.update({
+                'applied': True,
+                'reason': 'lie_evidence_too_weak',
+                'description': '원 모델은 눕기에 기울었지만, 전신 가로비·직립 억제·하반신 검출 조건이 부족해 눕기로 확정하지 않았습니다.',
+            })
+            if is_realtime and lower_vis < 0.35:
+                upper_estimate = self._realtime_upper_body_posture_estimate(feature_windows, classes=cls)
+                if upper_estimate.get('label'):
+                    est_diag = upper_estimate.get('diagnostics', {})
+                    est_diag['reason'] = 'upper_body_lie_reject_estimate'
+                    est_diag['description'] = '원 모델의 눕기 근거가 부족하고 하체가 가려져 상체/bbox 기준으로 행동을 추정했습니다.'
+                    return upper_estimate.get('label'), upper_estimate.get('probs', {}), est_diag
+            if is_realtime:
+                return _realtime_best_effort(
+                    default_label='stand',
+                    reason='realtime_lie_rejected_best_effort',
+                    description='눕기 확정 근거가 약해 미확인 대신 직립/상위 후보 행동으로 표시했습니다.',
+                )
+            return 'unknown', {c: 0.0 for c in cls}, diagnostics
+        if lie_clear:
+            diagnostics.update({'applied': True, 'reason': 'runtime_lie_geometry', 'description': '전신이 가로로 넓고 직립/다리 세로 정렬 증거가 낮아 눕기로 보정했습니다.'})
+            return 'lie', _make_probs('lie', 0.70), diagnostics
+        if sit_clear:
+            diagnostics.update({'applied': True, 'reason': 'runtime_sit_geometry', 'description': '무릎 굽힘과 앉은 자세 기하 점수가 충분해 앉기로 보정했습니다.'})
+            return 'sit', _make_probs('sit', 0.66), diagnostics
+
+        if poor_pose_evidence:
+            realtime_partial_upright_ok = (
+                is_realtime
+                and avg_conf >= 0.16
+                and top_label in ('stand', 'walk', 'run')
+                and (
+                    top_prob >= 0.28
+                    or upright_score >= 0.75
+                    or center_span >= 0.050
+                    or center_dx >= 0.025
+                )
+                and not (top_label in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal))
+                and lie_score < 1.05
+                and lying_skel < 0.85
+                and floor_contact <= 0.35
+            )
+            realtime_bbox_label_ok = (
+                is_realtime
+                and top_label in ('stand', 'walk', 'run')
+                and avg_conf >= 0.20
+                and top_prob >= 0.34
+                and raw_margin >= 0.045
+                and not (top_label in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal))
+                and lie_score < 0.95
+                and lying_skel < 0.70
+            )
+            if realtime_bbox_label_ok:
+                diagnostics.update({
+                    'applied': True,
+                    'reason': 'realtime_bbox_supported_label',
+                    'description': '하반신 키포인트는 약하지만 bbox 이동량과 상체/전신 기하가 일관되어 실시간 행동 라벨을 유지했습니다.',
+                })
+                return top_label, _make_probs(top_label, max(0.52, min(0.66, top_prob))), diagnostics
+            if realtime_partial_upright_ok:
+                diagnostics.update({
+                    'applied': True,
+                    'reason': 'realtime_partial_pose_label',
+                    'description': '실시간 포즈 일부가 약하지만 상체/bbox와 원 모델 상위 라벨이 일치해 임시 행동 라벨을 유지했습니다.',
+                })
+                return top_label, _make_probs(top_label, max(0.42, min(0.58, top_prob))), diagnostics
+            diagnostics.update({
+                'applied': True,
+                'reason': 'low_pose_confidence',
+                'description': '포즈 키포인트 신뢰도 또는 하반신 검출률이 낮아 5개 행동 중 하나로 확정하지 않았습니다.',
+            })
+            if is_realtime:
+                upper_estimate = self._realtime_upper_body_posture_estimate(feature_windows, classes=cls)
+                if upper_estimate.get('label'):
+                    est_diag = upper_estimate.get('diagnostics', {})
+                    est_diag['reason'] = 'upper_body_low_conf_estimate'
+                    est_diag['description'] = '포즈 신뢰도가 낮아도 사람 bbox와 상체 흐름이 있어 상체 기준으로 행동을 추정했습니다.'
+                    return upper_estimate.get('label'), upper_estimate.get('probs', {}), est_diag
+                return _realtime_best_effort(
+                    default_label='stand',
+                    reason='realtime_low_conf_best_effort',
+                    description='포즈 신뢰도는 낮지만 실시간 표시 유지를 위해 가장 그럴듯한 행동으로 추정했습니다.',
+                )
+            return 'unknown', {c: 0.0 for c in cls}, diagnostics
+
+        if raw_margin < 0.035 and raw_rank and raw_rank[0][1] < 0.34:
+            realtime_low_margin_label_ok = (
+                is_realtime
+                and top_label in ('stand', 'walk', 'run')
+                and top_prob >= 0.26
+                and not (top_label in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal))
+                and lie_score < 0.95
+                and lying_skel < 0.80
+                and floor_contact <= 0.35
+            )
+            if realtime_low_margin_label_ok:
+                diagnostics.update({
+                    'applied': True,
+                    'reason': 'realtime_low_margin_label',
+                    'description': '실시간 청크에서 확률 차이는 작지만 눕기/낙상 근거가 낮아 상위 행동 라벨을 유지했습니다.',
+                })
+                return top_label, _make_probs(top_label, max(0.38, min(0.52, top_prob))), diagnostics
+            diagnostics.update({
+                'applied': True,
+                'reason': 'low_margin',
+                'description': '1순위와 2순위 행동 확률 차이가 작아 행동을 확정하지 않았습니다.',
+            })
+            if is_realtime:
+                upper_estimate = self._realtime_upper_body_posture_estimate(feature_windows, classes=cls)
+                if upper_estimate.get('label'):
+                    est_diag = upper_estimate.get('diagnostics', {})
+                    est_diag['reason'] = 'upper_body_low_margin_estimate'
+                    est_diag['description'] = '행동 확률 차이는 작지만 실시간 상체/bbox 흐름으로 임시 행동을 추정했습니다.'
+                    return upper_estimate.get('label'), upper_estimate.get('probs', {}), est_diag
+                return _realtime_best_effort(
+                    default_label='stand',
+                    reason='realtime_low_margin_best_effort',
+                    description='행동 확률 차이가 작아도 실시간 모드에서는 미확인 대신 상위 후보 행동을 표시했습니다.',
+                )
+            return 'unknown', {c: 0.0 for c in cls}, diagnostics
+
+        if label in ('walk', 'run') and not (walk_displacement_signal or lower_gait_signal):
+            target = 'sit' if (sit_score >= max(0.80, upright_score + 0.15) or sitting_skel >= 0.75) else 'stand'
+            diagnostics.update({
+                'applied': True,
+                'reason': 'runtime_walk_displacement_guard',
+                'description': '상체/다리 움직임은 있었지만 4초 청크에서 몸 중심 이동량이 걷기 기준보다 작아 보행 대신 정적 자세로 보정했습니다.',
+            })
+            return target, _make_probs(target, 0.58), diagnostics
+
+        return label, probs, diagnostics
+
     # ── FN-0010: XG-Posture Temporal Smoothing ──────────────────────────
     # Transition constraint matrix: {from_class: set_of_allowed_next_classes}
     # FN-0024: Added stand→run and run→stand to allow detection in short clips
     _POSTURE_TRANSITION_ALLOWED = {
         'stand': {'walk', 'run', 'sit', 'fall', 'stand'},
-        'walk':  {'stand', 'run', 'fall', 'walk'},
+        'walk':  {'stand', 'run', 'fall', 'walk', 'sit'},  # FN-0060: added sit
         'run':   {'walk', 'stand', 'fall', 'run'},
         'sit':   {'stand', 'fall', 'sit'},
         'lie':   {'sit', 'stand', 'fall', 'lie'},
@@ -5367,7 +13583,16 @@ class VideoAnalysis:
         if not posture_windows:
             return []
 
-        classes = self._LABEL_L2_CLASSES  # ['stand','walk','run','sit','lie','fall']
+        active = []
+        for w in posture_windows:
+            probs = w.get('probs', {}) or {}
+            raw_label = w.get('label')
+            for c in self._LABEL_L2_CLASSES:
+                if c == raw_label or c in probs:
+                    active.append(c)
+        classes = [c for c in self._LABEL_L2_CLASSES if c in set(active)]
+        if not classes:
+            classes = list(self._LABEL_L2_CLASSES)
         n = len(posture_windows)
         results = []
 
@@ -5391,6 +13616,34 @@ class VideoAnalysis:
         for i in range(n):
             raw_label = posture_windows[i].get('label', 'stand')
             raw_probs = posture_windows[i].get('probs', {})
+            center_x_span = float(posture_windows[i].get('center_x_span', 0.0) or 0.0)
+            center_dx_abs_mean = float(posture_windows[i].get('center_dx_abs_mean', 0.0) or 0.0)
+            vert_horiz_ratio = float(posture_windows[i].get('vert_horiz_ratio', 0.0) or 0.0)
+            speed_std = float(posture_windows[i].get('speed_std', 0.0) or 0.0)
+            avg_conf = float(posture_windows[i].get('avg_conf', 0.0) or 0.0)
+            lower_body_visibility = float(posture_windows[i].get('lower_body_visibility', 0.0) or 0.0)
+            lie_geometry_score = float(posture_windows[i].get('lie_geometry_score', 0.0) or 0.0)
+            flatness_score = float(posture_windows[i].get('flatness_score', 0.0) or 0.0)
+            upright_geometry_score = float(posture_windows[i].get('upright_geometry_score', 0.0) or 0.0)
+            sit_geometry_score = float(posture_windows[i].get('sit_geometry_score', 0.0) or 0.0)
+            low_height_floor_score = float(posture_windows[i].get('low_height_floor_score', 0.0) or 0.0)
+            floor_height_ratio = float(posture_windows[i].get('floor_height_ratio', 0.0) or 0.0)
+            horizontal_pose_score = float(posture_windows[i].get('horizontal_pose_score', 0.0) or 0.0)
+            lie_stand_separation_score = float(posture_windows[i].get('lie_stand_separation_score', 0.0) or 0.0)
+            pose_spread_max = float(posture_windows[i].get('pose_spread_max', 0.0) or 0.0)
+            apparent_depth_score = float(posture_windows[i].get('apparent_depth_score', 0.0) or 0.0)
+            horizontal_flat_pose_score = float(posture_windows[i].get('horizontal_flat_pose_score', 0.0) or 0.0)
+            low_flat_still_score = float(posture_windows[i].get('low_flat_still_score', 0.0) or 0.0)
+            sit_lie_depth_contrast = float(posture_windows[i].get('sit_lie_depth_contrast', 0.0) or 0.0)
+            width_height_volume_proxy = float(posture_windows[i].get('width_height_volume_proxy', 0.0) or 0.0)
+            full_skeleton_aspect = float(posture_windows[i].get('full_skeleton_aspect', 0.0) or 0.0)
+            full_skeleton_height = float(posture_windows[i].get('full_skeleton_height', 0.0) or 0.0)
+            torso_verticality = float(posture_windows[i].get('torso_verticality', 0.0) or 0.0)
+            leg_verticality = float(posture_windows[i].get('leg_verticality', 0.0) or 0.0)
+            lower_body_extension = float(posture_windows[i].get('lower_body_extension', 0.0) or 0.0)
+            standing_skeleton_score = float(posture_windows[i].get('standing_skeleton_score', 0.0) or 0.0)
+            lying_skeleton_score = float(posture_windows[i].get('lying_skeleton_score', 0.0) or 0.0)
+            sitting_skeleton_score = float(posture_windows[i].get('sitting_skeleton_score', 0.0) or 0.0)
 
             # Collect labels in vote window
             i_start = max(0, i - window_size // 2)
@@ -5407,6 +13660,53 @@ class VideoAnalysis:
             ema_label = max(ema_probs[i], key=ema_probs[i].get)
             ema_conf = ema_probs[i].get(ema_label, 0.0)
             chosen_label = ema_label if ema_conf >= 0.45 else majority_label
+
+            walk_prob = ema_probs[i].get('walk', 0.0)
+            stand_prob = ema_probs[i].get('stand', 0.0)
+            run_prob = ema_probs[i].get('run', 0.0)
+            sit_prob = ema_probs[i].get('sit', 0.0)
+            lie_prob = ema_probs[i].get('lie', 0.0)
+            walk_displacement_signal = self._walk_displacement_signal(
+                center_x_span, center_dx_abs_mean, speed_std, lower_body_visibility
+            )
+            walk_signal = (
+                walk_displacement_signal
+                and (
+                    center_x_span >= 0.070
+                    or center_dx_abs_mean >= 0.026
+                    or vert_horiz_ratio <= 0.85
+                    or (center_x_span >= 0.060 and center_dx_abs_mean >= 0.022 and speed_std >= 0.010)
+                )
+            )
+            strong_walk_signal = (
+                center_x_span >= 0.080
+                or center_dx_abs_mean >= 0.045
+                or (walk_displacement_signal and center_x_span >= 0.070 and center_dx_abs_mean >= 0.026)
+            )
+            run_signal = center_x_span >= 0.250 or center_dx_abs_mean >= 0.120
+
+            if chosen_label == 'stand' and walk_signal:
+                if (
+                    vote_counts.get('walk', 0) >= 2
+                    and walk_prob >= max(0.14, stand_prob * 0.55)
+                    and sit_prob < 0.32
+                    and lie_prob < 0.42
+                ):
+                    chosen_label = 'walk'
+
+            if chosen_label == 'sit' and walk_signal:
+                if (
+                    strong_walk_signal
+                    and walk_prob >= max(0.20, sit_prob - 0.08)
+                    and lie_prob < 0.35
+                ):
+                    chosen_label = 'walk'
+
+            if chosen_label == 'stand' and run_signal:
+                if (
+                    vote_counts.get('run', 0) >= 1 or raw_label == 'run'
+                ) and run_prob >= max(0.10, stand_prob * 0.35):
+                    chosen_label = 'run'
 
             # Transition constraint enforcement
             transition_blocked = False
@@ -5426,9 +13726,281 @@ class VideoAnalysis:
                 'probs': ema_probs[i],
                 'raw_probs': raw_probs,
                 'transition_blocked': transition_blocked,
+                'center_x_span': center_x_span,
+                'center_dx_abs_mean': center_dx_abs_mean,
+                'walk_displacement_signal': walk_displacement_signal,
+                'vert_horiz_ratio': vert_horiz_ratio,
+                'speed_std': speed_std,
+                'avg_conf': avg_conf,
+                'lower_body_visibility': lower_body_visibility,
+                'lie_geometry_score': lie_geometry_score,
+                'flatness_score': flatness_score,
+                'upright_geometry_score': upright_geometry_score,
+                'sit_geometry_score': sit_geometry_score,
+                'low_height_floor_score': low_height_floor_score,
+                'floor_height_ratio': floor_height_ratio,
+                'horizontal_pose_score': horizontal_pose_score,
+                'lie_stand_separation_score': lie_stand_separation_score,
+                'pose_spread_max': pose_spread_max,
+                'apparent_depth_score': apparent_depth_score,
+                'horizontal_flat_pose_score': horizontal_flat_pose_score,
+                'low_flat_still_score': low_flat_still_score,
+                'sit_lie_depth_contrast': sit_lie_depth_contrast,
+                'width_height_volume_proxy': width_height_volume_proxy,
+                'full_skeleton_aspect': full_skeleton_aspect,
+                'full_skeleton_height': full_skeleton_height,
+                'torso_verticality': torso_verticality,
+                'leg_verticality': leg_verticality,
+                'lower_body_extension': lower_body_extension,
+                'standing_skeleton_score': standing_skeleton_score,
+                'lying_skeleton_score': lying_skeleton_score,
+                'sitting_skeleton_score': sitting_skeleton_score,
             })
 
         return results
+
+    def _resolve_posture_sequence_label(self, smoothed_windows, avg_probs=None):
+        """Resolve final posture label from smoothed windows with shared sequence rules."""
+        if not smoothed_windows:
+            return 'stand', avg_probs or {}
+
+        active = []
+        for s in smoothed_windows:
+            probs = s.get('probs', {}) or {}
+            lbl = s.get('label')
+            for c in self._LABEL_L2_CLASSES:
+                if c == lbl or c in probs:
+                    active.append(c)
+        classes = [c for c in self._LABEL_L2_CLASSES if c in set(active)] or list(self._LABEL_L2_CLASSES)
+        label_counts = {}
+        if avg_probs is None:
+            avg_probs = {c: 0.0 for c in classes}
+            for s in smoothed_windows:
+                lbl = s.get('label', 'stand')
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+                probs = s.get('probs', {})
+                for c in classes:
+                    avg_probs[c] += probs.get(c, 0.0)
+            avg_probs = {c: v / len(smoothed_windows) for c, v in avg_probs.items()}
+            total = sum(avg_probs.values())
+            if total > 0:
+                avg_probs = {c: v / total for c, v in avg_probs.items()}
+        else:
+            for s in smoothed_windows:
+                lbl = s.get('label', 'stand')
+                label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
+        posture_label = max(label_counts, key=label_counts.get)
+        smoothed_walk_count = label_counts.get('walk', 0)
+
+        run_like_windows = 0
+        walk_like_windows = 0
+        strong_walk_windows = 0
+        seq_max_span = 0.0
+        seq_max_dx = 0.0
+        seq_avg_vh = 0.0
+        seq_avg_speed_std = 0.0
+        seq_avg_conf = 0.0
+        seq_avg_lower_body = 0.0
+        seq_avg_lie_geometry = 0.0
+        seq_avg_flatness = 0.0
+        seq_avg_upright_geometry = 0.0
+        seq_avg_low_height_floor = 0.0
+        seq_avg_horizontal_pose = 0.0
+        seq_avg_lie_stand_sep = 0.0
+        seq_avg_depth_score = 0.0
+        seq_avg_flat_pose = 0.0
+        seq_avg_low_flat = 0.0
+        seq_avg_sit_lie_contrast = 0.0
+        seq_avg_volume = 0.0
+        seq_avg_full_skel_aspect = 0.0
+        seq_avg_full_skel_height = 0.0
+        seq_avg_torso_verticality = 0.0
+        seq_avg_leg_verticality = 0.0
+        seq_avg_lower_body_extension = 0.0
+        seq_avg_standing_skel = 0.0
+        seq_avg_lying_skel = 0.0
+        seq_avg_sitting_skel = 0.0
+        seq_max_pose_spread = 0.0
+        for s in smoothed_windows:
+            span = float(s.get('center_x_span', 0.0) or 0.0)
+            dx = float(s.get('center_dx_abs_mean', 0.0) or 0.0)
+            vh = float(s.get('vert_horiz_ratio', 0.0) or 0.0)
+            spd = float(s.get('speed_std', 0.0) or 0.0)
+            conf = float(s.get('avg_conf', 0.0) or 0.0)
+            lower_body = float(s.get('lower_body_visibility', 0.0) or 0.0)
+            lie_geometry = float(s.get('lie_geometry_score', 0.0) or 0.0)
+            flatness = float(s.get('flatness_score', 0.0) or 0.0)
+            upright_geometry = float(s.get('upright_geometry_score', 0.0) or 0.0)
+            low_height_floor = float(s.get('low_height_floor_score', 0.0) or 0.0)
+            horizontal_pose = float(s.get('horizontal_pose_score', 0.0) or 0.0)
+            lie_stand_sep = float(s.get('lie_stand_separation_score', 0.0) or 0.0)
+            depth_score = float(s.get('apparent_depth_score', 0.0) or 0.0)
+            flat_pose = float(s.get('horizontal_flat_pose_score', 0.0) or 0.0)
+            low_flat = float(s.get('low_flat_still_score', 0.0) or 0.0)
+            sit_lie_contrast = float(s.get('sit_lie_depth_contrast', 0.0) or 0.0)
+            volume_proxy = float(s.get('width_height_volume_proxy', 0.0) or 0.0)
+            full_skel_aspect = float(s.get('full_skeleton_aspect', 0.0) or 0.0)
+            full_skel_height = float(s.get('full_skeleton_height', 0.0) or 0.0)
+            torso_verticality = float(s.get('torso_verticality', 0.0) or 0.0)
+            leg_verticality = float(s.get('leg_verticality', 0.0) or 0.0)
+            lower_body_extension = float(s.get('lower_body_extension', 0.0) or 0.0)
+            standing_skel = float(s.get('standing_skeleton_score', 0.0) or 0.0)
+            lying_skel = float(s.get('lying_skeleton_score', 0.0) or 0.0)
+            sitting_skel = float(s.get('sitting_skeleton_score', 0.0) or 0.0)
+            pose_spread_max = float(s.get('pose_spread_max', 0.0) or 0.0)
+            walk_displacement = bool(
+                s.get('walk_displacement_signal')
+                or self._walk_displacement_signal(span, dx, spd, lower_body)
+            )
+            seq_max_span = max(seq_max_span, span)
+            seq_max_dx = max(seq_max_dx, dx)
+            seq_avg_vh += vh
+            seq_avg_speed_std += spd
+            seq_avg_conf += conf
+            seq_avg_lower_body += lower_body
+            seq_avg_lie_geometry += lie_geometry
+            seq_avg_flatness += flatness
+            seq_avg_upright_geometry += upright_geometry
+            seq_avg_low_height_floor += low_height_floor
+            seq_avg_horizontal_pose += horizontal_pose
+            seq_avg_lie_stand_sep += lie_stand_sep
+            seq_avg_depth_score += depth_score
+            seq_avg_flat_pose += flat_pose
+            seq_avg_low_flat += low_flat
+            seq_avg_sit_lie_contrast += sit_lie_contrast
+            seq_avg_volume += volume_proxy
+            seq_avg_full_skel_aspect += full_skel_aspect
+            seq_avg_full_skel_height += full_skel_height
+            seq_avg_torso_verticality += torso_verticality
+            seq_avg_leg_verticality += leg_verticality
+            seq_avg_lower_body_extension += lower_body_extension
+            seq_avg_standing_skel += standing_skel
+            seq_avg_lying_skel += lying_skel
+            seq_avg_sitting_skel += sitting_skel
+            seq_max_pose_spread = max(seq_max_pose_spread, pose_spread_max)
+            if span >= 0.250 or dx >= 0.120:
+                run_like_windows += 1
+            if walk_displacement and (span >= 0.070 or dx >= 0.026 or vh <= 0.85 or (span >= 0.060 and dx >= 0.022 and spd >= 0.010)):
+                walk_like_windows += 1
+            if span >= 0.080 or dx >= 0.045 or (walk_displacement and span >= 0.070 and dx >= 0.026):
+                strong_walk_windows += 1
+
+        seq_len = max(len(smoothed_windows), 1)
+        seq_avg_vh /= seq_len
+        seq_avg_speed_std /= seq_len
+        seq_avg_conf /= seq_len
+        seq_avg_lower_body /= seq_len
+        seq_avg_lie_geometry /= seq_len
+        seq_avg_flatness /= seq_len
+        seq_avg_upright_geometry /= seq_len
+        seq_avg_low_height_floor /= seq_len
+        seq_avg_horizontal_pose /= seq_len
+        seq_avg_lie_stand_sep /= seq_len
+        seq_avg_depth_score /= seq_len
+        seq_avg_flat_pose /= seq_len
+        seq_avg_low_flat /= seq_len
+        seq_avg_sit_lie_contrast /= seq_len
+        seq_avg_volume /= seq_len
+        seq_avg_full_skel_aspect /= seq_len
+        seq_avg_full_skel_height /= seq_len
+        seq_avg_torso_verticality /= seq_len
+        seq_avg_leg_verticality /= seq_len
+        seq_avg_lower_body_extension /= seq_len
+        seq_avg_standing_skel /= seq_len
+        seq_avg_lying_skel /= seq_len
+        seq_avg_sitting_skel /= seq_len
+
+        run_prob = avg_probs.get('run', 0.0)
+        walk_prob = avg_probs.get('walk', 0.0)
+        stand_prob = avg_probs.get('stand', 0.0)
+        sit_prob = avg_probs.get('sit', 0.0)
+        lie_prob = avg_probs.get('lie', 0.0)
+
+        if posture_label == 'stand' and run_like_windows >= 2:
+            if run_prob >= max(0.12, stand_prob * 0.45):
+                posture_label = 'run'
+
+        if posture_label in ('stand', 'sit'):
+            walk_min_windows = max(2, (seq_len * 6 + 9) // 10)
+            strong_walk_min_windows = max(1, (seq_len * 3 + 9) // 10)
+            walk_majority_signal = (
+                smoothed_walk_count >= max(4, seq_len // 2 + 1)
+                and walk_like_windows >= walk_min_windows
+                and strong_walk_windows >= strong_walk_min_windows
+                and seq_avg_conf >= 0.62
+                and seq_avg_lower_body >= 0.18
+            )
+            walk_motion_override = (
+                walk_like_windows >= walk_min_windows
+                and strong_walk_windows >= strong_walk_min_windows
+                and seq_max_dx >= 0.075
+                and seq_avg_vh <= 0.95
+                and seq_avg_speed_std >= 0.004
+                and seq_avg_conf >= 0.62
+                and seq_avg_lower_body >= 0.18
+            )
+            if walk_majority_signal:
+                if (
+                    walk_prob >= max(0.18, stand_prob * 0.74)
+                    and walk_prob >= sit_prob - 0.03
+                    and lie_prob <= 0.32
+                    and run_prob <= 0.16
+                ):
+                    posture_label = 'walk'
+            elif walk_motion_override:
+                if (
+                    walk_prob >= max(0.24, stand_prob * 0.80)
+                    and walk_prob >= sit_prob - 0.03
+                    and lie_prob <= 0.30
+                    and run_prob <= 0.16
+                ):
+                    posture_label = 'walk'
+
+        strong_upright_sequence = (
+            seq_avg_standing_skel >= 1.20
+            or (
+                seq_avg_full_skel_aspect > 0.0
+                and seq_avg_full_skel_aspect <= 0.82
+                and seq_avg_torso_verticality >= 0.72
+                and seq_avg_leg_verticality >= 0.70
+                and seq_avg_lower_body_extension >= 0.16
+            )
+        )
+        if posture_label in ('stand', 'sit') and 'lie' in classes:
+            lie_geometry_score_count = 0
+            if seq_avg_full_skel_aspect >= 1.05:
+                lie_geometry_score_count += 1
+            if seq_avg_lying_skel >= 0.85:
+                lie_geometry_score_count += 1
+            if seq_avg_horizontal_pose >= 0.72 or seq_avg_flat_pose >= 0.95:
+                lie_geometry_score_count += 1
+            if seq_avg_low_height_floor >= 0.32 or seq_avg_low_flat >= 0.28:
+                lie_geometry_score_count += 1
+            if seq_avg_lie_stand_sep >= 0.50 and seq_avg_sit_lie_contrast >= 0.12:
+                lie_geometry_score_count += 1
+            lie_geometry_signal = lie_geometry_score_count >= 2
+            low_motion_signal = seq_max_dx <= 0.055 and seq_avg_speed_std <= 0.035
+            not_upright_signal = (
+                not strong_upright_sequence
+                and seq_avg_standing_skel <= 0.95
+                and seq_avg_upright_geometry <= 0.72
+                and seq_avg_torso_verticality <= 0.68
+                and seq_avg_leg_verticality <= 0.70
+            )
+            no_gait_signal = walk_prob < 0.22 and run_prob < 0.18
+            close_lie_probability = lie_prob >= max(stand_prob, sit_prob) - 0.16
+            if (
+                lie_prob >= 0.20
+                and close_lie_probability
+                and lie_geometry_signal
+                and low_motion_signal
+                and not_upright_signal
+                and no_gait_signal
+            ):
+                posture_label = 'lie'
+
+        return posture_label, avg_probs
 
     # ── FN-0010: Decision Arbitration — Fall vs Posture ────────────────
     # Decision states for XG-Dual pipeline
@@ -5488,6 +14060,15 @@ class VideoAnalysis:
             if posture_label != 'fall':
                 explain.append(f'자세 분류({posture_label})와 불일치, 안전 우선 적용.')
 
+        # Case 4b: No fall detected but posture model says fall (FN-0054)
+        elif not fall_detected and posture_label == 'fall':
+            if posture_score >= 0.40:
+                state = 'fall_suspected'
+                explain.append(f'자세 분류가 낙상({posture_score:.0%})이지만 이진 분류에서 확인되지 않음. 주의 관찰.')
+            else:
+                state = 'uncertain'
+                explain.append('자세 분류에서 약한 낙상 신호 감지. 판정 불확실.')
+
         # Case 5: No fall, posture active
         elif posture_score >= 0.40 and posture_label in ('stand', 'walk', 'run', 'sit', 'lie'):
             state = 'posture_only' if posture_label != 'fall' else 'fall_suspected'
@@ -5525,7 +14106,7 @@ class VideoAnalysis:
         import numpy as np
         import pandas as pd
         from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-        from sklearn.model_selection import StratifiedKFold, cross_validate
+        from sklearn.model_selection import StratifiedKFold, cross_validate, cross_val_predict
 
         try:
             from xgboost import XGBClassifier
@@ -5567,7 +14148,7 @@ class VideoAnalysis:
 
         summary = {
             'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model_type': 'xg-fall-37',
+            'model_type': f'xg-fall-{len(feature_cols)}',
             'training_samples': len(rows),
             'class_distribution': {
                 'Y': len([r for r in rows if r['label'] == 'Y']),
@@ -5582,7 +14163,7 @@ class VideoAnalysis:
         errors = []
         if summary['class_distribution']['Y'] < 2 or summary['class_distribution']['N'] < 2:
             summary['message'] = 'XG-Fall 재학습은 클래스별 최소 2건 이상 필요합니다.'
-            self._write_json(self._project_abspath(self._XG_FALL_SUMMARY_REL_PATH), summary)
+            self._write_json(self._xg_fall_summary_path(), summary)
             return {'summary': summary, 'errors': errors}
 
         df = pd.DataFrame(rows)
@@ -5608,6 +14189,10 @@ class VideoAnalysis:
         scoring = {'accuracy': 'accuracy', 'precision': 'precision', 'recall': 'recall', 'f1': 'f1', 'roc_auc': 'roc_auc'}
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         cv_results = cross_validate(model, X, y, cv=cv, scoring=scoring, return_train_score=False)
+        try:
+            oof_proba = cross_val_predict(model, X, y, cv=cv, method='predict_proba')[:, 1]
+        except Exception:
+            oof_proba = None
         model.fit(X, y)
 
         model_path = self._xg_fall_model_path()
@@ -5628,10 +14213,12 @@ class VideoAnalysis:
 
         y_pred = model.predict(X)
         y_proba = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else None
+        tuned_thresholds = self._tune_binary_thresholds(y, oof_proba if oof_proba is not None else (y_proba if y_proba is not None else y_pred.astype(float)))
         summary.update({
             'ready': True,
             'model_path': self._project_relative_path(model_path),
             'algorithm': 'XGBClassifier' if _use_xgb else 'GradientBoostingClassifier',
+            'tuned_thresholds': tuned_thresholds,
             'cv': {
                 'folds': n_splits,
                 'accuracy': round(float(np.mean(cv_results['test_accuracy'])), 4),
@@ -5649,14 +14236,14 @@ class VideoAnalysis:
             },
             'feature_importance': {col: round(float(imp), 4) for col, imp in zip(feature_cols, model.feature_importances_)} if hasattr(model, 'feature_importances_') else {},
         })
-        self._write_json(self._project_abspath(self._XG_FALL_SUMMARY_REL_PATH), summary)
+        self._write_json(self._xg_fall_summary_path(), summary)
         return {'summary': summary, 'errors': errors}
 
     # ── FN-0008: XG-Posture multiclass retrain ──────────────────────────
     _XG_POSTURE_CLASSES = ['stand', 'walk', 'run', 'sit', 'lie', 'fall']
 
     def retrain_xg_posture(self):
-        """Train XG-Posture 6-class classifier with 37 features.
+        """Train XG-Posture classifier with runtime pose features.
 
         Expects posture-labeled data in intake/{posture_class}/ directories
         (e.g. intake/stand/, intake/walk/, ..., intake/fall/).
@@ -5670,6 +14257,7 @@ class VideoAnalysis:
         import pandas as pd
         from sklearn.metrics import accuracy_score, f1_score, classification_report
         from sklearn.model_selection import StratifiedKFold, cross_validate
+        from sklearn.utils.class_weight import compute_sample_weight
 
         try:
             from xgboost import XGBClassifier
@@ -5678,7 +14266,8 @@ class VideoAnalysis:
             from sklearn.ensemble import GradientBoostingClassifier
             _use_xgb = False
 
-        feature_cols = self._XG_FEATURE_COLUMNS
+        # FN-0059: Drop n_points (domain proxy: CCTV detects fewer points than webcam/KTH)
+        feature_cols = [c for c in self._XG_FEATURE_COLUMNS if c != 'n_points']
         posture_classes = self._XG_POSTURE_CLASSES
         class_to_int = {c: i for i, c in enumerate(posture_classes)}
         rows = []
@@ -5711,7 +14300,7 @@ class VideoAnalysis:
                         if not windows:
                             skipped.append({'video': name, 'class': cls_name, 'reason': 'No valid windows'})
                             continue
-                        best_w = max(windows, key=lambda w: w.get('max_down_speed', 0) + w.get('floor_proximity', 0))
+                        best_w = max(windows, key=lambda w: w.get('oscillation_count', 0) + w.get('speed_std', 0) * 10 + w.get('center_y_periodicity', 0))
                         row = {'video': name, 'posture': cls_name}
                         for col in feature_cols:
                             row[col] = float(best_w.get(col, 0.0) or 0.0)
@@ -5738,7 +14327,7 @@ class VideoAnalysis:
                         if not windows:
                             skipped.append({'video': name, 'class': posture, 'reason': 'No valid windows'})
                             continue
-                        best_w = max(windows, key=lambda w: w.get('max_down_speed', 0) + w.get('floor_proximity', 0))
+                        best_w = max(windows, key=lambda w: w.get('oscillation_count', 0) + w.get('speed_std', 0) * 10 + w.get('center_y_periodicity', 0))
                         row = {'video': name, 'posture': posture}
                         for col in feature_cols:
                             row[col] = float(best_w.get(col, 0.0) or 0.0)
@@ -5752,21 +14341,45 @@ class VideoAnalysis:
 
         summary = {
             'updated_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model_type': 'xg-posture-37',
+            'trained_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'model_type': f'xg-posture-{len(feature_cols)}',
             'training_samples': len(rows),
             'class_distribution': class_dist,
             'features': list(feature_cols),
             'feature_count': len(feature_cols),
+            'n_features': len(feature_cols),
             'classes': posture_classes,
             'source': 'posture-dirs' if has_posture_dirs else 'yn-bootstrap',
             'skipped': skipped,
             'ready': False,
         }
+        external_pose = self._load_external_pose_training_rows(feature_cols)
+        if external_pose.get('rows'):
+            rows.extend(external_pose.get('rows', []))
+            summary['external_pose_dataset'] = {
+                'dataset_root': external_pose.get('dataset_root', ''),
+                'dataset_roots': external_pose.get('dataset_roots', []),
+                'class_distribution': external_pose.get('counts', {}),
+                'rule_distribution': external_pose.get('rule_distribution', {}),
+                'action_distribution': external_pose.get('action_distribution', {}),
+                'selected_examples': external_pose.get('selected_examples', {}),
+                'used_files': int(external_pose.get('used_files', 0) or 0),
+                'scanned_files': int(external_pose.get('scanned_files', 0) or 0),
+                'skipped_files': external_pose.get('skipped_files', []),
+                'aihub61_dataset': external_pose.get('aihub61_dataset', {}),
+            }
+            class_dist = {}
+            for cls_name in posture_classes:
+                class_dist[cls_name] = len([r for r in rows if r['posture'] == cls_name])
+            summary['training_samples'] = len(rows)
+            summary['class_distribution'] = class_dist
         errors = []
         active_classes = [c for c in posture_classes if class_dist.get(c, 0) >= 2]
         if len(active_classes) < 2:
             summary['message'] = f'XG-Posture 재학습은 최소 2개 클래스(각 2건 이상)가 필요합니다. 현재 활성 클래스: {active_classes}'
-            self._write_json(self._project_abspath(self._XG_POSTURE_SUMMARY_REL_PATH), summary)
+            summary['n_classes'] = len(active_classes)
+            summary['n_windows'] = len(rows)
+            self._write_json(self._xg_posture_summary_path(), summary)
             return {'summary': summary, 'errors': errors}
 
         # Filter to active classes only
@@ -5777,20 +14390,25 @@ class VideoAnalysis:
 
         active_to_int = {c: i for i, c in enumerate(active_classes)}
         y = df['posture'].map(active_to_int).to_numpy()
+        sample_weight = compute_sample_weight(class_weight='balanced', y=y)
         min_class_count = min(int(np.sum(y == i)) for i in range(len(active_classes)))
         n_splits = min(3, min_class_count) if min_class_count >= 2 else 2
 
         n_classes = len(active_classes)
+        # Behavior-tuned regularization: geometry features raised OOF macro F1
+        # while shallow trees keep sit/lie boundary overfit under control.
         if _use_xgb:
             model = XGBClassifier(
-                n_estimators=200, max_depth=6, learning_rate=0.1,
+                n_estimators=160, max_depth=3, learning_rate=0.065,
                 objective='multi:softprob', num_class=n_classes,
-                eval_metric='mlogloss', random_state=42, n_jobs=-1,
-                use_label_encoder=False,
+                eval_metric='mlogloss', random_state=42, n_jobs=2,
+                min_child_weight=4, subsample=0.86, colsample_bytree=0.86,
+                reg_alpha=0.08, reg_lambda=1.8,
             )
         else:
             model = GradientBoostingClassifier(
-                n_estimators=200, max_depth=6, learning_rate=0.1, random_state=42,
+                n_estimators=200, max_depth=3, learning_rate=0.08, random_state=42,
+                min_samples_leaf=10, subsample=0.8,
             )
 
         scoring = {
@@ -5799,7 +14417,7 @@ class VideoAnalysis:
         }
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         cv_results = cross_validate(model, X, y, cv=cv, scoring=scoring, return_train_score=False)
-        model.fit(X, y)
+        model.fit(X, y, sample_weight=sample_weight)
 
         # Save model with class mapping metadata
         model_data = {
@@ -5833,25 +14451,30 @@ class VideoAnalysis:
         summary.update({
             'ready': True,
             'active_classes': active_classes,
+            'n_classes': len(active_classes),
+            'n_windows': len(filtered),
             'model_path': self._project_relative_path(model_path),
             'algorithm': 'XGBClassifier' if _use_xgb else 'GradientBoostingClassifier',
+            'class_balance_strategy': 'external caps + balanced sample weights',
             'cv': {
                 'folds': n_splits,
                 'accuracy': round(float(np.mean(cv_results['test_accuracy'])), 4),
                 'f1_macro': round(float(np.mean(cv_results['test_f1_macro'])), 4),
             },
+            'cv_accuracy': round(float(np.mean(cv_results['test_accuracy'])), 4),
             'train_metrics': {
                 'accuracy': round(float(accuracy_score(y, y_pred)), 4),
                 'f1_macro': round(float(f1_score(y, y_pred, average='macro', zero_division=0)), 4),
                 'class_recall': class_recall,
             },
+            'train_accuracy': round(float(accuracy_score(y, y_pred)), 4),
             'feature_importance': {col: round(float(imp), 4) for col, imp in zip(feature_cols, model.feature_importances_)} if hasattr(model, 'feature_importances_') else {},
         })
-        self._write_json(self._project_abspath(self._XG_POSTURE_SUMMARY_REL_PATH), summary)
+        self._write_json(self._xg_posture_summary_path(), summary)
         return {'summary': summary, 'errors': errors}
 
     def submit_analysis_feedback(self, saved_name, predicted_label, feedback_status, actual_label='', note='', retrain=False, posture_class='', predicted_posture='', ambiguity_flag=False, occlusion_flag=False, short_clip_flag=False):
-        """FN-0013: 2-Level 피드백 (낙상 Y/N + 자세 6-class + 애매함 태깅).
+        """FN-0013: 2-Level 피드백 (낙상 Y/N + 자세/행동 class + 애매함 태깅).
 
         Parameters:
             saved_name: 분석했던 파일 이름
@@ -5951,6 +14574,9 @@ class VideoAnalysis:
             'posture_intake_saved': posture_intake_saved,
             'is_hard_case': is_hard_case,
             'feedback_summary': feedback_summary,
+            'manual_retrain_requested': bool(retrain),
+            'training_effect': 'queued_for_next_retrain',
+            'learning_message': '피드백을 학습 intake에 저장했습니다. 아직 모델 가중치는 바뀌지 않았고, 재학습 실행 시 반영됩니다.',
         }
         # FN-0013: 분리된 재학습 트리거
         auto_retrain_triggered = False
@@ -5961,6 +14587,9 @@ class VideoAnalysis:
         if retrain:
             result['retrain'] = self.retrain_baseline()
             result['auto_retrain_triggered'] = auto_retrain_triggered
+            result['manual_retrain_triggered'] = not auto_retrain_triggered
+            result['training_effect'] = 'retrained'
+            result['learning_message'] = '피드백 저장 후 재학습을 실행했습니다. 새 모델 요약을 확인하세요.'
             if auto_retrain_triggered:
                 result['auto_retrain_reason'] = f"마지막 학습 이후 {feedback_summary.get('since_last_train', 0)}건 피드백 누적 (임계값: {self.AUTO_RETRAIN_THRESHOLD}건)"
         # XG-Posture 별도 자동 재학습: 자세 피드백 누적 시 트리거
@@ -5970,6 +14599,8 @@ class VideoAnalysis:
                 result['posture_retrain'] = self.retrain_xg_posture()
                 auto_posture_retrain_triggered = True
                 result['auto_posture_retrain_triggered'] = True
+                result['training_effect'] = 'posture_retrained'
+                result['learning_message'] = '자세 피드백 저장 후 자세 분류 모델 재학습을 실행했습니다.'
                 result['auto_posture_retrain_reason'] = f"자세 피드백 {posture_count}건 누적 (임계값: {self.AUTO_RETRAIN_THRESHOLD}건)"
             except Exception as e:
                 result['posture_retrain_error'] = str(e)
@@ -6051,6 +14682,63 @@ class VideoAnalysis:
             'clip_window': clip_window,
             'clip_info': self._extract_clip(video_path, 'reference-' + scene_id, clip_window),
             'video_meta': meta,
+        }
+
+    def chunk_preview_info(self, saved_name, chunk_id):
+        saved_name = self._sanitize_filename(saved_name)
+        if len(saved_name) == 0:
+            raise Exception('분석 원본 영상 정보가 없습니다.')
+        try:
+            chunk_id = int(chunk_id)
+        except Exception:
+            raise Exception('청크 번호가 올바르지 않습니다.')
+        if chunk_id <= 0:
+            raise Exception('청크 번호가 올바르지 않습니다.')
+
+        video_path, meta_path = self._load_upload_paths(saved_name)
+        if os.path.exists(video_path) is False:
+            raise Exception('원본 영상을 찾을 수 없습니다.')
+
+        meta = self._read_json(meta_path, default={}) or {}
+        logs = (((meta.get('last_analysis', {}) or {}).get('chunk_analysis', {}) or {}).get('logs', []) or [])
+        target = None
+        for item in logs:
+            try:
+                if int(item.get('chunk_id', 0) or 0) == chunk_id:
+                    target = item
+                    break
+            except Exception:
+                continue
+        if target is None:
+            raise Exception('부분 영상 정보를 찾을 수 없습니다.')
+
+        window = target.get('window', {}) or {}
+        if len(window) == 0:
+            raise Exception('부분 영상 구간 정보가 없습니다.')
+        clip_key = 'chunk-preview-' + saved_name + '-' + str(chunk_id)
+        return {
+            'saved_name': saved_name,
+            'chunk_id': chunk_id,
+            'chunk_label': target.get('chunk_label', window.get('label', '청크 ' + str(chunk_id))),
+            'window': window,
+            'clip_info': self._extract_clip(video_path, clip_key, window),
+            'video_meta': self._video_meta(video_path),
+        }
+
+    def upload_video_info(self, saved_name):
+        saved_name = self._sanitize_filename(saved_name)
+        if len(saved_name) == 0:
+            raise Exception('분석 원본 영상 정보가 없습니다.')
+        video_path, meta_path = self._load_upload_paths(saved_name)
+        if os.path.exists(video_path) is False:
+            raise Exception('원본 영상을 찾을 수 없습니다.')
+        meta = self._read_json(meta_path, default={}) or {}
+        return {
+            'saved_name': saved_name,
+            'video_path': video_path,
+            'video_meta': self._video_meta(video_path),
+            'filename': meta.get('filename', saved_name),
+            'uploaded_at': meta.get('uploaded_at', ''),
         }
 
     def _send_sms(self, sms_config, recipient_phone, message_body):
@@ -6394,7 +15082,7 @@ class VideoAnalysis:
 
         # Save report
         try:
-            report_dir = os.path.join(self._project_root(), 'data', 'storage', 'training', 'fall-detection', 'evaluation')
+            report_dir = self._project_abspath('storage', 'training', 'fall-detection', 'evaluation')
             os.makedirs(report_dir, exist_ok=True)
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             report_path = os.path.join(report_dir, f'eval_{eval_type}_{ts}.json')
@@ -6415,14 +15103,13 @@ class VideoAnalysis:
         if '/opt/app/my_libs' not in _sys.path:
             _sys.path.insert(0, '/opt/app/my_libs')
         import numpy as np
-        from sklearn.model_selection import StratifiedKFold, cross_validate
         from sklearn.metrics import classification_report, confusion_matrix
 
         if not self._xg_fall_available():
             return {'status': 'unavailable', 'message': 'XG-Fall 모델이 없습니다.'}
 
         # Load intake data for fall/non-fall
-        intake_dir = os.path.join(self._project_root(), 'data', 'storage', 'training', 'fall-detection', 'intake')
+        intake_dir = self._training_dir()
         samples = []
         labels = []
 
@@ -6443,45 +15130,36 @@ class VideoAnalysis:
                 'sample_count': total,
             }
 
-        # Extract features from video files
-        features = []
-        valid_labels = []
-        for i, (video_path, label) in enumerate(zip(samples, labels)):
+        cases = []
+        for video_path, label in zip(samples, labels):
             try:
-                ts_result = self._extract_unified_timeseries(video_path, input_source='file')
-                timeseries = ts_result.get('timeseries', [])
-                vid_meta = ts_result.get('vid_meta', {})
-                if len(timeseries) < 2:
-                    continue
-                windows = self._build_xg_feature_windows(timeseries, vid_meta, window_sec=1.0, stride_sec=0.5)
-                if len(windows) == 0:
-                    continue
-                # Use max-probability window features
-                feature_cols = self._XG_FEATURE_COLUMNS
-                X_win = np.array([[w.get(col, 0.0) for col in feature_cols] for w in windows])
-                X_win = np.nan_to_num(X_win, nan=0.0, posinf=0.0, neginf=0.0)
-                # Aggregate: use feature vector of max-probability window (simulated)
-                features.append(np.mean(X_win, axis=0))
-                valid_labels.append(label)
+                result = self._infer_xg_fall(video_path, filename=os.path.basename(video_path), analysis_profile='balanced', input_source='file')
+                ri = result.get('runtime_inference', {}) or {}
+                cases.append({
+                    'video': os.path.basename(video_path),
+                    'path': self._project_relative_path(video_path) if os.path.isfile(video_path) else video_path,
+                    'actual': int(label),
+                    'predicted': 1 if result.get('fall_detected') else 0,
+                    'score': round(float(result.get('risk_score', 0.0) or 0.0), 4),
+                    'fall_band': ri.get('fall_band', 'non-fall'),
+                    'motion_gate_passed': bool(ri.get('motion_gate_passed', False)),
+                    'suppressed_by': ri.get('suppressed_by', []) or [],
+                    'case_type': self._classify_failure_case_type(video_path, int(label)),
+                })
             except Exception:
                 continue
 
-        n_valid = len(features)
+        n_valid = len(cases)
         if n_valid < 10:
             return {
                 'status': 'insufficient_features',
-                'message': f'특징 추출 성공 {n_valid}/{total}건. 최소 10건 필요.',
+                'message': f'평가 성공 {n_valid}/{total}건. 최소 10건 필요.',
                 'extracted': n_valid,
                 'total': total,
             }
 
-        X = np.array(features)
-        y = np.array(valid_labels)
-
-        # Load model and predict
-        model = self._get_xg_fall_model()
-        y_pred = model.predict(X)
-        y_proba = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else y_pred.astype(float)
+        y = np.array([c['actual'] for c in cases])
+        y_pred = np.array([c['predicted'] for c in cases])
 
         # Metrics
         report = classification_report(y, y_pred, target_names=['non-fall', 'fall'], output_dict=True, zero_division=0)
@@ -6514,11 +15192,12 @@ class VideoAnalysis:
                 'non-fall': {k: round(v, 4) for k, v in report['non-fall'].items()},
                 'fall': {k: round(v, 4) for k, v in report['fall'].items()},
             },
-            'threshold': self._XG_FALL_THRESHOLD,
+            'thresholds': self._xg_fall_thresholds(),
+            'failure_report': self._build_binary_failure_report(cases),
         }
 
     def _evaluate_xg_posture(self):
-        """Evaluate XG-Posture 6-class classifier using posture intake data.
+        """Evaluate XG-Posture classifier using posture intake data.
 
         Metrics: macro F1, class-wise recall, confusion rates (sit/fall, lie/fall, walk/run).
         """
@@ -6531,7 +15210,7 @@ class VideoAnalysis:
         if not self._xg_posture_available():
             return {'status': 'unavailable', 'message': 'XG-Posture 모델이 없습니다.'}
 
-        intake_dir = os.path.join(self._project_root(), 'data', 'storage', 'training', 'fall-detection', 'intake')
+        intake_dir = self._training_dir()
         posture_classes = self._XG_POSTURE_CLASSES  # ['stand', 'walk', 'run', 'sit', 'lie', 'fall']
 
         samples = []
@@ -6682,7 +15361,7 @@ class VideoAnalysis:
             'xg_fall': {
                 'available': xg_fall_ready,
                 'model_path': self._project_relative_path(self._xg_fall_model_path()) if xg_fall_ready else None,
-                'threshold': self._XG_FALL_THRESHOLD,
+                'thresholds': self._xg_fall_thresholds(),
             },
             'xg_posture': {
                 'available': xg_posture_ready,
@@ -6707,7 +15386,7 @@ class VideoAnalysis:
 
         # Short-clip robustness (existence of short clips in intake)
         short_clip_count = 0
-        intake_dir = os.path.join(self._project_root(), 'data', 'storage', 'training', 'fall-detection', 'intake')
+        intake_dir = self._training_dir()
         for sub in ['Y', 'N']:
             sub_dir = os.path.join(intake_dir, sub)
             if os.path.isdir(sub_dir):
@@ -6775,7 +15454,7 @@ class VideoAnalysis:
         report['model_status'] = {
             'xg_fall': {
                 'available': self._xg_fall_available(),
-                'threshold': self._XG_FALL_THRESHOLD,
+                'thresholds': self._xg_fall_thresholds(),
             },
             'xg_posture': {
                 'available': self._xg_posture_available(),
@@ -6805,7 +15484,7 @@ class VideoAnalysis:
 
         # Save
         try:
-            report_dir = os.path.join(self._project_root(), 'data', 'storage', 'training', 'fall-detection', 'evaluation')
+            report_dir = self._project_abspath('storage', 'training', 'fall-detection', 'evaluation')
             os.makedirs(report_dir, exist_ok=True)
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             report_path = os.path.join(report_dir, f'baseline_{ts}.json')

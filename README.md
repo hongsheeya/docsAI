@@ -1,7 +1,29 @@
-# WIZ Sample Project
+# FallAI Project
 
-WIZ 프레임워크 기반 샘플 프로젝트입니다.  
-게시판, 사용자 관리, 대시보드 등의 기본 기능을 **Struct 패턴**과 **Portal 패키지** 구조로 구현한 레퍼런스 애플리케이션입니다.
+WIZ 프레임워크 기반 FallAI 운영 프로젝트입니다.
+현재는 **낙상 탐지 / 자세 분류 / 실시간 영상 분석** 중심으로 운영 중이며, 게시판·사용자관리·대시보드 구조 위에 프로토타입 기능이 확장되어 있습니다.
+
+---
+
+## 현재 모델 상태 (2026-04-27)
+
+- 기본 업로드/실시간 운영 축: `rf-dual`
+- 청크 정책: `0~2 / 0~4 / 0~5` Dense Bootstrap 뒤 `2~7 / 4~9 / 6~11` 형태의 2초 간격 5초 슬라이딩 윈도우
+- RF 운영 모델: Validation 1100영상 기반 재학습본
+    - Train `899`, Validation `200`
+    - Accuracy `89.5%`
+    - Precision `84.96%`
+    - Recall `96.0%`
+    - F1 `90.14%`
+    - 운영 threshold `0.35`
+- XG-Posture: 6-class 재학습 완료, CV accuracy `93.7%`
+- 운영 행동분류 노출: **5-class (`stand/walk/run/sit/lie`)**
+- raw 6-class `fall` 확률은 **진단용(`posture_raw_*`)으로만 유지**
+- `sit ↔ lie` 경계: 상체가 직립에 가깝고 무릎 굽힘이 보이는 경우 `upright_sit_guard`로 `lie` rescue를 억제
+- XG-Posture 학습 검증: **clip-grouped CV** 기준으로 누수 방지 적용
+- 기존 업로드 재평가: FP `0`, FN `0`
+
+상세 운영 문서는 [docs/prototype/fall-detection/README.md](docs/prototype/fall-detection/README.md), 전체 개요는 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)를 참고합니다. [docs/xg-dual-architecture.md](docs/xg-dual-architecture.md)는 **레거시 설계 문서**이며, 현재 운영 기준은 RF-Dual입니다.
 
 ---
 

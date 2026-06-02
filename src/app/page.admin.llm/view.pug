@@ -1,0 +1,75 @@
+nav(class="sticky top-0 z-20 border-b border-zinc-200 bg-white/95 backdrop-blur")
+    div(class="max-w-5xl px-4 py-3 sm:px-6 lg:px-8")
+        div(class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between")
+            div(class="min-w-0 flex items-center gap-3")
+                span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
+                    img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
+                div
+                    h1(class="text-lg font-semibold text-zinc-950") LLM 판독 설정
+                    p(class="text-xs text-zinc-400") FallAI · OpenAI · 서버 보관 설정
+            div(class="flex flex-wrap items-center gap-2")
+                a(routerLink="/", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 메인
+                a(routerLink="/pipeline", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 파이프라인
+                a(routerLink="/admin/analysis", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 분석 설정
+
+div(class="max-w-5xl px-4 pb-10 pt-6 sm:px-6 lg:px-8")
+    div(class="mb-5 flex flex-wrap items-center justify-between gap-3")
+        div
+            p(class="text-[13px] font-medium text-gray-900") 현재 상태
+            p(class="mt-1 text-xs text-gray-500") 저장된 키는 서버에서만 사용하고 화면에는 마스킹 값만 표시합니다.
+        span(class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold", [ngClass]="statusClass()") {{statusLabel()}}
+
+    div(class="grid gap-6 lg:grid-cols-[1fr_360px]")
+        section(class="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm")
+            div(class="flex items-center justify-between gap-3")
+                div
+                    h2(class="text-[15px] font-semibold text-gray-900") OpenAI API 설정
+                    p(class="mt-1 text-[13px] text-gray-500") GPT-4.1 기반 판독 보조 레이어에 사용할 서버 설정입니다.
+                label(class="inline-flex items-center gap-2 text-[13px] font-medium text-gray-700")
+                    input(type="checkbox", [checked]="settings.enabled", (change)="settings.enabled = $any($event.target).checked")
+                    span 사용
+
+            div(class="mt-5 grid gap-4 md:grid-cols-2")
+                label(class="block")
+                    span(class="text-[13px] font-medium text-gray-700") 모델
+                    input(type="text", class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-800 outline-none focus:border-indigo-400", [value]="settings.model", (input)="settings.model = $any($event.target).value", placeholder="gpt-4.1")
+                label(class="block")
+                    span(class="text-[13px] font-medium text-gray-700") 모드
+                    select(class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-800 outline-none focus:border-indigo-400", [value]="settings.mode", (change)="settings.mode = $any($event.target).value")
+                        option(value="advisory") advisory
+                        option(value="shadow") shadow
+                        option(value="review-required") review-required
+                label(class="block")
+                    span(class="text-[13px] font-medium text-gray-700") Temperature
+                    input(type="number", min="0", max="1", step="0.05", class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-800 outline-none focus:border-indigo-400", [value]="settings.temperature", (input)="settings.temperature = $any($event.target).value")
+                label(class="block")
+                    span(class="text-[13px] font-medium text-gray-700") Max output tokens
+                    input(type="number", min="128", max="4000", step="64", class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-800 outline-none focus:border-indigo-400", [value]="settings.max_output_tokens", (input)="settings.max_output_tokens = $any($event.target).value")
+
+            label(class="mt-4 block")
+                span(class="text-[13px] font-medium text-gray-700") OpenAI API Key
+                input(type="password", autocomplete="off", class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] text-gray-800 outline-none focus:border-indigo-400", [value]="apiKeyInput", (input)="apiKeyInput = $any($event.target).value", placeholder="새 키를 입력하면 기존 키를 교체합니다.")
+                p(class="mt-1 text-xs text-gray-500", *ngIf="settings.api_key_configured") 현재 {{settings.api_key_source || 'server'}} 키: {{settings.api_key_masked}}
+                p(class="mt-1 text-xs text-gray-500", *ngIf="!settings.api_key_configured") 저장된 키가 없습니다.
+
+            label(class="mt-4 block")
+                span(class="text-[13px] font-medium text-gray-700") 판독 프롬프트 정책
+                textarea(rows="5", class="mt-1 w-full rounded-xl border border-gray-300 px-4 py-3 text-[13px] leading-6 text-gray-800 outline-none focus:border-indigo-400", [value]="settings.prompt_policy", (input)="settings.prompt_policy = $any($event.target).value")
+
+            div(class="mt-5 flex flex-wrap gap-2")
+                button(type="button", class="inline-flex items-center rounded-xl bg-indigo-600 px-4 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50", (click)="saveSettings(false)", [disabled]="saving")
+                    span(*ngIf="!saving") 설정 저장
+                    span(*ngIf="saving") 저장 중...
+                button(type="button", class="inline-flex items-center rounded-xl border border-rose-300 bg-white px-4 py-2 text-[13px] font-medium text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50", (click)="saveSettings(true)", [disabled]="saving || !settings.api_key_configured") 키 삭제
+            p(class="mt-3 text-[13px] text-gray-600", *ngIf="message") {{message}}
+
+        aside(class="space-y-4")
+            section(class="rounded-2xl border border-sky-200 bg-sky-50 p-5")
+                h2(class="text-[15px] font-semibold text-sky-950") 판독 레이어 역할
+                ul(class="mt-3 space-y-2")
+                    li(class="text-[13px] leading-6 text-sky-800") RF 낙상 확률과 XG-Posture 결과를 자연어 근거로 정리합니다.
+                    li(class="text-[13px] leading-6 text-sky-800") 눕기 쏠림처럼 feature 기반 모델이 애매한 구간을 운영자 검토 대상으로 표시합니다.
+                    li(class="text-[13px] leading-6 text-sky-800") 최종 낙상 판정은 기존 RF-Dual 규칙을 유지하고 LLM은 보조 해석으로 시작합니다.
+            section(class="rounded-2xl border border-amber-200 bg-amber-50 p-5")
+                h2(class="text-[15px] font-semibold text-amber-950") 보안 기준
+                p(class="mt-3 text-[13px] leading-6 text-amber-800") API Key는 서버 설정 파일 또는 환경변수에서만 읽고, 브라우저 응답에는 원문을 내려주지 않습니다.

@@ -2,7 +2,7 @@ doctype html
 html(lang="en")
     head
         meta(charset="utf-8")
-        title SEASON Cloud Services
+        title FallAI Console
         base(href="/")
         
         meta(name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0')
@@ -13,26 +13,35 @@ html(lang="en")
         meta(name='theme-color' content='#6C8DF6')
         meta(name='apple-mobile-web-app-status-bar-style' content='black')
         meta(name='apple-mobile-web-app-capable' content='yes')
-        meta(name='apple-mobile-web-app-title' content='SEASON Cloud Services')
+        meta(name='apple-mobile-web-app-title' content='FallAI Console')
         meta(name='mobile-web-app-capable' content='yes')
         meta(name='HandheldFriendly' content='True')
         meta(name='MobileOptimized' content='320')
-        link(rel="shortcut icon", href="/assets/brand/icon.ico")
+        link(rel="shortcut icon", href="/assets/brand/fallai-mark.svg")
 
-        link(rel="apple-touch-icon" sizes="72x72" href="/assets/brand/icon.ico")
-        link(rel="apple-touch-icon" sizes="114x114" href="/assets/brand/icon.ico")
-        link(rel="apple-touch-icon" href="/assets/brand/icon.ico")
+        link(rel="apple-touch-icon" sizes="72x72" href="/assets/brand/fallai-mark.svg")
+        link(rel="apple-touch-icon" sizes="114x114" href="/assets/brand/fallai-mark.svg")
+        link(rel="apple-touch-icon" href="/assets/brand/fallai-mark.svg")
 
-        link(rel="icon" sizes="72x72" href="/assets/brand/icon.ico")
-        link(rel="icon" sizes="114x114" href="/assets/brand/icon.ico")
-        link(rel="icon" sizes="192x192" href="/assets/brand/icon.ico")
-        link(rel="icon" sizes="57x57" href="/assets/brand/icon.ico")
+        link(rel="icon" type="image/svg+xml" sizes="72x72" href="/assets/brand/fallai-mark.svg")
+        link(rel="icon" type="image/svg+xml" sizes="114x114" href="/assets/brand/fallai-mark.svg")
+        link(rel="icon" type="image/svg+xml" sizes="192x192" href="/assets/brand/fallai-mark.svg")
+        link(rel="icon" type="image/svg+xml" sizes="57x57" href="/assets/brand/fallai-mark.svg")
 
         link(rel="manifest" href="/manifest.json")
 
         script(type="text/javascript").
+            window.__FALLAI_ASSET_VERSION__ = '20260601-training-mode-speed-v1';
+            if ('caches' in window) {
+                caches.keys().then(function(keys) {
+                    keys.forEach(function(key) { caches.delete(key); });
+                }).catch(function() {});
+            }
             if ('serviceWorker' in navigator) {
-                navigator.serviceWorker.register('/sw.js', {scope: '/'}).then((reg) => {});
+                navigator.serviceWorker.getRegistrations().then(function(registrations) {
+                    registrations.forEach(function(reg) { reg.update(); });
+                }).catch(function() {});
+                navigator.serviceWorker.register('/sw.js?v=20260601-training-mode-speed-v1', {scope: '/'}).then(function(reg) { reg.update(); });
             }
 
     body

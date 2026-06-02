@@ -8,7 +8,9 @@ MODEL_REL_PATH = os.path.join('storage', 'training', 'action-behavior', 'model',
 
 # ── FN-20260406-0002: 다중 자세 클래스 라벨 체계 ──
 
-# 6-class 자세 분류 정의 (이진 → 다중 클래스 전환 준비)
+# 5-class 자세/행동 분류 정의.
+# 낙상 최종 판정은 RF-Dual의 RF binary 레이어가 담당하고, 이 모듈은
+# 비낙상 상태의 stand/walk/run/sit/lie 해석 메타데이터만 관리한다.
 POSTURE_CLASSES = {
     'standing': {
         'code': 'standing',
@@ -69,7 +71,8 @@ POSTURE_CLASSES = {
 }
 
 # 클래스 순서 (학습/추론 시 공통 사용)
-MULTICLASS_ORDER = ['standing', 'walking', 'sitting', 'running', 'lying', 'fall']
+MULTICLASS_ORDER = ['standing', 'walking', 'running', 'sitting', 'lying']
+RUNTIME_CLASS_ORDER = ['stand', 'walk', 'run', 'sit', 'lie']
 
 # 이진 → 다중 클래스 마이그레이션 매핑
 BINARY_TO_MULTICLASS_MAPPING = {
@@ -122,56 +125,54 @@ def to_binary_label(multiclass_label):
 
 DEFAULT_SUMMARY = {
     'created_at': '',
-    'model_type': 'behavior-rule-v1',
-    'ready_by_rules': True,
+    'model_type': 'behavior-posture-5class',
+    'ready_by_rules': False,
+    'ready': False,
     'dataset': {
         'sample_count': 0,
         'train_count': 0,
         'validation_count': 0,
-        'class_distribution': {
-            'non-fall': 0,
-            'fall': 0,
-        },
+        'class_distribution': {code: 0 for code in RUNTIME_CLASS_ORDER},
         'train_ratio': 0.7,
         'validation_ratio': 0.3,
         'split_strategy': 'runtime-feature-rules',
-        'label_note': '현재는 런타임 특징 기반 규칙으로 낙상/비낙상 이진 분류를 제공합니다.',
+        'label_note': '행동분류는 stand/walk/run/sit/lie 5-class XG-Posture 계열 모델로 학습 후 활성화합니다.',
     },
     'train_metrics': {
         'accuracy': 0.0,
         'macro_f1': 0.0,
         'per_class': {},
-        'note': '학습 기반 모델이 아니라 규칙 기반 행동 프로파일입니다.',
+        'note': '실제 5-class 행동분류 모델 학습 전 대기 메타데이터입니다.',
     },
     'validation_metrics': {
         'accuracy': 0.0,
         'macro_f1': 0.0,
         'per_class': {},
-        'note': '추후 이진 행동 분류 라벨 데이터 확보 시 실제 학습 모델로 교체 예정입니다.',
+        'note': 'AI-Hub 71461 행동분류 데이터 확보 후 실제 학습 모델로 교체 예정입니다.',
     },
-    'class_order': ['non-fall', 'fall'],
+    'class_order': RUNTIME_CLASS_ORDER,
     # FN-20260406-0002: 다중 클래스 확장 준비 필드
     'multiclass_order': MULTICLASS_ORDER,
     'multiclass_ready': False,
-    'runtime_source': 'person-feature track_summary + top_features',
+    'runtime_source': 'rf-dual xg-posture layer',
 }
 
 
 DEFAULT_MODEL = {
-    'model': 'behavior-binary-v1',
+    'model': 'behavior-posture-pending-v1',
     'updated_at': '',
-    'class_order': ['non-fall', 'fall'],
+    'class_order': RUNTIME_CLASS_ORDER,
     'multiclass_order': MULTICLASS_ORDER,
     'multiclass_ready': False,
-    'source': 'runtime-feature-rules',
+    'ready': False,
+    'source': 'aihub-71461-pending',
     'thresholds': {
-        'fall_speed': 0.75,
+        'fall_confirm': 0.465,
     },
     'notes': [
-        '낙상은 낙상 감지 결과와 낙상 확률을 우선 반영합니다.',
-        '비낙상은 낙상 조건을 충족하지 않는 나머지 경우로 분류합니다.',
-        '현재는 규칙 기반 모델이며 이진 행동 라벨 데이터 확보 후 교체 예정입니다.',
-        '다중 자세 클래스(서기/걷기/앉기/뛰기/눕기/낙상) 전환은 multiclass_ready=True 후 활성화됩니다.',
+        '낙상 최종 판정은 RF-Dual RF binary 레이어가 담당합니다.',
+        '행동분류는 비낙상 구간에서 stand/walk/run/sit/lie 5-class를 제공합니다.',
+        'AI-Hub 71461 데이터 학습 완료 후 multiclass_ready=True로 활성화합니다.',
     ],
 }
 
@@ -206,8 +207,9 @@ def train_and_save(project_root, force_rebuild=False):
     summary = training_summary(project_root)
     created_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     summary['created_at'] = created_at
-    summary['model_type'] = 'behavior-binary-v1'
-    summary['ready_by_rules'] = True
+    summary['model_type'] = 'behavior-posture-5class'
+    summary['ready_by_rules'] = False
+    summary['ready'] = False
     write_json(_path(project_root, SUMMARY_REL_PATH), summary)
     model = dict(DEFAULT_MODEL)
     model['updated_at'] = created_at

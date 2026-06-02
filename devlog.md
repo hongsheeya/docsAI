@@ -1,11 +1,68 @@
 | 날짜 | ID | 작업 내용 | 상세 |
-| 2026-04-06 | 024 | sit/lie 학습 데이터 수집 및 XG-Posture 6클래스 재학습 (210샘플, CV F1=69.93%) | [상세](devlog/2026-04-06/024-sit-lie-data-collection.md) |
-| 2026-04-06 | 023 | XG-Posture 재훈련 — KTH 데이터 통합, 141샘플 4-class, CV F1=86.19% | [상세](devlog/2026-04-06/023-xg-posture-retrain.md) |
-| 2026-04-06 | 022 | KTH Action Recognition Dataset 다운로드 (walk 81 + run 80 = 161 clips) | [상세](devlog/2026-04-06/022-kth-data-download.md) |
-| 2026-04-06 | 021 | 웹캠 모드 화면 표시 오류 수정 (CSS Grid grid-rows-1 + layout flex + h-full) | [상세](devlog/2026-04-06/021-webcam-display-grid-fix.md) |
-| 2026-04-06 | 020 | 자세 분류 휴리스틱 부스트 및 학습 데이터 인프라 (FN-0024~0026) | [상세](devlog/2026-04-06/020-posture-heuristic-boost.md) |
-| 2026-04-06 | 019 | 실시간 분석 UI 오버플로 수정 및 XG-Dual 신뢰성 개선 (FN-0019~0023) | [상세](devlog/2026-04-06/019-realtime-ui-xg-reliability.md) |
-| 2026-04-06 | 018 | XG-Dual 검증 최적화 — 5초 윈도우 + walk/run/stand 휴리스틱 (FN-0018) | [상세](devlog/2026-04-06/018-xg-dual-verification-optimization.md) |
+| 2026-05-04 | 003 | 영속 모델 저장 경로 고정 | [상세](devlog/2026-05-04/003-persistent-model-storage-path-fix.md) |
+| 2026-05-04 | 002 | 비상 모델 아티팩트 복구 | [상세](devlog/2026-05-04/002-emergency-model-artifact-restore.md) |
+| 2026-05-04 | 001 | 대시보드 모델 표시 복구 | [상세](devlog/2026-05-04/001-dashboard-model-visibility-recovery.md) |
+| 2026-04-28 | 004 | 실시간 즉시 적용 튜닝 (FPS·YOLO·Occlusion·Guard) | [상세](devlog/2026-04-28/004-realtime-immediate-tuning-fps-yolo-occlusion.md) |
+| 2026-04-28 | 003 | 가림 대응·YOLO 고도화·낙상 예측 모델 선행 검토 | [상세](devlog/2026-04-28/003-occlusion-yolo-fall-prediction-feasibility.md) |
+| 2026-04-28 | 002 | 추가 데이터 수집 및 모델 고도화 로드맵 분석 | [상세](devlog/2026-04-28/002-data-collection-and-model-roadmap-analysis.md) |
+| 2026-04-28 | 001 | 실시간 60fps 목표 달성 가능성 분석 | [상세](devlog/2026-04-28/001-realtime-60fps-feasibility-analysis.md) |
+| 2026-04-27 | 005 | 발표 슬라이드 6가지 수정 (비디오 수정, 017 이미지 교체, fall/lie 구분, threshold 명시, stand 불균형 슬라이드) | [상세](devlog/2026-04-27/005-presentation-updates-6items.md) |
+| 2026-04-27 | 004 | 발표 대본 작성 (11슬라이드 기준) | [상세](devlog/2026-04-27/004-presentation-narration-script.md) |
+| 2026-04-27 | 003 | 발표자료 리팩토링 — 11슬라이드 재구성, 데이터 샘플 슬라이드 추가, PPT 레이아웃 고정 | [상세](devlog/2026-04-27/003-5-issue-fixes.md) |
+| 2026-04-27 | 002 | PPT 스타일 발표 웹페이지 구현 (/presentation) | [상세](devlog/2026-04-27/002-presentation-web-page.md) |
+| 2026-04-27 | 001 | sit/lie 가드 보정, 데이터 누수 점검, 문서/발표자료 최신화 | [상세](devlog/2026-04-27/001-sit-lie-guard-leakage-audit-and-presentation.md) |
+| 2026-04-24 | 001 | RF-Dual 런타임 동기화 및 chunk summary 예외 수정 | [상세](devlog/2026-04-24/001-rf-dual-runtime-sync-and-chunk-summary-fix.md) |
+| 2026-04-23 | 003 | RF-Dual posture fall 클래스 분리 및 5-class 행동분류 고정 | [상세](devlog/2026-04-23/003-rf-dual-posture-5class-separation.md) |
+| 2026-04-23 | 002 | RF-Dual 비낙상 상태에서 raw posture fall 표시 제거 | [상세](devlog/2026-04-23/002-posture-probability-ui-fix.md) |
+| 2026-04-23 | 001 | RF-Dual FP 억제 및 guard_soft_override 강화 (fhr_rise_suppressor 신규 추가) | [상세](devlog/2026-04-23/001-fp-suppressor-guard-optimization.md) |
+| 2026-04-22 | 003 | RF-Dual 리콜 개선용 motion guard 미세조정 | [상세](devlog/2026-04-22/003-rf-dual-recall-motion-guard-tuning.md) |
+| 2026-04-22 | 002 | RF-Dual 낙상/행동 판정 분리 | [상세](devlog/2026-04-22/002-rf-dual-fall-behavior-decision-split.md) |
+| 2026-04-22 | 001 | RF threshold 재조정 및 fallback-warning 분리 | [상세](devlog/2026-04-22/001-rf-threshold-fallback-warning-fix.md) |
+| 2026-04-21 | 008 | 업로드 지연 및 앉기/서기 편향 완화 | [상세](devlog/2026-04-21/008-upload-latency-and-sit-stand-bias-fix.md) |
+| 2026-04-21 | 007 | 외부 행동 라벨 매핑 확장 및 클래스·행동 리포트 생성 | [상세](devlog/2026-04-21/007-external-action-mapping-expansion-and-class-report.md) |
+| 2026-04-21 | 006 | 외부 person 액션 라벨 기반 XG-Posture 보조학습 추가 | [상세](devlog/2026-04-21/006-external-pose-sit-supplement-for-xg-posture.md) |
+| 2026-04-21 | 005 | walk 시퀀스 scorer 및 metadata 보존 보강 | [상세](devlog/2026-04-21/005-walk-sequence-scorer-and-metadata-preservation.md) |
+| 2026-04-21 | 004 | 공통 sequence resolver 동기화 및 run 최종 분리 강화 | [상세](devlog/2026-04-21/004-shared-sequence-resolver-sync-and-run-boost.md) |
+| 2026-04-21 | 003 | walk/run smoothing rescue 및 run 분리 개선 | [상세](devlog/2026-04-21/003-walk-run-smoothing-rescue-and-run-improvement.md) |
+| 2026-04-21 | 002 | walk/run 검출 한계 샘플 x-motion 보정 | [상세](devlog/2026-04-21/002-walk-run-detector-limit-xmotion-tuning.md) |
+| 2026-04-21 | 001 | 서기 회귀 복구 및 동기화 검증 | [상세](devlog/2026-04-21/001-stand-regression-fix-and-sync-verification.md) |
+| 2026-04-20 | 008 | 서기 복구용 knee support 및 static override 추가 | [상세](devlog/2026-04-20/008-stand-recovery-knee-support-and-static-override.md) |
+| 2026-04-20 | 007 | gait/lie/fall 경계 미세조정 및 런타임 재검증 | [상세](devlog/2026-04-20/007-gait-lie-fall-boundary-tuning-and-runtime-recheck.md) |
+| 2026-04-20 | 006 | 행동 분류용 pose 검출 재시도 체인 추가 | [상세](devlog/2026-04-20/006-pose-detection-retry-chain-for-action-classification.md) |
+| 2026-04-20 | 005 | 전체 행동 분류 런타임 재평가 및 서기 스케일 보정 | [상세](devlog/2026-04-20/005-runtime-posture-regression-test-and-stand-scale-fix.md) |
+| 2026-04-20 | 004 | 서기 prior 부스트 및 높이 임계값 보정 | [상세](devlog/2026-04-20/004-stand-prior-boost-and-height-threshold-fix.md) |
+| 2026-04-20 | 003 | 서기 복구 및 앉기 보정 게이트 강화 | [상세](devlog/2026-04-20/003-stand-recovery-and-sit-gating-fix.md) |
+| 2026-04-20 | 002 | 앉기/눕기 상체 기울기 기준 강화 | [상세](devlog/2026-04-20/002-sit-lie-tilt-threshold-tightening.md) |
+| 2026-04-20 | 001 | 서기/앉기 무릎 각도 보정 수정 | [상세](devlog/2026-04-20/001-stand-sit-knee-angle-fix.md) |
+| 2026-04-16 | 001 | 분석 상세 부분 영상 로딩 개선 및 청크 분석 병렬화 (I/O Prefetch) | [상세](devlog/2026-04-16/001-analysis-video-fallback-prefetch.md) |
+| 2026-04-16 | 007 | 분석 상세 영상 fallback 및 청크 프리패치 적용 | [상세](devlog/2026-04-16/007-detail-video-fallback-and-chunk-prefetch.md) |
+| 2026-04-16 | 006 | 분석 상세 부분 영상 로딩 지연 수정 | [상세](devlog/2026-04-16/006-analysis-detail-video-loading-fix.md) |
+| 2026-04-16 | 005 | 헤더 우측 네비게이션 통일 복구 | [상세](devlog/2026-04-16/005-header-right-nav-unification.md) |
+| 2026-04-16 | 004 | 분석 상세 부분 영상 복원 | [상세](devlog/2026-04-16/004-analysis-detail-partial-video.md) |
+| 2026-04-16 | 003 | 문서 RF-Dual 정책 정렬 및 설명 정리 | [상세](devlog/2026-04-16/003-docs-rf-dual-policy-alignment.md) |
+| 2026-04-16 | 002 | 세부 페이지 헤더 통일 및 로그 UX 개선 | [상세](devlog/2026-04-16/002-detail-pages-header-and-log-ux-refresh.md) |
+| 2026-04-16 | 001 | RF-Dual 파이프라인 정리 및 슬라이딩 윈도우 전환 | [상세](devlog/2026-04-16/001-rf-dual-pipeline-sliding-window-cleanup.md) |
+| 2026-04-15 | 003 | FallAI 브랜딩 정리 및 RF-Dual 운영 문서 정렬 | [상세](devlog/2026-04-15/003-fallai-branding-and-rf-dual-doc-alignment.md) |
+| 2026-04-15 | 001 | XG-Posture 행동분류 feature 중요도 및 연관성 정리 | [상세](devlog/2026-04-15/001-posture-model-feature-analysis.md) |
+| 2026-04-15 | 002 | RF-Dual UI·로그·청크 정책 정리 | [상세](devlog/2026-04-15/002-rf-dual-ui-log-chunk-policy-refresh.md) |
+| 2026-04-14 | 007 | RF-Dual 전용 선택지 제한 및 sit/lie 상체 기울기 보정 | [상세](devlog/2026-04-14/007-rf-dual-only-and-posture-tilt-tightening.md) |
+| 2026-04-14 | 004 | RF threshold 0.35 미세조정·업로드 재평가·문서 및 배포 패키지 정리 | [상세](devlog/2026-04-14/004-rf-threshold-tuning-docs-and-export.md) |
+| 2026-04-14 | 003 | Validation 1100영상 기반 RF 재학습 및 16-feature 런타임 호환 복구 | [상세](devlog/2026-04-14/003-rf-validation-retrain-and-runtime-fix.md) |
+| 2026-04-14 | 002 | RF 로그 기반 threshold 복원 적용 및 회귀 검증 | [상세](devlog/2026-04-14/002-rf-threshold-restore-from-summary.md) |
+| 2026-04-13 | 008 | RF 낙상 모델 피처 확장 검토 (13→25 feature 타당성 분석) | [상세](devlog/2026-04-13/008-rf-feature-expansion-review.md) |
+| 2026-04-13 | 007 | RF-Dual 실시간 자세 분류 특화 UI (타임라인/전환/경고) | [상세](devlog/2026-04-13/007-rf-dual-posture-ui.md) |
+| 2026-04-13 | 006 | RF-Dual 실시간 청크 타이밍 최적화 (3초/1.5초 간격) | [상세](devlog/2026-04-13/006-rf-dual-chunk-timing.md) |
+| 2026-04-13 | 005 | RF-Dual Rolling Cache 도입 (실시간 청크 간 연속성) | [상세](devlog/2026-04-13/005-rf-dual-rolling-cache.md) |
+| 2026-04-13 | 004 | RF-Dual YOLO Single-Pass 통합 (2회→1회 YOLO 최적화) | [상세](devlog/2026-04-13/004-rf-dual-single-pass-yolo.md) |
+| 2026-04-13 | 003 | XG-Dual vs RF-Dual 성능 비교 분석 리포트 작성 | [상세](devlog/2026-04-13/003-xg-vs-rf-dual-analysis.md) |
+| 2026-04-13 | 002 | 실시간 청크 NaN JSON SyntaxError 버그 수정 | [상세](devlog/2026-04-13/002-nan-json-sanitize.md) |
+| 2026-04-13 | 001 | RF-Dual (Fall+Posture) 파이프라인 신규 구현 | [상세](devlog/2026-04-13/001-rf-dual-fall-posture-pipeline.md) |
+| 2026-04-10 | 005 | 실시간 세션 캐시 영속화 및 청크 스모크 테스트 | [상세](devlog/2026-04-10/005-realtime-session-cache-and-smoke-test.md) |
+| 2026-04-10 | 004 | 관리자 모니터링 UI 및 실시간 롤링 캐시 안전장치 추가 | [상세](devlog/2026-04-10/004-admin-monitoring-and-realtime-cache-safeguard.md) |
+| 2026-04-10 | 003 | XG-Fall 완전 검증 달성 및 suspected 리포트 강화 | [상세](devlog/2026-04-10/003-xg-fall-perfect-validation-and-suspected-reporting.md) |
+| 2026-04-10 | 002 | XG-Fall 잔여 엣지케이스 미세조정 | [상세](devlog/2026-04-10/002-xg-fall-final-edgecase-tuning.md) |
+| 2026-04-10 | 001 | XG-Fall 하드케이스 회귀 복구 및 규칙 정밀화 | [상세](devlog/2026-04-10/001-xg-fall-hardcase-regression-recovery.md) |
+| 2026-04-06 | 025 | UI 개선 + 칼만 필터 스켈레톤 + 6-class 데이터 균형 재학습 (FN-0041~0047) | [상세](devlog/2026-04-06/025-fn0041-0047-ui-kalman-data.md) |
 | 2026-04-06 | 017 | 실시간 분석 로그 사이드 패널 이동 (영상 하단→오른쪽 2컬럼 레이아웃) | [상세](devlog/2026-04-06/017-log-side-panel.md) |
 | 2026-04-06 | 016 | 오버레이 6-class 행동분류 시각화 강화 (확률 바·아이콘·하이라이트) | [상세](devlog/2026-04-06/016-overlay-6class-visualization.md) |
 | 2026-04-06 | 015 | 전체 시스템 성능 평가 프레임워크 구축 (XG-Fall/Posture 개별 + 시스템 + baseline 리포트) | [상세](devlog/2026-04-06/015-evaluation-framework.md) |
@@ -88,7 +145,8 @@
 | 2026-03-26 | 020 | 웹 분석 파이프라인 person-feature 통합 | [상세](devlog/2026-03-26/020-web-pipeline-person-feature.md) |
 | 2026-03-26 | 018 | bbox 궤적 기반 낙상 feature 추출 (194 windows, Y:82/N:112) | [상세](devlog/2026-03-26/018-fall-feature-extraction.md) |
 | 2026-03-26 | 019 | 낙상 분류기 학습 (XGBoost best, F1=0.70, AUC=0.84) | [상세](devlog/2026-03-26/019-fall-classifier-training.md) |
-|------|-----|----------|------|\n| 2026-03-26 | 017 | YOLO person detector fine-tune (mAP50=0.989, P=0.99, R=0.98) | [상세](devlog/2026-03-26/017-person-detector-finetune.md) |
+|------|-----|----------|------|
+| 2026-03-26 | 017 | YOLO person detector fine-tune (mAP50=0.989, P=0.99, R=0.98) | [상세](devlog/2026-03-26/017-person-detector-finetune.md) |
 | 2026-03-26 | 016 | Pseudo-label QC 도구 (tiny 10건 필터, fall 167 리뷰 이미지 생성) | [상세](devlog/2026-03-26/016-pseudo-label-qc-review.md) |
 | 2026-03-26 | 015 | Pseudo-label YOLO person detect 데이터셋 생성 (270img, 282bbox) | [상세](devlog/2026-03-26/015-pseudo-label-dataset.md) |
 | 2026-03-26 | 014 | YOLO person bbox 자동 추출 (11영상, 6058 bboxes, ByteTrack) | [상세](devlog/2026-03-26/014-person-bbox-extraction.md) |
@@ -155,3 +213,13 @@
 | 2026-04-02 | 004 | XGBoost Fallback 수정 + RF v4 피처 개선 + 판단근거 짝수 표시 | [상세](devlog/2026-04-02/004-xgb-fix-rf-v4-features.md) |
 | 2026-04-06 | 019 | 실시간 분석 UI 오버플로 수정 및 XG-Dual 신뢰성 개선 (FN-0019~0023) | [상세](devlog/2026-04-06/019-realtime-ui-xg-reliability.md) |
 | 2026-04-06 | 020 | 자세 분류 휴리스틱 부스트 및 학습 데이터 인프라 (FN-0024~0026) | [상세](devlog/2026-04-06/020-posture-heuristic-boost.md) |
+| 2026-04-06 | 026 | UX 버그 수정, 스켈레톤 오버레이, heuristic 교정, XG-Dual 검증 (FN-0048~0054) | [상세](devlog/2026-04-06/026-fn0048-0054-ux-skeleton-heuristic.md) |
+| 2026-04-07 | 001 | 웹캠 로그 스크롤 수정 (FN-0055) | [상세](devlog/2026-04-07/001-log-scroll-fix.md) |
+| 2026-04-07 | 002 | 피드백 저장 UX 개선 (FN-0056) | [상세](devlog/2026-04-07/002-feedback-ux-improvement.md) |
+| 2026-04-07 | 003 | 실시간 4중첩 녹화 + 요청 큐 (FN-0057) | [상세](devlog/2026-04-07/003-4overlap-recording-queue.md) |
+| 2026-04-07 | 004 | 041 낙상사고 데이터에서 walk/stand/sit 클립 자동 추출 (FN-0058) | [상세](devlog/2026-04-07/004-data-extraction-walk-stand-sit.md) |
+| 2026-04-07 | 005 | Gait Feature 활성화 및 XG-Posture 모델 최적화 (FN-0059) | [상세](devlog/2026-04-07/005-gait-feature-optimization.md) |
+| 2026-04-07 | 006 | 자세 분류 휴리스틱 튜닝 (FN-0060) | [상세](devlog/2026-04-07/006-posture-heuristic-tuning.md) |
+| 2026-04-07 | 001 | XGBoost 가짜 움직임 예측 방지를 위한 키포인트 신뢰도 검사 추가 | [상세](devlog/2026-04-07/001-fix-keypoint-interpolation.md) |
+| 2026-04-07 | N/A | 2026-04-07 일일 개발 보고 추가 | [상세](devlog/2026-04-07/daily_report_20260407.md) |
+| 2026-04-14 | 001 | 모델 복구 및 _desc_dur UnboundLocalError 수정 (33% fallback 해결) | [상세](devlog/2026-04-14/001-model-recovery-and-desc-dur-fix.md) |

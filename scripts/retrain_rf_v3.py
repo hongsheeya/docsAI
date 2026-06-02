@@ -39,7 +39,11 @@ print = functools.partial(print, flush=True)
 
 # ── 설정 ──────────────────────────────────────────────────
 PROJECT_ROOT = Path('/opt/app/project/main')
-DATASET_ROOT = Path('/opt/app/041.낙상사고_위험동작_영상-센서_쌍_데이터/3.개방데이터/1.데이터/Validation/01.원천데이터/VS/영상')
+_DATASET_ROOT_CANDIDATES = [
+    Path('/opt/app/041.낙상사고_위험동작_영상-센서_쌍_데이터/3.개방데이터/1.데이터/Validation/01.원천데이터/VS/영상'),
+    Path('/opt/app/041.낙상사고_위험동작_영상-센서_쌍_데이터/3.개방데이터/1.데이터/Validation/01.원천데이터/영상'),
+]
+DATASET_ROOT = next((p for p in _DATASET_ROOT_CANDIDATES if p.exists()), _DATASET_ROOT_CANDIDATES[-1])
 RF_YOLO_MODEL = 'yolov8n.pt'
 RF_TARGET_FPS = 2
 RF_CONF_THRES = 0.25
@@ -272,6 +276,7 @@ def main():
     print("  RF 파이프라인 v3 — 대규모 학습 + 정확도 최적화")
     print(f"  총 {n_total}개 영상 | 학습 Y/N 각 {args.n_train} | 검증 Y/N 각 {args.n_val}")
     print(f"  최소 Recall 목표: {args.recall_target}")
+    print(f"  데이터셋 경로: {DATASET_ROOT}")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 

@@ -1,0 +1,11 @@
+{
+    "mode": "page",
+    "id": "page.admin.llm",
+    "title": "/admin/llm",
+    "namespace": "admin.llm",
+    "viewuri": "/admin/llm",
+    "category": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-admin-llm()"
+}

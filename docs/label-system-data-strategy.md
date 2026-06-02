@@ -109,9 +109,15 @@ storage/training/fall-detection/intake/
 
 | 모델 | 라벨 전파 방식 |
 |------|-------------|
-| XG-Fall | 영상 단위 Y/N → 전체 윈도우에 동일 라벨 전파 OK |
+| XG-Fall | 레거시 참조용. 현재 운영 기본은 RF-Dual |
 | XG-Posture | 영상 단위 라벨 전파 **금지** — 윈도우/interval 단위 라벨 필수 |
 
 > XG-Posture는 영상 내에서 자세가 변화할 수 있으므로 (stand→sit 전이 등),
 > 영상 단위 라벨을 모든 윈도우에 전파하면 노이즈 라벨이 됨.
 > 현재는 peak window만 대표 라벨로 사용 (bootstrap 모드).
+
+## 8. 검증 누수 방지 메모 (2026-04-27)
+
+- posture 학습 스크립트의 교차검증은 이제 **window 단위 셔플 CV가 아니라 clip-grouped CV**를 사용해야 한다.
+- 같은 영상에서 나온 여러 윈도우가 train/validation에 동시에 섞이면 성능이 과대평가될 수 있다.
+- RF binary 재학습은 영상 단위 train/val 분할 후 특징 추출을 수행하므로 posture 스크립트보다 누수 위험이 낮다.

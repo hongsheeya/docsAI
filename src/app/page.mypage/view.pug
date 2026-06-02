@@ -1,11 +1,15 @@
-nav(class="sticky top-0 z-20 bg-white shadow")
+nav(class="sticky top-0 z-20 border-b border-zinc-200 bg-white/95 backdrop-blur")
     div(class="max-w-3xl px-2 sm:px-4 lg:px-8 py-3 lg:px-6")
         div(class="flex items-center justify-between")
             div(class="min-w-0 flex-1")
-                h1(class="flex text-lg font-semibold text-zinc-950 gap-x-3 items-center")
-                    svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-6")
+                div(class="flex items-center gap-x-3")
+                    span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
+                        img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
+                    svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-6 text-zinc-700")
                         path(stroke-linecap="round", stroke-linejoin="round", d="M17.982 18.725A7.488 7.488 0 0 0 12 15.75a7.488 7.488 0 0 0-5.982 2.975m11.963 0a9 9 0 1 0-11.963 0m11.963 0A8.966 8.966 0 0 1 12 21a8.966 8.966 0 0 1-5.982-2.275M15 9.75a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z")
-                    span 내 프로필
+                    div
+                        h1(class="text-lg font-semibold text-zinc-950") 내 프로필
+                        p(class="text-xs text-zinc-400") FallAI · 계정 정보 관리
 
 ng-container(*ngIf="user")
     div(class="max-w-3xl pt-8 px-8 pb-12 space-y-8")

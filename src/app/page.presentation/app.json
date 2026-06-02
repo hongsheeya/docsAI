@@ -1,0 +1,11 @@
+{
+    "mode": "page",
+    "id": "page.presentation",
+    "title": "/presentation",
+    "namespace": "presentation",
+    "viewuri": "/presentation",
+    "category": "",
+    "controller": "base",
+    "layout": "layout.empty",
+    "template": "wiz-page-presentation()"
+}
