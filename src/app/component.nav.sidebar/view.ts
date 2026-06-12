@@ -1,27 +1,49 @@
 import { OnInit } from '@angular/core';
-import { HostListener } from '@angular/core';
 import { Service } from '@wiz/libs/portal/season/service';
 
 export class Component implements OnInit {
     constructor(public service: Service) { }
 
+    public isLoggedIn: boolean = false;
+    public isAdmin: boolean = false;
+    public showUserMenu: boolean = false;
+
+    public navItems = [
+        { link: '/doc/write', label: '워크스페이스', icon: 'home' },
+        { link: '/doc/templates', label: '양식', icon: 'doc' }
+    ];
+
     public async ngOnInit() {
         await this.service.init();
+        let check = await this.service.auth.check();
+        this.isLoggedIn = !!check;
+        if (this.isLoggedIn) {
+            this.isAdmin = this.service.auth.session?.role === 'admin';
+        }
+        await this.service.render();
     }
 
-    @HostListener('document:click')
-    public clickout() {
-        this.service.status.toggle('navbar', true);
+    public navigate(link: string) {
+        this.service.href(link);
     }
 
     public isActive(link: string) {
-        return location.pathname.indexOf(link) === 0
+        return location.pathname === link || location.pathname.startsWith(link + '/');
     }
 
-    public activeClass(link: string) {
+    public navButtonClass(link: string) {
         if (this.isActive(link)) {
-            return "group flex gap-x-2 items-center rounded-md bg-gray-100 px-2 py-1.5 text-[13px] font-medium text-indigo-600";
+            return 'bg-teal-50 text-teal-700';
         }
-        return "group flex gap-x-2 items-center rounded-md px-2 py-1.5 text-[13px] font-medium text-gray-600 hover:bg-gray-50 hover:text-indigo-600";
+        return 'text-slate-500 hover:bg-slate-50 hover:text-slate-700';
+    }
+
+    public async toggleUserMenu() {
+        this.showUserMenu = !this.showUserMenu;
+        await this.service.render();
+    }
+
+    public logout() {
+        location.href = '/auth/logout?returnTo=/doc/write';
     }
 }

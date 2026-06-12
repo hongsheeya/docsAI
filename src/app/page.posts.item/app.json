@@ -5,7 +5,7 @@
     "namespace": "posts.item",
     "viewuri": "/posts/:id/:tab?",
     "category": "",
-    "controller": "user",
+    "controller": "base",
     "layout": "layout.sidebar",
     "template": "wiz-page-posts-item()"
 }

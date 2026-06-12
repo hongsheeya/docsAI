@@ -5,7 +5,7 @@
     "namespace": "posts",
     "viewuri": "/posts",
     "category": "",
-    "controller": "user",
+    "controller": "base",
     "layout": "layout.sidebar",
     "template": "wiz-page-posts()"
 }

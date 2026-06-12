@@ -1,0 +1,6 @@
+{
+    "id": "manifest",
+    "title": "manifest.json",
+    "route": "/manifest.json",
+    "controller": ""
+}

@@ -1,0 +1,68 @@
+div(class="flex min-h-full flex-col justify-center px-6 py-12 lg:px-8")
+    div(class="sm:mx-auto sm:w-full sm:max-w-sm")
+        div(class="flex justify-center")
+            div((click)="service.href('/doc/write')",
+                class="flex flex-col items-center cursor-pointer group")
+                div(class="flex items-center justify-center w-12 h-12 rounded-2xl bg-gradient-to-br from-orange-400 to-amber-500 text-white group-hover:from-orange-500 group-hover:to-amber-600 transition-all shadow-sm")
+                    svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-7")
+                        path(stroke-linecap="round", stroke-linejoin="round", d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z")
+                h2(class="mt-6 text-center text-xl font-bold text-stone-800 group-hover:text-orange-600 transition-colors") DocsAI
+        p(class="mt-2 text-center text-[13px] text-stone-400") 새 계정을 만들어 시작하세요.
+
+    div(class="mt-8 sm:mx-auto sm:w-full sm:max-w-sm")
+        div(class="bg-white rounded-2xl shadow-sm border border-orange-100/50 p-6")
+            div(class="space-y-4")
+                div
+                    label(class="block text-[13px] font-medium text-stone-600 mb-1") 아이디
+                    input(type="text",
+                        autocomplete="username",
+                        [(ngModel)]="data.username",
+                        placeholder="영문, 숫자 조합 (4자 이상)",
+                        class="block w-full rounded-xl border border-orange-200 px-3 py-2 text-[13px] text-stone-800 placeholder:text-stone-300 focus:border-orange-400 focus:ring-2 focus:ring-orange-200 focus:outline-none")
+
+                div
+                    label(class="block text-[13px] font-medium text-stone-600 mb-1") 이메일
+                    input(type="email",
+                        autocomplete="email",
+                        [(ngModel)]="data.email",
+                        placeholder="example@email.com",
+                        class="block w-full rounded-xl border border-orange-200 px-3 py-2 text-[13px] text-stone-800 placeholder:text-stone-300 focus:border-orange-400 focus:ring-2 focus:ring-orange-200 focus:outline-none")
+
+                div
+                    label(class="block text-[13px] font-medium text-stone-600 mb-1") 이름
+                    input(type="text",
+                        autocomplete="name",
+                        [(ngModel)]="data.name",
+                        placeholder="이름 입력",
+                        class="block w-full rounded-xl border border-orange-200 px-3 py-2 text-[13px] text-stone-800 placeholder:text-stone-300 focus:border-orange-400 focus:ring-2 focus:ring-orange-200 focus:outline-none")
+
+                div
+                    label(class="block text-[13px] font-medium text-stone-600 mb-1") 비밀번호
+                    input(type="password",
+                        autocomplete="new-password",
+                        [(ngModel)]="data.password",
+                        placeholder="8자 이상",
+                        class="block w-full rounded-xl border border-orange-200 px-3 py-2 text-[13px] text-stone-800 placeholder:text-stone-300 focus:border-orange-400 focus:ring-2 focus:ring-orange-200 focus:outline-none")
+
+                div
+                    label(class="block text-[13px] font-medium text-stone-600 mb-1") 비밀번호 확인
+                    input(type="password",
+                        autocomplete="new-password",
+                        [(ngModel)]="data.password_confirm",
+                        (keyup.enter)="signup()",
+                        placeholder="비밀번호 재입력",
+                        class="block w-full rounded-xl border border-orange-200 px-3 py-2 text-[13px] text-stone-800 placeholder:text-stone-300 focus:border-orange-400 focus:ring-2 focus:ring-orange-200 focus:outline-none")
+
+                button((click)="signup()",
+                    [disabled]="loading",
+                    class="flex w-full justify-center rounded-xl bg-gradient-to-r from-orange-400 to-amber-500 px-3 py-2.5 text-[13px] font-semibold text-white shadow-sm hover:from-orange-500 hover:to-amber-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed")
+                    span(*ngIf="!loading") 회원가입
+                    span(*ngIf="loading") 처리 중...
+
+        div(class="mt-6 text-center")
+            span(class="text-[13px] text-stone-400") 이미 계정이 있으신가요?
+            | &nbsp;
+            a((click)="service.href('/access')",
+                class="text-[13px] font-semibold text-orange-500 hover:text-orange-700 cursor-pointer") 로그인
+
+        p(class="mt-8 text-center text-xs text-stone-300") &copy; 2026 DocsAI. All rights reserved.

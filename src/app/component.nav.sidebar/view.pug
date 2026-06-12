@@ -1,46 +1,77 @@
-div(class="flex shrink-0 items-center justify-center pt-5 pb-4")
-    div(routerLink="/dashboard", class="flex items-center gap-2 cursor-pointer")
-        div(class="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600 text-white")
-            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-5")
-                path(stroke-linecap="round", stroke-linejoin="round", d="m21 7.5-9-5.25L3 7.5m18 0-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9")
-        span(class="text-[15px] font-bold text-gray-900") Sample
+header(class="h-14 bg-white border-b border-slate-200 flex items-center px-6 flex-shrink-0")
+    //- Logo
+    div((click)="navigate('/doc/write')",
+        class="flex items-center gap-2 cursor-pointer group")
+        div(class="flex items-center justify-center w-8 h-8 rounded-lg bg-teal-600 text-white")
+            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z")
+        span(class="text-[15px] font-bold tracking-tight text-slate-800 group-hover:text-teal-600 transition-colors") DocsAI
 
-//- User profile & logout
-div(class="mx-2 mb-4 rounded-lg bg-gray-50 border border-gray-200/80")
-    div(class="flex items-center gap-2.5 px-3 py-2.5")
-        div(class="flex-shrink-0 flex items-center justify-center w-8 h-8 rounded-full bg-indigo-600 text-white text-xs font-bold")
-            | {{service.auth.session?.name?.charAt(0) || '?'}}
-        div(class="min-w-0 flex-1")
-            p(class="text-[13px] font-medium text-gray-900 truncate leading-tight") {{service.auth.session?.name || 'User'}}
-            p(class="text-[11px] text-gray-400 truncate leading-tight mt-0.5") {{service.auth.session?.email || ''}}
-    div(class="border-t border-gray-200/80 flex")
-        a(routerLink="/mypage", class="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-gray-500 hover:text-indigo-600 hover:bg-gray-100 rounded-bl-lg transition-colors border-r border-gray-200/80")
-            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="2", stroke="currentColor", class="size-3.5")
-                path(stroke-linecap="round", stroke-linejoin="round", d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z")
-                path(stroke-linecap="round", stroke-linejoin="round", d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z")
-            span My Page
-        a(href="/auth/logout", class="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 text-[11px] text-gray-500 hover:text-red-500 hover:bg-gray-100 rounded-br-lg transition-colors")
-            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="2", stroke="currentColor", class="size-3.5")
-                path(stroke-linecap="round", stroke-linejoin="round", d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15m3 0 3-3m0 0-3-3m3 3H9")
-            span Logout
+    //- Navigation
+    nav(class="flex items-center gap-1 ml-8")
+        button(*ngFor="let nav of navItems",
+            (click)="navigate(nav.link)",
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium transition-all",
+            [ngClass]="navButtonClass(nav.link)")
+            //- home icon
+            svg(*ngIf="nav.icon === 'home'", xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="m2.25 12 8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25")
+            //- edit icon
+            svg(*ngIf="nav.icon === 'edit'", xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0 1 15.75 21H5.25A2.25 2.25 0 0 1 3 18.75V8.25A2.25 2.25 0 0 1 5.25 6H10")
+            //- doc icon
+            svg(*ngIf="nav.icon === 'doc'", xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z")
+            | {{ nav.label }}
 
-nav(class="flex flex-1 flex-col overflow-y-auto")
-    ul(role="list", class="flex flex-1 flex-col gap-y-4 mx-2")
-        li
-            div(class="text-[11px] font-semibold uppercase tracking-wider text-gray-400 px-2") Menu
-            ul(role="list", class="mt-1 space-y-0.5")
-                li
-                    a(routerLink="/dashboard", [class]="activeClass('/dashboard')")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 3v11.25A2.25 2.25 0 0 0 6 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0 1 18 16.5h-2.25m-7.5 0h7.5m-7.5 0-1 3m8.5-3 1 3m0 0 .5 1.5m-.5-1.5h-9.5m0 0-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6")
-                        span(class="truncate") Dashboard
-                li
-                    a(routerLink="/posts", [class]="activeClass('/posts')")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z")
-                        span(class="truncate") 게시물
-                li
-                    a(routerLink="/members", [class]="activeClass('/members')")
-                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
-                            path(stroke-linecap="round", stroke-linejoin="round", d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z")
-                        span(class="truncate") 멤버
+        //- 구분선
+        div(class="w-px h-5 bg-slate-200 mx-2")
+
+        //- 회원관리 (관리자만)
+        button(*ngIf="isAdmin",
+            (click)="navigate('/members')",
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium transition-all",
+            [ngClass]="navButtonClass('/members')")
+            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z")
+            | 팀
+
+        //- AI 설정
+        button((click)="navigate('/ai/settings')",
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium transition-all",
+            [ngClass]="navButtonClass('/ai/settings')")
+            svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                path(stroke-linecap="round", stroke-linejoin="round", d="M9.813 15.904 9 18.75l-.813-2.846a4.5 4.5 0 0 0-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 0 0 3.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 0 0 3.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 0 0-3.09 3.09ZM18.259 8.715 18 9.75l-.259-1.035a3.375 3.375 0 0 0-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 0 0 2.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 0 0 2.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 0 0-2.455 2.456ZM16.894 20.567 16.5 21.75l-.394-1.183a2.25 2.25 0 0 0-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 0 0 1.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 0 0 1.423 1.423l1.183.394-1.183.394a2.25 2.25 0 0 0-1.423 1.423Z")
+            | AI
+
+    //- User Section (right)
+    div(class="ml-auto flex items-center gap-3")
+        //- 로그인 상태
+        div(*ngIf="isLoggedIn",
+            class="relative")
+            button((click)="toggleUserMenu()",
+                class="flex items-center gap-2 px-2 py-1 rounded-lg hover:bg-slate-50 transition-colors")
+                div(class="flex items-center justify-center w-7 h-7 rounded-full bg-teal-100 text-teal-700 text-xs font-bold")
+                    | {{ service.auth.session?.name?.charAt(0) || '?' }}
+                span(class="text-[13px] text-slate-700 font-medium") {{ service.auth.session?.name || 'User' }}
+                svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-3.5 text-slate-400")
+                    path(stroke-linecap="round", stroke-linejoin="round", d="m19.5 8.25-7.5 7.5-7.5-7.5")
+
+            //- 드롭다운 메뉴
+            div(*ngIf="showUserMenu",
+                class="absolute right-0 top-10 w-48 bg-white rounded-xl shadow-lg border border-slate-200 py-1 z-50")
+                div(class="px-3 py-2 border-b border-slate-100")
+                    div(class="text-[13px] font-medium text-slate-700 truncate") {{ service.auth.session?.name }}
+                    div(class="text-[11px] text-slate-400 truncate") {{ service.auth.session?.email }}
+                button((click)="navigate('/mypage'); showUserMenu = false",
+                    class="w-full text-left px-3 py-2 text-[13px] text-slate-600 hover:bg-slate-50 transition-colors") 내 프로필
+                button((click)="logout()",
+                    class="w-full text-left px-3 py-2 text-[13px] text-red-500 hover:bg-red-50 transition-colors") 로그아웃
+
+        //- 비로그인 상태
+        div(*ngIf="!isLoggedIn",
+            class="flex items-center gap-2")
+            button((click)="navigate('/access')",
+                class="px-4 py-1.5 bg-teal-600 text-white text-[13px] font-medium rounded-lg hover:bg-teal-700 transition-colors") 로그인
+            button((click)="navigate('/signup')",
+                class="px-3 py-1.5 text-[13px] text-slate-500 hover:text-slate-700 transition-colors") 회원가입

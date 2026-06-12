@@ -1,0 +1,12 @@
+{
+    "id": "page.home",
+    "mode": "page",
+    "title": "/",
+    "namespace": "home",
+    "category": "home",
+    "viewuri": "/",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.empty",
+    "template": "wiz-page-home()"
+}

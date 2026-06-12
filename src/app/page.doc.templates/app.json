@@ -1,0 +1,12 @@
+{
+    "id": "page.doc.templates",
+    "mode": "page",
+    "title": "/doc/templates",
+    "namespace": "doc.templates",
+    "category": "doc",
+    "viewuri": "/doc/templates",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-doc-templates()"
+}

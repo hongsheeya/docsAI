@@ -1,0 +1,329 @@
+div.w-full.h-full.overflow-auto
+    div(class="max-w-4xl mx-auto py-8 px-6")
+        //- 헤더
+        div.flex.items-center.justify-between.mb-6
+            div
+                h1(class="text-lg font-bold text-slate-800") AI 설정
+                p(class="text-[13px] text-slate-400 mt-1") AI 모델 연결 및 기억 관리
+
+        //- 탭 네비게이션
+        div(class="flex border-b border-slate-200 mb-6")
+            button((click)="activeTab = 'config'; service.render()",
+                class="px-4 py-3 text-[13px] font-medium border-b-2 transition-colors",
+                [ngClass]="{'border-teal-500 text-teal-600': activeTab === 'config', 'border-transparent text-slate-400 hover:text-slate-600': activeTab !== 'config'}") AI 모델 설정
+            button((click)="activeTab = 'memory'; service.render()",
+                class="px-4 py-3 text-[13px] font-medium border-b-2 transition-colors",
+                [ngClass]="{'border-teal-500 text-teal-600': activeTab === 'memory', 'border-transparent text-slate-400 hover:text-slate-600': activeTab !== 'memory'}")
+                | AI 기억 관리
+                span(*ngIf="profileKeys.length > 0",
+                    class="ml-2 inline-flex items-center justify-center w-5 h-5 rounded-full bg-teal-100 text-teal-600 text-xs font-medium") {{ profileKeys.length }}
+            button((click)="activeTab = 'instructions'; loadInstructions(); service.render()",
+                class="px-4 py-3 text-[13px] font-medium border-b-2 transition-colors",
+                [ngClass]="{'border-teal-500 text-teal-600': activeTab === 'instructions', 'border-transparent text-slate-400 hover:text-slate-600': activeTab !== 'instructions'}")
+                | 인스트럭션
+                span(*ngIf="instructions.length > 0",
+                    class="ml-2 inline-flex items-center justify-center w-5 h-5 rounded-full bg-teal-100 text-teal-600 text-xs font-medium") {{ instructions.length }}
+
+        //- 탭 1: AI 모델 설정
+        div(*ngIf="activeTab === 'config'")
+
+            //- 설정 폼 카드
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6")
+                h2(class="text-[15px] font-semibold text-slate-800 mb-5")
+                    | {{ editMode ? 'AI 설정 수정' : '새 AI 설정 추가' }}
+
+                div(class="grid grid-cols-2 gap-4 mb-4")
+                    //- Provider
+                    div
+                        label(class="block text-[13px] font-medium text-slate-600 mb-1") Provider
+                        select([(ngModel)]="formData.provider",
+                            (ngModelChange)="onProviderChange()",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+                            option(*ngFor="let p of providers",
+                                [value]="p.value") {{ p.label }}
+
+                    //- Model
+                    div
+                        label(class="block text-[13px] font-medium text-slate-600 mb-1") 모델
+                        select(*ngIf="getModels().length > 0",
+                            [(ngModel)]="formData.model_name",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+                            option(*ngFor="let m of getModels()",
+                                [value]="m") {{ m }}
+                        input(*ngIf="getModels().length === 0",
+                            type="text",
+                            [(ngModel)]="formData.model_name",
+                            placeholder="모델명 입력",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+
+                div(class="grid grid-cols-2 gap-4 mb-4")
+                    //- API Key
+                    div
+                        label(class="block text-[13px] font-medium text-slate-600 mb-1") API Key
+                        input(type="password",
+                            [(ngModel)]="formData.api_key",
+                            [placeholder]="editMode ? '변경하려면 입력 (빈 칸이면 기존 유지)' : 'API Key 입력'",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+
+                    //- Endpoint
+                    div
+                        label(class="block text-[13px] font-medium text-slate-600 mb-1") Endpoint (선택)
+                        input(type="text",
+                            [(ngModel)]="formData.endpoint",
+                            placeholder="커스텀 엔드포인트 URL",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+
+                //- 활성화 토글
+                div.flex.items-center.gap-3.mb-5
+                    label(class="relative inline-flex items-center cursor-pointer")
+                        input(type="checkbox",
+                            [(ngModel)]="formData.is_active",
+                            class="sr-only peer")
+                        div(class="w-9 h-5 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-teal-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-teal-500")
+                    span(class="text-[13px] text-slate-600") 활성화
+
+                //- 버튼 영역
+                div.flex.items-center.gap-3
+                    button((click)="save()",
+                        class="px-4 py-2 bg-teal-600 text-white text-[13px] font-semibold rounded-lg hover:bg-teal-700 transition-colors")
+                        | {{ editMode ? '수정' : '추가' }}
+                    button((click)="testConnection()",
+                        [disabled]="testing",
+                        class="px-4 py-2 border border-slate-300 text-slate-600 text-[13px] font-medium rounded-lg hover:bg-slate-50 transition-colors disabled:opacity-50")
+                        span(*ngIf="!testing") 연결 테스트
+                        span(*ngIf="testing") 테스트 중...
+                    button(*ngIf="editMode",
+                        (click)="openCreate()",
+                        class="px-4 py-2 border border-slate-300 text-slate-600 text-[13px] font-medium rounded-lg hover:bg-slate-50 transition-colors") 취소
+
+                //- 테스트 결과
+                div(*ngIf="testResult",
+                    class="mt-3 px-4 py-2 rounded-lg text-[13px]",
+                    [class.bg-emerald-50]="testResult.success",
+                    [class.text-emerald-700]="testResult.success",
+                    [class.bg-rose-50]="!testResult.success",
+                    [class.text-rose-700]="!testResult.success")
+                    | {{ testResult.message }}
+
+            //- 등록된 설정 목록
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6")
+                h2(class="text-[15px] font-semibold text-slate-800 mb-4") 등록된 AI 설정
+
+                div(*ngIf="configs.length === 0",
+                    class="text-center py-8 text-[13px] text-slate-400") 등록된 AI 설정이 없습니다.
+
+                div(*ngFor="let cfg of configs",
+                    class="flex items-center justify-between py-4 border-b border-slate-100 last:border-b-0")
+                    div.flex.items-center.gap-4
+                        //- 활성 상태 표시
+                        div(class="w-2 h-2 rounded-full",
+                            [class.bg-emerald-500]="cfg.is_active",
+                            [class.bg-slate-300]="!cfg.is_active")
+                        div
+                            div(class="text-[13px] font-medium text-slate-800")
+                                | {{ getProviderLabel(cfg.provider) }}
+                                span(class="ml-2 text-slate-400") {{ cfg.model_name }}
+                                span(*ngIf="cfg.is_active",
+                                    class="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700") 활성
+                            div(class="text-xs text-slate-400 mt-0.5")
+                                | API Key: {{ cfg.api_key_masked || '****' }}
+                                span(*ngIf="cfg.endpoint",
+                                    class="ml-3") Endpoint: {{ cfg.endpoint }}
+                    div.flex.items-center.gap-2
+                        label(class="ai-config-toggle flex items-center gap-2 cursor-pointer",
+                            [class.opacity-50]="togglingConfigId === cfg.id")
+                            input(type="checkbox",
+                                [checked]="cfg.is_active",
+                                [disabled]="togglingConfigId === cfg.id",
+                                (change)="toggleActive(cfg)",
+                                class="sr-only")
+                            span(class="ai-config-toggle-track")
+                                span(class="ai-config-toggle-thumb")
+                            span(class="text-xs font-medium text-slate-600") {{ cfg.is_active ? '활성' : '비활성' }}
+                        button((click)="openEdit(cfg)",
+                            class="px-3 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") 수정
+                        button((click)="remove(cfg.id)",
+                            class="px-3 py-1 text-xs border border-rose-200 text-rose-500 rounded-lg hover:bg-rose-50 transition-colors") 삭제
+
+        //- 탭 2: AI 기억 관리
+        div(*ngIf="activeTab === 'memory'")
+
+            //- 설명
+            div(class="bg-teal-50 border border-teal-200 rounded-xl p-4 mb-6")
+                div(class="flex items-start gap-3")
+                    div(class="text-teal-500 text-lg flex-shrink-0") 💡
+                    div
+                        div(class="text-[13px] font-medium text-teal-800 mb-1") AI 기억이란?
+                        div(class="text-xs text-teal-700 leading-relaxed") AI는 문서 작성 과정에서 대화를 통해 회사명, 직책, 부서 등 유용한 정보를 자동으로 학습합니다. 학습된 정보는 다음 문서 작성 시 자동으로 활용됩니다. 여기서 학습된 정보를 확인하고 관리할 수 있습니다.
+
+            //- 새 항목 추가
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6")
+                h2(class="text-[15px] font-semibold text-slate-800 mb-4") 수동으로 정보 추가
+                div(class="flex gap-3")
+                    div(class="flex-shrink-0 w-40")
+                        input(type="text",
+                            [(ngModel)]="newProfileKey",
+                            placeholder="항목명 (예: 회사명)",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+                    div.flex-1
+                        input(type="text",
+                            [(ngModel)]="newProfileValue",
+                            (keydown.enter)="addProfileKey()",
+                            placeholder="값 (예: ABC 주식회사)",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+                    button((click)="addProfileKey()",
+                        class="px-4 py-2 bg-teal-600 text-white text-[13px] font-semibold rounded-lg hover:bg-teal-700 transition-colors flex-shrink-0") 추가
+
+            //- 학습된 정보 목록
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6")
+                div.flex.items-center.justify-between.mb-4
+                    h2(class="text-[15px] font-semibold text-slate-800") AI가 기억한 정보
+                    button(*ngIf="profileKeys.length > 0",
+                        (click)="clearAllProfile()",
+                        class="px-3 py-1 text-xs border border-rose-200 text-rose-500 rounded-lg hover:bg-rose-50 transition-colors") 전체 삭제
+
+                div(*ngIf="profileKeys.length === 0",
+                    class="text-center py-12")
+                    div(class="text-3xl mb-3 opacity-30") 🧠
+                    div(class="text-[13px] text-slate-400") AI가 아직 학습한 정보가 없습니다.
+                    div(class="text-xs text-slate-300 mt-1") 문서 작성 과정에서 대화를 통해 자동으로 학습됩니다.
+
+                div(*ngIf="profileKeys.length > 0",
+                    class="space-y-2")
+                    div(*ngFor="let key of profileKeys",
+                        class="flex items-center justify-between py-3 px-4 bg-slate-50 rounded-lg border border-slate-200")
+
+                        //- 보기 모드
+                        div(*ngIf="editingProfileKey !== key",
+                            class="flex items-center gap-4 flex-1 min-w-0")
+                            div(class="text-[13px] font-medium text-slate-700 flex-shrink-0 w-32 truncate") {{ key }}
+                            div(class="text-[13px] text-slate-600 flex-1 truncate") {{ profileData[key] }}
+
+                        //- 편집 모드
+                        div(*ngIf="editingProfileKey === key",
+                            class="flex items-center gap-3 flex-1")
+                            div(class="text-[13px] font-medium text-slate-700 flex-shrink-0 w-32 truncate") {{ key }}
+                            input(type="text",
+                                [(ngModel)]="editingProfileValue",
+                                (keydown.enter)="saveProfileKey()",
+                                class="flex-1 border border-teal-300 rounded-lg px-3 py-1 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+
+                        //- 버튼
+                        div.flex.items-center.gap-1.flex-shrink-0.ml-3
+                            ng-container(*ngIf="editingProfileKey !== key")
+                                button((click)="startEditProfile(key)",
+                                    class="px-2 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") 수정
+                                button((click)="deleteProfileKey(key)",
+                                    class="px-2 py-1 text-xs border border-rose-200 text-rose-500 rounded-lg hover:bg-rose-50 transition-colors") 삭제
+                            ng-container(*ngIf="editingProfileKey === key")
+                                button((click)="saveProfileKey()",
+                                    class="px-2 py-1 text-xs bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors") 저장
+                                button((click)="cancelEditProfile()",
+                                    class="px-2 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") 취소
+
+        //- 탭 3: 인스트럭션
+        div(*ngIf="activeTab === 'instructions'")
+
+            //- 설명
+            div(class="bg-violet-50 border border-violet-200 rounded-xl p-4 mb-6")
+                div(class="flex items-start gap-3")
+                    div(class="text-violet-500 text-lg flex-shrink-0") 📋
+                    div
+                        div(class="text-[13px] font-medium text-violet-800 mb-1") 커스텀 인스트럭션이란?
+                        div(class="text-xs text-violet-700 leading-relaxed") AI가 문서를 작성할 때 참고할 지시사항을 미리 등록해두세요. 활성화된 인스트럭션은 자동으로 적용되며, 문서별로 특정 인스트럭션을 선택할 수도 있습니다.
+
+            //- 인스트럭션 생성/수정 폼
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6 mb-6")
+                h2(class="text-[15px] font-semibold text-slate-800 mb-5")
+                    | {{ instructionEditMode ? '인스트럭션 수정' : '새 인스트럭션 추가' }}
+
+                div(class="mb-4")
+                    label(class="block text-[13px] font-medium text-slate-600 mb-1") 제목
+                    input(type="text",
+                        [(ngModel)]="instructionForm.title",
+                        placeholder="예: 전문적/공식 어조로 작성",
+                        class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-200 focus:border-violet-400")
+
+                div(class="mb-4")
+                    label(class="block text-[13px] font-medium text-slate-600 mb-1") 내용
+                    textarea([(ngModel)]="instructionForm.content",
+                        rows="4",
+                        placeholder="AI에게 전달할 구체적인 지시사항을 작성하세요...",
+                        class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-200 focus:border-violet-400 resize-y")
+
+                div(class="grid grid-cols-2 gap-4 mb-5")
+                    div
+                        label(class="block text-[13px] font-medium text-slate-600 mb-1") 적용 범위
+                        select([(ngModel)]="instructionForm.category",
+                            class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-violet-200 focus:border-violet-400")
+                            option(*ngFor="let c of categories",
+                                [value]="c.value") {{ c.label }}
+                    div.flex.items-end
+                        label(class="flex items-center gap-3 cursor-pointer")
+                            div(class="relative inline-flex items-center")
+                                input(type="checkbox",
+                                    [(ngModel)]="instructionForm.is_active",
+                                    class="sr-only peer")
+                                div(class="w-9 h-5 bg-slate-200 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-violet-200 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-violet-500")
+                            span(class="text-[13px] text-slate-600") 기본 활성화
+
+                div.flex.items-center.gap-3
+                    button((click)="saveInstruction()",
+                        class="px-4 py-2 bg-violet-600 text-white text-[13px] font-semibold rounded-lg hover:bg-violet-700 transition-colors")
+                        | {{ instructionEditMode ? '수정' : '추가' }}
+                    button(*ngIf="instructionEditMode",
+                        (click)="openCreateInstruction()",
+                        class="px-4 py-2 border border-slate-300 text-slate-600 text-[13px] font-medium rounded-lg hover:bg-slate-50 transition-colors") 취소
+
+            //- 인스트럭션 목록
+            div(class="bg-white rounded-xl shadow-sm border border-slate-200 p-6")
+                div.flex.items-center.justify-between.mb-4
+                    h2(class="text-[15px] font-semibold text-slate-800") 등록된 인스트럭션
+
+                    //- 카테고리 필터
+                    div(class="flex items-center gap-1")
+                        button((click)="categoryFilter = 'all'; service.render()",
+                            class="px-3 py-1 text-xs rounded-full transition-colors",
+                            [ngClass]="{'bg-violet-100 text-violet-700 font-medium': categoryFilter === 'all', 'text-slate-400 hover:text-slate-600': categoryFilter !== 'all'}") 전체
+                        button(*ngFor="let c of categories",
+                            (click)="categoryFilter = c.value; service.render()",
+                            class="px-3 py-1 text-xs rounded-full transition-colors",
+                            [ngClass]="{'bg-violet-100 text-violet-700 font-medium': categoryFilter === c.value, 'text-slate-400 hover:text-slate-600': categoryFilter !== c.value}") {{ c.label }}
+
+                div(*ngIf="filteredInstructions.length === 0",
+                    class="text-center py-12")
+                    div(class="text-3xl mb-3 opacity-30") 📋
+                    div(class="text-[13px] text-slate-400") 등록된 인스트럭션이 없습니다.
+                    div(class="text-xs text-slate-300 mt-1") 위 폼에서 새 인스트럭션을 추가해보세요.
+
+                div(*ngIf="filteredInstructions.length > 0",
+                    class="space-y-3")
+                    div(*ngFor="let inst of filteredInstructions",
+                        class="border rounded-lg p-4 transition-colors",
+                        [ngClass]="{'border-violet-200 bg-violet-50/30': inst.is_active, 'border-slate-200 bg-white': !inst.is_active}")
+
+                        div.flex.items-start.justify-between.gap-4
+                            div(class="flex-1 min-w-0")
+                                div.flex.items-center.gap-2.mb-1
+                                    div(class="text-[13px] font-medium",
+                                        [class.text-violet-800]="inst.is_active",
+                                        [class.text-slate-700]="!inst.is_active") {{ inst.title }}
+                                    span(*ngIf="inst.user_id === 'system'",
+                                        class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-100 text-slate-500") 시스템
+                                    span(class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-violet-100 text-violet-600") {{ getCategoryLabel(inst.category) }}
+                                    span(*ngIf="inst.is_active",
+                                        class="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-600") 활성
+
+                                div(class="text-xs text-slate-500 mt-1 line-clamp-2") {{ inst.content }}
+
+                            div(class="flex items-center gap-1 flex-shrink-0")
+                                //- 활성/비활성 토글
+                                button((click)="toggleInstruction(inst.id)",
+                                    class="px-3 py-1 text-xs rounded-lg transition-colors",
+                                    [ngClass]="{'border border-emerald-200 text-emerald-600 hover:bg-emerald-50': inst.is_active, 'border border-slate-300 text-slate-500 hover:bg-slate-50': !inst.is_active}")
+                                    | {{ inst.is_active ? 'OFF' : 'ON' }}
+                                button((click)="openEditInstruction(inst)",
+                                    class="px-3 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") 수정
+                                button(*ngIf="inst.user_id !== 'system'",
+                                    (click)="deleteInstruction(inst.id)",
+                                    class="px-3 py-1 text-xs border border-rose-200 text-rose-500 rounded-lg hover:bg-rose-50 transition-colors") 삭제

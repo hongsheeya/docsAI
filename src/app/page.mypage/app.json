@@ -5,7 +5,7 @@
     "namespace": "mypage",
     "viewuri": "/mypage",
     "category": "",
-    "controller": "user",
+    "controller": "base",
     "layout": "layout.sidebar",
     "template": "wiz-page-mypage()"
 }

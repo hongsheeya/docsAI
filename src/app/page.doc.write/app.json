@@ -1,0 +1,12 @@
+{
+    "id": "page.doc.write",
+    "mode": "page",
+    "title": "/doc/write",
+    "namespace": "doc.write",
+    "category": "doc",
+    "viewuri": "/doc/write",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-doc-write()"
+}

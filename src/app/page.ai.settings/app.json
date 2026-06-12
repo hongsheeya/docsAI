@@ -1,0 +1,12 @@
+{
+    "id": "page.ai.settings",
+    "mode": "page",
+    "title": "/ai/settings",
+    "namespace": "ai.settings",
+    "category": "ai",
+    "viewuri": "/ai/settings",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-ai-settings()"
+}

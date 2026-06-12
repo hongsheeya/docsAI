@@ -1,0 +1,12 @@
+{
+    "id": "page.doc.write.item",
+    "mode": "page",
+    "title": "/doc/write/:id/:tab?",
+    "namespace": "doc.write.item",
+    "category": "doc",
+    "viewuri": "/doc/write/:id/:tab?",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-doc-write-item()"
+}

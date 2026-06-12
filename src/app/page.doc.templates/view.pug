@@ -1,0 +1,201 @@
+div.w-full.h-full.overflow-auto
+    div(class="max-w-5xl mx-auto py-8 px-6")
+        //- 헤더
+        div.flex.items-center.justify-between.mb-8
+            div
+                h1(class="text-lg font-bold text-slate-800") 양식 관리
+                p(class="text-[13px] text-slate-400 mt-1") 문서 양식과 프로젝트 전체 설명을 함께 등록해 원본 양식 삽입 품질을 높입니다
+            button((click)="openCreate()",
+                class="px-4 py-2 bg-teal-600 text-white text-[13px] font-semibold rounded-lg hover:bg-teal-700 transition-colors shadow-sm") + 양식 등록
+
+        //- 빈 상태
+        div(*ngIf="templates.length === 0",
+            class="bg-white rounded-xl shadow-sm border border-slate-200 p-12 text-center")
+            div(class="text-4xl mb-3 opacity-30") 📋
+            p(class="text-[13px] text-slate-400") 등록된 양식이 없습니다
+            p(class="text-xs text-slate-300 mt-1") '양식 등록' 버튼을 눌러 시작하세요
+
+        //- 양식 목록
+        div(*ngIf="templates.length > 0",
+            class="grid grid-cols-1 gap-4")
+            div(*ngFor="let tpl of templates",
+                class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 hover:shadow-md transition-shadow")
+                div.flex.items-start.justify-between
+                    div.flex.items-start.gap-4
+                        //- 파일 타입 배지
+                        div(class="flex-shrink-0 w-12 h-12 rounded-lg flex items-center justify-center text-xs font-bold",
+                            [ngClass]="fileTypeBadgeClass(tpl.file_type)")
+                            | {{ fileTypeLabel(tpl.file_type) }}
+                        div
+                            div(class="text-[14px] font-semibold text-slate-800") {{ tpl.title }}
+                            div(*ngIf="tpl.description",
+                                class="text-[13px] text-slate-400 mt-1") {{ tpl.description }}
+                            div(class="flex items-center gap-4 mt-2 text-xs text-slate-400")
+                                span 등록일: {{ tpl.created?.substring(0, 10) }}
+                                span 필드 {{ schemaStats(tpl).fields }}개
+                                span 섹션 {{ schemaStats(tpl).sections }}개
+                                span 표 {{ schemaStats(tpl).tables }}개
+                                span 빈칸 {{ schemaStats(tpl).fills }}개
+                                span 참고자료 {{ referenceCount(tpl) }}개
+                            div(class="mt-2")
+                                span(class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium", [ngClass]="fillCapabilityClass(tpl)") {{ fillCapabilityLabel(tpl) }}
+                                span(*ngIf="schemaStats(tpl).placeholders",
+                                    class="ml-2 inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600") 플레이스홀더 {{ schemaStats(tpl).placeholders }}개
+
+                    div.flex.items-center.gap-2
+                        button((click)="toggleTemplate(tpl); $event.stopPropagation()",
+                            class="px-3 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") {{ expandedTemplateId === tpl.id ? '닫기' : '분석' }}
+                        button((click)="reanalyze(tpl, $event)",
+                            [disabled]="reanalyzingId === tpl.id",
+                            class="px-3 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors disabled:opacity-50") {{ reanalyzingId === tpl.id ? '분석 중' : '재분석' }}
+                        button((click)="openEdit(tpl)",
+                            class="px-3 py-1 text-xs border border-slate-300 text-slate-600 rounded-lg hover:bg-slate-50 transition-colors") 수정
+                        button((click)="remove(tpl.id)",
+                            class="px-3 py-1 text-xs border border-rose-200 text-rose-500 rounded-lg hover:bg-rose-50 transition-colors") 삭제
+
+                div(*ngIf="expandedTemplateId === tpl.id",
+                    class="mt-5 border-t border-slate-100 pt-5")
+                    div(class="grid grid-cols-4 gap-3 mb-5")
+                        div(class="rounded-lg border border-slate-200 bg-slate-50 p-3")
+                            div(class="text-xs text-slate-400 mb-1") 표 구조
+                            div(class="text-[18px] font-semibold text-slate-800") {{ schemaStats(tpl).tables }}개
+                            div(class="text-xs text-slate-400 mt-1") {{ schemaStats(tpl).rows }}행 · 최대 {{ schemaStats(tpl).maxCols }}열
+                        div(class="rounded-lg border border-slate-200 bg-slate-50 p-3")
+                            div(class="text-xs text-slate-400 mb-1") 채움 칸
+                            div(class="text-[18px] font-semibold text-slate-800") {{ schemaStats(tpl).fills }}개
+                            div(class="text-xs text-slate-400 mt-1") 표 기반 자동 기입 후보
+                        div(class="rounded-lg border border-slate-200 bg-slate-50 p-3")
+                            div(class="text-xs text-slate-400 mb-1") 섹션
+                            div(class="text-[18px] font-semibold text-slate-800") {{ schemaStats(tpl).sections }}개
+                            div(class="text-xs text-slate-400 mt-1") 본문 생성 단위
+                        div(class="rounded-lg border border-slate-200 bg-slate-50 p-3")
+                            div(class="text-xs text-slate-400 mb-1") 레이아웃 출력
+                            div(class="text-[13px] font-semibold text-slate-800 mt-1") {{ tpl.fields_schema?.capabilities?.preferred_output || 'section-text' }}
+                            div(class="text-xs text-slate-400 mt-1 truncate") {{ tpl.fields_schema?.capabilities?.reason || '분석 정보 없음' }}
+
+                    div(*ngIf="tpl.fields_schema?.tables?.length",
+                        class="space-y-4")
+                        div(*ngFor="let table of tpl.fields_schema.tables; let ti = index",
+                            class="border border-slate-200 rounded-lg overflow-hidden")
+                            div(class="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between")
+                                div(class="text-[13px] font-semibold text-slate-700") 표 {{ ti + 1 }}
+                                div(class="text-xs text-slate-400") {{ table.length }}행 · {{ tableColumnCount(table) }}열
+                            div(class="overflow-x-auto")
+                                table(class="w-full min-w-[560px]")
+                                    tbody
+                                        tr(*ngFor="let row of tablePreviewRows(table)",
+                                            class="border-b border-slate-100 last:border-b-0")
+                                            td(*ngFor="let cell of row",
+                                                class="px-3 py-2 text-xs text-slate-600 border-r border-slate-100 last:border-r-0 max-w-[180px] truncate") {{ cell || '빈칸' }}
+
+                    div(*ngIf="firstTableFills(tpl).length",
+                        class="mt-5")
+                        div(class="text-xs font-semibold text-slate-500 mb-2") 주요 채움 후보
+                        div(class="flex flex-wrap gap-2")
+                            span(*ngFor="let fill of firstTableFills(tpl)",
+                                class="inline-flex items-center px-2 py-1 rounded bg-teal-50 text-teal-700 text-xs") {{ fill.label }}
+
+    //- 모달
+    div(*ngIf="showModal",
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm")
+        div(class="bg-white rounded-xl shadow-xl w-full max-w-lg p-6",
+            (click)="$event.stopPropagation()")
+            h3(class="text-[15px] font-bold text-slate-800 mb-5")
+                | {{ editMode ? '양식 수정' : '양식 등록' }}
+
+            //- 수정 시 기존 양식 정보 표시
+            div(*ngIf="editMode && editTemplateInfo",
+                class="mb-4 p-3 bg-slate-50 rounded-lg border border-slate-200")
+                div(class="flex items-center gap-3 mb-2")
+                    div(class="flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold",
+                        [ngClass]="fileTypeBadgeClass(editTemplateInfo.file_type)")
+                        | {{ fileTypeLabel(editTemplateInfo.file_type) }}
+                    div
+                        div(class="text-[13px] font-medium text-slate-700") 현재 파일: {{ editTemplateInfo.file_type?.toUpperCase() }} 양식
+                        div(class="text-xs text-slate-400") 등록일: {{ editTemplateInfo.created?.substring(0, 10) }}
+                //- 필드 목록
+                div(*ngIf="editTemplateInfo.fields_schema?.fields?.length",
+                    class="mt-2")
+                    div(class="text-xs font-medium text-slate-500 mb-1") 감지된 필드 ({{ editTemplateInfo.fields_schema.fields.length }}개)
+                    div(class="flex flex-wrap gap-1")
+                        span(*ngFor="let f of editTemplateInfo.fields_schema.fields",
+                            class="inline-flex items-center px-2 py-0.5 rounded text-xs bg-teal-50 text-teal-600") {{ f.label || f.name }}
+                //- 섹션 목록
+                div(*ngIf="editTemplateInfo.fields_schema?.sections?.length",
+                    class="mt-2")
+                    div(class="text-xs font-medium text-slate-500 mb-1") 감지된 섹션 ({{ editTemplateInfo.fields_schema.sections.length }}개)
+                    div(class="space-y-0.5")
+                        div(*ngFor="let s of editTemplateInfo.fields_schema.sections; let i = index",
+                            class="text-xs text-slate-500 truncate") {{ i + 1 }}. {{ s.title || s.name || s }}
+
+            div.mb-4
+                label(class="block text-[13px] font-medium text-slate-600 mb-1") 양식 이름 *
+                input(type="text",
+                    [(ngModel)]="formData.title",
+                    placeholder="예: 주간업무보고서",
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400")
+
+            div.mb-4
+                label(class="block text-[13px] font-medium text-slate-600 mb-1") 프로젝트 전체 설명
+                textarea([(ngModel)]="formData.description",
+                    placeholder="이 양식이 사용되는 프로젝트/서비스/도메인 배경 설명을 입력하세요",
+                    rows="3",
+                    class="w-full border border-slate-300 rounded-lg px-3 py-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-teal-200 focus:border-teal-400 resize-none")
+                p(class="mt-1 text-xs text-slate-400") 문서별 세부 설명은 문서 작성 화면에서 입력하고, 여기는 양식 전반에 공통으로 적용되는 설명을 적습니다.
+
+            div.mb-4
+                label(class="block text-[13px] font-medium text-slate-600 mb-1") 기본 참고자료
+                div(class="border-2 border-dashed border-slate-300 rounded-lg p-4 text-center cursor-pointer hover:border-teal-400 transition-colors bg-slate-50",
+                    (click)="referenceInput.click()")
+                    input(#referenceInput="",
+                        type="file",
+                        multiple,
+                        accept=".pdf,.hwp,.doc,.docx,.txt,.md,.csv,.json,.yaml,.yml",
+                        (change)="onReferenceFileSelect($event)",
+                        class="hidden")
+                    div(*ngIf="referenceFiles.length === 0",
+                        class="text-[13px] text-slate-400") 이 양식으로 만드는 문서에 기본으로 넣을 참고자료를 선택하세요
+                    div(*ngIf="referenceFiles.length > 0",
+                        class="text-[13px] text-teal-600 font-medium") {{ referenceFiles.length }}개 파일 선택됨
+                div(*ngIf="referenceFiles.length > 0",
+                    class="mt-2 flex flex-wrap gap-2")
+                    span(*ngFor="let file of referenceFiles",
+                        class="inline-flex items-center rounded-full bg-teal-50 px-2 py-1 text-xs text-teal-700") {{ file.name }}
+                    button((click)="clearReferenceFiles()",
+                        class="inline-flex items-center rounded-full border border-slate-300 px-2 py-1 text-xs text-slate-500 hover:bg-slate-50 transition-colors") 선택 해제
+                div(*ngIf="existingReferenceFiles.length > 0",
+                    class="mt-2")
+                    div(class="text-xs text-slate-400 mb-1") 저장된 기본 참고자료
+                    div(class="flex flex-wrap gap-2")
+                        span(*ngFor="let ref of existingReferenceFiles",
+                            class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600")
+                            span {{ ref.original_name || ref.filename }}
+                            button(type="button",
+                                (click)="removeExistingReference(ref)",
+                                class="ml-1 text-slate-400 hover:text-rose-500") 삭제
+
+            div.mb-5
+                label(class="block text-[13px] font-medium text-slate-600 mb-1")
+                    | {{ editMode ? '파일 변경 (선택)' : '양식 파일 *' }}
+                div(class="border-2 border-dashed border-slate-300 rounded-lg p-4 text-center cursor-pointer hover:border-teal-400 transition-colors bg-slate-50",
+                    (click)="fileInput.click()")
+                    input(#fileInput="",
+                        type="file",
+                        accept=".hwp,.doc,.docx",
+                        (change)="onFileSelect($event)",
+                        class="hidden")
+                    div(*ngIf="!selectedFile",
+                        class="text-[13px] text-slate-400")
+                        | HWP, DOC, DOCX 파일을 선택하세요
+                    div(*ngIf="selectedFile",
+                        class="text-[13px] text-teal-600 font-medium")
+                        | {{ selectedFile.name }}
+
+            div.flex.justify-end.gap-3
+                button((click)="closeModal()",
+                    class="px-4 py-2 border border-slate-300 text-slate-600 text-[13px] rounded-lg hover:bg-slate-50 transition-colors") 취소
+                button((click)="save()",
+                    [disabled]="uploading",
+                    class="px-4 py-2 bg-teal-600 text-white text-[13px] font-semibold rounded-lg hover:bg-teal-700 transition-colors disabled:opacity-50")
+                    span(*ngIf="!uploading") {{ editMode ? '수정' : '등록' }}
+                    span(*ngIf="uploading") 업로드 중...

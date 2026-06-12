@@ -49,6 +49,11 @@
                         "inlineStyleLanguage": "scss",
                         "assets": [
                             {
+                                "glob": "manifest.json",
+                                "input": "src",
+                                "output": "/"
+                            },
+                            {
                                 "glob": "**/*",
                                 "input": "node_modules/monaco-editor/min/vs",
                                 "output": "/lib/vs"

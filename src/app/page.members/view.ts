@@ -1,4 +1,4 @@
-import { OnInit } from '@angular/core';
+import { OnInit, ChangeDetectorRef } from '@angular/core';
 import { Service } from '@wiz/libs/portal/season/service';
 
 export class Component implements OnInit {
@@ -15,11 +15,18 @@ export class Component implements OnInit {
     public showInviteModal: boolean = false;
     public inviteData: any = { email: '', role: 'viewer' };
 
-    constructor(public service: Service) { }
+    constructor(public service: Service, private cdr: ChangeDetectorRef) { }
 
     public async ngOnInit() {
         await this.service.init();
-        await this.service.auth.allow("/access");
+
+        // 관리자만 접근 가능
+        let session = this.service.auth.session;
+        if (!session || session.role !== 'admin') {
+            this.service.href('/doc/write');
+            return;
+        }
+
         await this.load();
     }
 
@@ -44,6 +51,7 @@ export class Component implements OnInit {
     public async openInvite() {
         this.inviteData = { email: '', role: 'viewer' };
         this.showInviteModal = true;
+        this.cdr.detectChanges();
         await this.service.render();
     }
 
@@ -57,6 +65,7 @@ export class Component implements OnInit {
         if (code === 200) {
             await this.service.modal.success("초대가 완료되었습니다.");
             this.showInviteModal = false;
+            this.cdr.detectChanges();
             await this.load();
         } else {
             await this.service.modal.error(data || "초대에 실패했습니다.");
@@ -81,10 +90,10 @@ export class Component implements OnInit {
 
     public roleClass(role: string) {
         switch (role) {
-            case 'admin': return 'bg-purple-100 text-purple-700';
-            case 'editor': return 'bg-blue-100 text-blue-700';
-            case 'viewer': return 'bg-gray-100 text-gray-600';
-            default: return 'bg-gray-100 text-gray-600';
+            case 'admin': return 'bg-violet-50 text-violet-700';
+            case 'editor': return 'bg-blue-50 text-blue-700';
+            case 'viewer': return 'bg-slate-100 text-slate-600';
+            default: return 'bg-slate-100 text-slate-600';
         }
     }
 }
