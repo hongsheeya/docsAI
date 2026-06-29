@@ -12,7 +12,7 @@ export class Component implements OnInit {
     };
 
     public async ngOnInit() {
-        await this.service.init();
+        await this.service.init(this);
         let check = await this.service.auth.check();
         if (check) return location.href = "/";
     }

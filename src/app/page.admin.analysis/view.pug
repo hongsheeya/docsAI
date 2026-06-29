@@ -1,20 +1,21 @@
 input(#trainingInput="", type="file", accept="video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,video/webm", class="hidden", (change)="onTrainingFileSelected($event)")
 
-nav(class="sticky top-0 z-20 border-b border-zinc-200 bg-white/95 backdrop-blur")
-    div(class="max-w-7xl px-4 py-3 sm:px-6 lg:px-8")
-        div(class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between")
+nav(class="sticky top-0 z-20 border-b border-zinc-200 bg-white")
+    div(class="max-w-[1800px] px-4 sm:px-6")
+        div(class="flex h-[56px] items-center justify-between gap-4")
             div(class="min-w-0 flex items-center gap-3")
                 span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
                     img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
                 div
                     h1(class="text-lg font-semibold text-zinc-950") 관리자 분석 설정
                     p(class="text-xs text-zinc-400") FallAI · 운영 상태 · 학습·알림 설정
-            div(class="flex flex-wrap items-center gap-2")
-                a(routerLink="/", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 메인
-                a(routerLink="/pipeline", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 파이프라인
-                a(routerLink="/manual", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") 설명서
-                a(routerLink="/admin/llm", class="inline-flex items-center rounded-xl border border-gray-300 bg-white px-3 py-1.5 text-[13px] font-medium text-gray-700 hover:bg-gray-50") LLM 설정
-                a(routerLink="/admin/analysis", class="inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-[13px] font-semibold text-sky-700") 관리자
+            div(class="flex min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap")
+                a(routerLink="/", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 메인
+                a(routerLink="/pipeline", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 파이프라인
+                a(routerLink="/models", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 모델 관리
+                a(routerLink="/manual", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
+                a(routerLink="/admin/analysis", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 text-[13px] font-semibold text-sky-700") 관리자
+                a(routerLink="/admin/llm", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") LLM 설정
 
 div(class="max-w-7xl px-4 pb-8 pt-6 sm:px-6 lg:px-8")
     div(class="grid grid-cols-1 gap-4 lg:grid-cols-3")

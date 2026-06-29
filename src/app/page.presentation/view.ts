@@ -11,14 +11,14 @@ export class Component implements OnInit, OnDestroy {
     public slides: any[] = [
         {
             type: 'cover',
-            badge: '표정·가림 보조모델 개선 보고 · 2026-06-01',
-            title: 'FallAI 표정·가림 보조모델 개선 보고',
-            subtitle: '이번 발표는 표정 상태 보조모델과 하체가림 전처리 보조모델을 같은 비중으로 정리',
+            badge: '모델 포트폴리오 · 2026-06-22',
+            title: 'FallAI 모델 포트폴리오',
+            subtitle: 'RF-Dual 운영 모델, XG-Posture, AI-Hub 82/173 표정·상태 보조, 가림 보조 모델을 한눈에 정리',
             stats: [
-                { label: 'RF-Fall F1', value: '0.9302', tone: 'emerald' },
-                { label: 'FacialRisk-Aux 적용', value: '1/100', tone: 'cyan' },
-                { label: '가림 보조 F1', value: '0.8657', tone: 'orange' },
-                { label: 'Skeleton-only', value: '적용', tone: 'violet' },
+                { label: 'RF-Fall 운영 F1', value: '98.1%', tone: 'emerald' },
+                { label: 'XG-Posture F1', value: '94.3%', tone: 'cyan' },
+                { label: '가림 보조 Sequence F1', value: '95.96%', tone: 'orange' },
+                { label: 'AI-Hub 82 Macro F1', value: '87.5%', tone: 'violet' },
             ],
         },
         {
@@ -32,10 +32,10 @@ export class Component implements OnInit, OnDestroy {
                     headers: ['단계', '모델/처리', '역할', '이번 발표 포인트'],
                     rows: [
                         ['1', 'Pose/BBox feature', '사람 위치, 자세, 이동량, visibility 추출', '프라이버시 화면은 skeleton-only로 표시'],
-                        ['2', 'RF-Fall v2', '낙상/비낙상 주 판정', '현재 기준 F1 0.9302, recall 95.36%'],
-                        ['3', 'XG-Posture', '비낙상 구간 행동 설명', '하체가림 상황에서 흔들림이 커서 보조모델 추가'],
-                        ['4', 'Occlusion-Aux', '하체가림 전처리로 만든 보조 판단', '가림 조건 F1 0.8657'],
-                        ['5', 'FacialRisk-Aux', '표정/주의저하 근거를 하나의 보조 evidence로 합산', '100개 확장검증 기준 판정개선 0건, harmful 0건'],
+                        ['2', 'RF-Fall v2', '낙상/비낙상 주 판정', '운영 F1 98.1%, Acc 96.8%, Recall 99.3%'],
+                        ['3', 'XG-Posture', '비낙상 구간 행동 설명', '운영 F1 94.3%, Acc 94.3%'],
+                        ['4', 'Occlusion-Aux', '하체가림 전처리로 만든 보조 판단', 'Sequence F1 95.96%로 목표 달성, 반복 학습 중단'],
+                        ['5', 'FacialRisk-Aux', '표정/주의저하 근거를 하나의 보조 evidence로 합산', 'AI-Hub 82는 87.5% plateau 원인 제거 후 seed sweep 재학습 중'],
                     ],
                 },
             ],
@@ -51,8 +51,8 @@ export class Component implements OnInit, OnDestroy {
                     title: '둘 다 주 모델을 대체하지 않고 약점 구간을 보강한다',
                     headers: ['보조모델', '왜 만들었나', '검증 결과', '현재 결론'],
                     rows: [
-                        ['Occlusion-Aux', '하체가 침대/가구/화면 밖으로 가려질 때 stand/sit/lie가 흔들림', '가림 조건 F1 0.8657 · Acc 0.8663', '가림 hard-case에서는 기존 행동분류보다 도움 확인'],
-                        ['FacialRisk-Aux', '낙상 near-miss에서 표정/주의저하 evidence가 빠져 FN이 남음', '100개 확장검증 F1 0.9149 → 0.9149 · harmful 0건', '현재 데이터에서는 판정 성능 개선 미확인, 얼굴 ROI가 병목'],
+                        ['Occlusion-Aux', '하체가 침대/가구/화면 밖으로 가려질 때 stand/sit/lie가 흔들림', 'Sequence F1 95.96% · Window F1 91.13%', '목표 달성 완료. 이제 표정/상태 모델을 우선 개선'],
+                        ['FacialRisk-Aux', '낙상 near-miss에서 표정/주의저하 evidence가 빠져 FN이 남음', 'AI-Hub 82 Macro F1 87.5% · AI-Hub 173 Macro F1 93.24%', '82는 고정 seed 반복과 FP precision 병목을 제거하는 중'],
                     ],
                 },
             ],
@@ -68,8 +68,8 @@ export class Component implements OnInit, OnDestroy {
                     title: '내부는 2개 모델, 외부는 1개 보조점수',
                     headers: ['표시 이름', '기존 번호', '학습 목적', '현재 성능', '운영 해석'],
                     rows: [
-                        ['EmotionGuard-82', 'AI-Hub 82', '한국인 감정 7-class', 'Acc 62.06% · Macro F1 0.6198', '불안/상처/슬픔 같은 감정 근거. 단독 낙상 근거로는 약함'],
-                        ['DrowsyState-173', 'AI-Hub 173', '졸음/하품/주의저하 5-class', 'Acc 90.22% · Macro F1 0.9054', '졸음/하품처럼 명확한 상태 근거가 비교적 안정적'],
+                        ['EmotionGuard-82', 'AI-Hub 82', 'distress/non-distress 운영 보조', 'Acc 87.52% · Macro F1 87.50%', 'distress recall은 높지만 precision 병목이 있어 seed/crop/weight 조합으로 개선 중'],
+                        ['DrowsyState-173', 'AI-Hub 173', '졸음/하품/주의저하 5-class', 'Acc 90.2% · Macro F1 93.24%', '졸음/하품처럼 명확한 상태 근거가 비교적 안정적'],
                         ['FacialRisk-Aux', '통합 출력', '두 모델의 evidence를 late fusion', '단일 support score로 표시', '화면과 발표에서는 표정 보조모델 하나처럼 설명'],
                     ],
                 },
@@ -107,7 +107,7 @@ export class Component implements OnInit, OnDestroy {
                     headers: ['문제', '왜 중요한가', '다음 조치'],
                     rows: [
                         ['얼굴이 작거나 안 보임', '100개 중 얼굴 미검출 65건', '상체/전체 프레임 fallback을 추가했고, 실제 얼굴 검출률 지표로 gate'],
-                        ['82 감정모델 한계', '불안 F1 0.4532, 상처 F1 0.3788로 약한 클래스가 있음', '감정 자체보다 distress/normal 이진 보조로 재정의'],
+                        ['82 표정모델 plateau', '87.5% 후보가 고정 seed와 같은 레시피로 반복되어 실제 탐색이 멈춤', 'distress FP를 줄이는 crop/weight/smoothing/validation seed sweep으로 재학습'],
                         ['173 도메인 차이', '운전자 상태 데이터라 병실/실내 낙상과 완전히 같지 않음', '졸음/하품/눈감김 evidence로만 제한'],
                         ['실환경 데이터 부족', '낙상 전후 표정, 누운 상태 얼굴, 가림 얼굴이 부족', '실제 설치각 데이터로 near-miss rescue 기준 재검증'],
                     ],
@@ -144,12 +144,12 @@ export class Component implements OnInit, OnDestroy {
                     headers: ['비교', '수치', '해석'],
                     rows: [
                         ['기존 XG-Posture', 'F1 0.6513 / Acc 0.6602', '일반 행동분류 기준. 하체가림 hard-case에 약함'],
-                        ['Occlusion-Aux', 'F1 0.8657 / Acc 0.8663', '가림 전처리 조건에서 행동/자세 보조 성능 개선'],
+                        ['Occlusion-Aux', 'Sequence F1 95.96% / Window F1 91.13%', '가림 전처리 조건에서 목표 달성, 반복 학습 중단'],
                         ['RF 주 판정 기여', 'occlusion_fall_risk rank 4/65, importance 0.0564', '가림 관련 feature가 낙상 판정에서도 상위 근거로 사용됨'],
                     ],
                 },
             ],
-            note: '가림 보조모델은 만든 의미가 있다. 다만 합성 가림이 실제 침대/가구 가림과 얼마나 일치하는지는 추가 촬영 데이터로 확인해야 한다.',
+            note: '가림 보조모델은 목표 95%를 넘겼으므로 더 돌리지 않고, 같은 자원은 AI-Hub 82/173 등 미달 모델 개선에 우선 배정한다.',
         },
         {
             type: 'screenshot',
@@ -173,10 +173,10 @@ export class Component implements OnInit, OnDestroy {
                     title: '무엇이 효과 있었고, 무엇이 아직 실패인가',
                     headers: ['항목', '현재 결론', '다음 개선'],
                     rows: [
-                        ['표정 보조', '100개 확장검증 F1 0.9149 → 0.9149, harmful 0건', '현재는 판정 근거 표시용에 가깝고, 성능 개선은 얼굴 ROI/실제 설치각 데이터 확보 후 재검증'],
+                        ['표정 보조', 'AI-Hub 82는 87.5% plateau. 고정 seed 반복과 잘못된 clean 레시피를 제거', 'precision 병목을 줄이는 새 후보를 백그라운드 학습 중'],
                         ['82+173 통합', '지금은 내부 2개 모델을 FacialRisk-Aux 하나의 보조점수로 합산', '공통 라벨(normal/distress/drowsy/unknown) 데이터가 생기면 단일 모델 재학습'],
-                        ['가림 보조', '가려진 하체 조건의 행동/자세 판정에는 도움 확인', '실제 침대/가구 가림 데이터로 보강'],
-                        ['발표 메시지', '가림은 행동/자세 보조 효과 확인, 표정은 현 데이터에서 성능 개선 미확인', '표정은 입력 품질, 가림은 실제 가림 데이터가 핵심'],
+                        ['가림 보조', 'Sequence F1 95.96%로 목표 달성', '추가 반복보다 실제 침대/가구 가림 데이터 확보가 다음 단계'],
+                        ['발표 메시지', '가림은 목표 달성, 표정은 현재 최우선 개선 대상', '표정은 FP precision과 얼굴 ROI 품질을 같이 잡는 것이 핵심'],
                     ],
                 },
             ],
@@ -196,7 +196,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public async ngOnInit() {
-        await this.service.init();
+        await this.service.init(this);
         window.addEventListener('keydown', this._keyHandler);
         document.addEventListener('fullscreenchange', this._fsHandler);
         await this.service.render();
@@ -327,5 +327,29 @@ export class Component implements OnInit, OnDestroy {
 
     public pipelineHighlightClass(step: any): string {
         return step.highlight ? 'ring-2 ring-violet-400 bg-white shadow-lg' : 'bg-white/80';
+    }
+
+    public portfolioCoverStats(): any[] {
+        const cover = this.slides.find((item: any) => item?.type === 'cover');
+        return Array.isArray(cover?.stats) ? cover.stats : [];
+    }
+
+    public portfolioExportDateText(): string {
+        return new Date().toLocaleDateString('ko-KR', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        });
+    }
+
+    public exportPortfolioPdf() {
+        const previousTitle = document.title;
+        document.title = `FallAI-portfolio-${new Date().toISOString().slice(0, 10)}`;
+        const restoreTitle = () => {
+            document.title = previousTitle;
+            window.removeEventListener('afterprint', restoreTitle);
+        };
+        window.addEventListener('afterprint', restoreTitle);
+        setTimeout(() => window.print(), 80);
     }
 }

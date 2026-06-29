@@ -15,6 +15,8 @@ import math
 import os
 import random
 import re
+import shutil
+import tarfile
 import time
 import zipfile
 from collections import Counter, defaultdict
@@ -22,9 +24,15 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
+
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+except Exception:
+    pass
 
 try:
     _torch_threads = int(os.environ.get('TORCH_NUM_THREADS', '0') or 0)
@@ -34,7 +42,8 @@ except Exception:
     pass
 
 
-CLASS_NAMES = ['happiness', 'embarrassed', 'anger', 'anxiety', 'hurt', 'sadness', 'neutral']
+RAW_CLASS_NAMES = ['happiness', 'embarrassed', 'anger', 'anxiety', 'hurt', 'sadness', 'neutral']
+CLASS_NAMES = list(RAW_CLASS_NAMES)
 KOR_TO_CLASS = {
     '기쁨': 'happiness',
     '당황': 'embarrassed',
@@ -44,9 +53,159 @@ KOR_TO_CLASS = {
     '슬픔': 'sadness',
     '중립': 'neutral',
 }
-CLASS_TO_KOR = {v: k for k, v in KOR_TO_CLASS.items()}
+RAW_CLASS_TO_KOR = {v: k for k, v in KOR_TO_CLASS.items()}
+CLASS_TO_KOR = dict(RAW_CLASS_TO_KOR)
+ACTIVE_LABEL_MAP = {label: label for label in RAW_CLASS_NAMES}
+LABEL_POLICY = 'seven'
+LABEL_POLICY_CONFIGS = {
+    'seven': {
+        'classes': RAW_CLASS_NAMES,
+        'label_map': {label: label for label in RAW_CLASS_NAMES},
+        'class_to_korean': RAW_CLASS_TO_KOR,
+    },
+    'fall_aux4': {
+        'classes': ['happiness', 'embarrassed', 'distress', 'neutral'],
+        'label_map': {
+            'happiness': 'happiness',
+            'embarrassed': 'embarrassed',
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'neutral',
+        },
+        'class_to_korean': {
+            'happiness': '기쁨',
+            'embarrassed': '당황',
+            'distress': '불편/고통',
+            'neutral': '중립',
+        },
+    },
+    'fall_aux3_drop_embarrassed': {
+        'classes': ['happiness', 'distress', 'neutral'],
+        'label_map': {
+            'happiness': 'happiness',
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'neutral',
+        },
+        'class_to_korean': {
+            'happiness': '기쁨',
+            'distress': '불편/고통',
+            'neutral': '중립',
+        },
+    },
+    'fall_aux3_merge_embarrassed_neutral': {
+        'classes': ['happiness', 'distress', 'neutral'],
+        'label_map': {
+            'happiness': 'happiness',
+            'embarrassed': 'neutral',
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'neutral',
+        },
+        'class_to_korean': {
+            'happiness': '기쁨',
+            'distress': '불편/고통',
+            'neutral': '중립/당황',
+        },
+    },
+    'distress_binary': {
+        'classes': ['non_distress', 'distress'],
+        'label_map': {
+            'happiness': 'non_distress',
+            'embarrassed': 'non_distress',
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'non_distress',
+        },
+        'class_to_korean': {
+            'non_distress': '비불편',
+            'distress': '불편/고통',
+        },
+    },
+    'distress_operational_clean': {
+        'classes': ['normal', 'distress'],
+        'label_map': {
+            'happiness': 'normal',
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'normal',
+        },
+        'class_to_korean': {
+            'normal': '정상/무증상',
+            'distress': '불편/고통',
+        },
+    },
+    'distress_vs_neutral': {
+        'classes': ['neutral', 'distress'],
+        'label_map': {
+            'anger': 'distress',
+            'anxiety': 'distress',
+            'hurt': 'distress',
+            'sadness': 'distress',
+            'neutral': 'neutral',
+        },
+        'class_to_korean': {
+            'neutral': '중립',
+            'distress': '불편/고통',
+        },
+    },
+}
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+SPLIT_ZIP_CACHE_ROOT = Path(os.environ.get(
+    'FALLAI_AIHUB82_SPLIT_ZIP_CACHE',
+    '/opt/app/storage/training/fall-detection/facial-state/aihub82_source_zip_cache',
+))
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def configure_label_policy(policy):
+    global CLASS_NAMES, CLASS_TO_KOR, ACTIVE_LABEL_MAP, LABEL_POLICY
+    policy = str(policy or 'seven').strip()
+    config = LABEL_POLICY_CONFIGS.get(policy)
+    if config is None:
+        raise SystemExit(f'Unknown label policy: {policy}')
+    LABEL_POLICY = policy
+    CLASS_NAMES = list(config['classes'])
+    CLASS_TO_KOR = dict(config.get('class_to_korean') or {})
+    ACTIVE_LABEL_MAP = dict(config.get('label_map') or {})
+
+
+def parse_class_weight_multipliers(value):
+    multipliers = {}
+    for part in str(value or '').split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' not in part:
+            raise SystemExit(f'Invalid class weight multiplier: {part}')
+        label, raw = part.split('=', 1)
+        label = label.strip()
+        if label not in CLASS_NAMES:
+            raise SystemExit(f'Unknown class in class weight multiplier: {label}')
+        try:
+            weight = float(raw)
+        except Exception:
+            raise SystemExit(f'Invalid class weight value: {part}')
+        if not math.isfinite(weight) or weight <= 0:
+            raise SystemExit(f'Class weight must be positive: {part}')
+        multipliers[label] = weight
+    return multipliers
+
+
+def map_raw_label(label):
+    if not label:
+        return None
+    return ACTIVE_LABEL_MAP.get(label)
 
 
 def stable_key(value):
@@ -75,17 +234,184 @@ def infer_split(path):
     return 'train'
 
 
+def cache_key_for_archive(path):
+    try:
+        stat = Path(path).stat()
+        raw = f'{Path(path).resolve()}:{stat.st_size}:{stat.st_mtime_ns}'
+    except Exception:
+        raw = str(path)
+    return stable_key(raw)[:16]
+
+
+def load_split_zip_manifest(archive_path):
+    cache_dir = SPLIT_ZIP_CACHE_ROOT / cache_key_for_archive(archive_path)
+    manifest_path = cache_dir / 'manifest.json'
+    try:
+        data = json.loads(manifest_path.read_text(encoding='utf-8'))
+        paths = [Path(item) for item in data.get('zip_paths') or []]
+        if paths and all(path.exists() and zipfile.is_zipfile(path) for path in paths):
+            return paths
+    except Exception:
+        pass
+    try:
+        paths = sorted(path for path in cache_dir.glob('*.zip') if path.exists() and zipfile.is_zipfile(path))
+        if paths:
+            return paths
+    except Exception:
+        pass
+    return []
+
+
+def write_split_zip_manifest(archive_path, zip_paths, part_counts):
+    if not zip_paths:
+        return
+    cache_dir = SPLIT_ZIP_CACHE_ROOT / cache_key_for_archive(archive_path)
+    manifest = {
+        'source_tar': str(archive_path),
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'zip_paths': [str(path) for path in zip_paths],
+        'part_counts': dict(part_counts),
+    }
+    (cache_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def split_zip_member_info(name):
+    match = re.search(r'(.+\.zip)\.part(\d+)$', str(name or ''), re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def assemble_split_zips_from_tar(archive_path):
+    cached = load_split_zip_manifest(archive_path)
+    if cached:
+        return cached
+    archive_path = Path(archive_path)
+    cache_dir = SPLIT_ZIP_CACHE_ROOT / cache_key_for_archive(archive_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {}
+    current_base = None
+    current_fp = None
+    current_tmp = None
+    current_out = None
+    part_counts = Counter()
+
+    def close_current():
+        nonlocal current_base, current_fp, current_tmp, current_out
+        if current_fp is not None:
+            current_fp.close()
+        if current_tmp and current_out:
+            try:
+                os.replace(current_tmp, current_out)
+                outputs[current_base] = current_out
+            except Exception:
+                pass
+        current_base = None
+        current_fp = None
+        current_tmp = None
+        current_out = None
+
+    def valid_outputs():
+        paths = [path for path in outputs.values() if path.exists() and zipfile.is_zipfile(path)]
+        try:
+            paths.extend(path for path in cache_dir.glob('*.zip') if path.exists() and zipfile.is_zipfile(path) and path not in paths)
+        except Exception:
+            pass
+        return sorted(paths)
+
+    try:
+        with tarfile.open(archive_path, mode='r|*') as tf:
+            while True:
+                try:
+                    member = tf.next()
+                except (tarfile.TarError, EOFError, OSError) as exc:
+                    if outputs or current_fp is not None:
+                        print(f'[source] partial tar EOF tolerated {archive_path}: {exc}', flush=True)
+                    else:
+                        raise
+                    break
+                if member is None:
+                    break
+                if not member.isfile():
+                    continue
+                info = split_zip_member_info(member.name)
+                if not info:
+                    continue
+                zip_base, offset = info
+                if current_base != zip_base:
+                    close_current()
+                    safe_name = re.sub(r'[^0-9A-Za-z._가-힣-]+', '_', Path(zip_base).name)
+                    current_out = cache_dir / safe_name
+                    current_tmp = cache_dir / (safe_name + '.partial')
+                    current_base = zip_base
+                    current_fp = current_tmp.open('wb')
+                src = tf.extractfile(member)
+                if src is None or current_fp is None:
+                    continue
+                shutil.copyfileobj(src, current_fp, length=1024 * 1024)
+                part_counts[Path(zip_base).name] += 1
+        close_current()
+    except Exception as exc:
+        close_current()
+        zip_paths = valid_outputs()
+        if zip_paths:
+            write_split_zip_manifest(archive_path, zip_paths, part_counts)
+            print(f'[source] partial tar EOF tolerated {archive_path}: zips={len(zip_paths)} parts={dict(part_counts)} error={exc}', flush=True)
+            return zip_paths
+        print(f'[source] split zip assembly failed {archive_path}: {exc}', flush=True)
+        return []
+
+    zip_paths = valid_outputs()
+    if zip_paths:
+        write_split_zip_manifest(archive_path, zip_paths, part_counts)
+        print(f'[source] assembled split zip cache {archive_path}: zips={len(zip_paths)} parts={dict(part_counts)}', flush=True)
+    return zip_paths
+
+
 def find_zips(root):
     root = Path(root)
     label_zips = []
     source_zips = []
-    for path in root.rglob('*.zip'):
+    for path in root.rglob('*'):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        is_archive = (
+            name.endswith('.zip')
+            or name.endswith('.tar')
+            or name.endswith('.tar.gz')
+            or name.endswith('.tgz')
+        )
+        if not is_archive:
+            continue
         text = str(path)
         if '라벨링데이터' in text:
             label_zips.append(path)
         elif '원천데이터' in text:
-            source_zips.append(path)
+            if is_tar_archive(path):
+                expanded = assemble_split_zips_from_tar(path)
+                source_zips.extend(expanded or [path])
+            else:
+                source_zips.append(path)
     return sorted(label_zips), sorted(source_zips)
+
+
+def is_tar_archive(path):
+    name = str(path).lower()
+    return name.endswith('.tar') or name.endswith('.tar.gz') or name.endswith('.tgz')
+
+
+def iter_image_members(archive_path):
+    if is_tar_archive(archive_path):
+        with tarfile.open(archive_path) as tf:
+            for member in tf.getmembers():
+                if member.isfile() and member.name.lower().endswith(IMAGE_EXTS):
+                    yield member.name
+    else:
+        with zipfile.ZipFile(archive_path) as zf:
+            for member in zf.namelist():
+                if member.lower().endswith(IMAGE_EXTS):
+                    yield member
 
 
 def average_box(entry):
@@ -120,12 +446,14 @@ def choose_label_info(entry):
         value = ((entry or {}).get(key) or {}).get('faceExp')
         if value:
             votes.append(value)
-    mapped = [KOR_TO_CLASS[v] for v in votes if v in KOR_TO_CLASS]
+    raw_mapped = [KOR_TO_CLASS[v] for v in votes if v in KOR_TO_CLASS]
+    mapped = [map_raw_label(v) for v in raw_mapped]
+    mapped = [v for v in mapped if v in CLASS_NAMES]
     if not mapped:
         return None
     counts = Counter(mapped)
     label, count = counts.most_common(1)[0]
-    uploader_class = KOR_TO_CLASS.get(uploader)
+    uploader_class = map_raw_label(KOR_TO_CLASS.get(uploader))
     if count >= 2:
         selected = label
     else:
@@ -135,6 +463,7 @@ def choose_label_info(entry):
         'agreement': int(count),
         'votes_total': int(len(mapped)),
         'vote_counts': dict(counts),
+        'raw_vote_counts': dict(Counter(raw_mapped)),
     }
 
 
@@ -180,39 +509,37 @@ def build_rows(source_zips, labels, seed, max_train_per_class, max_val_per_class
     for zpath in source_zips:
         split_hint = infer_split(zpath)
         try:
-            with zipfile.ZipFile(zpath) as zf:
-                for member in zf.namelist():
-                    if not member.lower().endswith(IMAGE_EXTS):
-                        continue
-                    meta = None
-                    for key in filename_match_keys(member)[:-1]:
-                        meta = labels.get(key)
-                        if meta:
-                            break
-                    if not meta:
-                        continue
-                    split = meta.get('split') or split_hint
-                    label = meta.get('label')
-                    if label not in CLASS_NAMES:
-                        continue
-                    agreement = int(meta.get('agreement') or 0)
-                    if isinstance(min_agreement, dict):
-                        required_agreement = int(min_agreement.get(split, min_agreement.get('default', 1)))
-                    else:
-                        required_agreement = int(min_agreement)
-                    if agreement < required_agreement:
-                        skipped_low_agreement[(split, label)] += 1
-                        continue
-                    rows_by_split_class[(split, label)].append({
-                        'zip_path': str(zpath),
-                        'member': member,
-                        'label': label,
-                        'split': split,
-                        'agreement': agreement,
-                        'votes_total': int(meta.get('votes_total') or 0),
-                        'bbox': meta.get('bbox'),
-                        'filename': os.path.basename(member),
-                    })
+            for member in iter_image_members(zpath):
+                meta = None
+                for key in filename_match_keys(member)[:-1]:
+                    meta = labels.get(key)
+                    if meta:
+                        break
+                if not meta:
+                    continue
+                split = meta.get('split') or split_hint
+                label = meta.get('label')
+                if label not in CLASS_NAMES:
+                    continue
+                agreement = int(meta.get('agreement') or 0)
+                if isinstance(min_agreement, dict):
+                    required_agreement = int(min_agreement.get(split, min_agreement.get('default', 1)))
+                else:
+                    required_agreement = int(min_agreement)
+                if agreement < required_agreement:
+                    skipped_low_agreement[(split, label)] += 1
+                    continue
+                rows_by_split_class[(split, label)].append({
+                    'zip_path': str(zpath),
+                    'archive_type': 'tar' if is_tar_archive(zpath) else 'zip',
+                    'member': member,
+                    'label': label,
+                    'split': split,
+                    'agreement': agreement,
+                    'votes_total': int(meta.get('votes_total') or 0),
+                    'bbox': meta.get('bbox'),
+                    'filename': os.path.basename(member),
+                })
         except Exception as exc:
             print(f'[source] skip {zpath}: {exc}', flush=True)
     if skipped_low_agreement:
@@ -267,19 +594,32 @@ def rebalance_missing_train_classes(train_rows, val_rows, seed):
 
 
 class ZipFaceDataset(Dataset):
-    def __init__(self, rows, class_to_idx, image_size, train):
+    def __init__(self, rows, class_to_idx, image_size, train, crop_pad_ratio=0.14, augment_strength='medium'):
         self.rows = rows
         self.class_to_idx = class_to_idx
         self._zip_cache = {}
+        self.crop_pad_ratio = max(0.0, float(crop_pad_ratio))
+        augment_strength = str(augment_strength or 'medium').strip().lower()
         if train:
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10),
-                transforms.RandomAffine(degrees=8, translate=(0.04, 0.04), scale=(0.92, 1.08)),
+            transform_steps = [transforms.Resize((image_size, image_size))]
+            if augment_strength != 'none':
+                if augment_strength == 'light':
+                    transform_steps.extend([
+                        transforms.RandomHorizontalFlip(p=0.35),
+                        transforms.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.06),
+                        transforms.RandomAffine(degrees=4, translate=(0.02, 0.02), scale=(0.96, 1.04)),
+                    ])
+                else:
+                    transform_steps.extend([
+                        transforms.RandomHorizontalFlip(p=0.5),
+                        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10),
+                        transforms.RandomAffine(degrees=8, translate=(0.04, 0.04), scale=(0.92, 1.08)),
+                    ])
+            transform_steps.extend([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
+            self.transform = transforms.Compose(transform_steps)
         else:
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
@@ -290,20 +630,24 @@ class ZipFaceDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
-    def _zip(self, path):
-        zf = self._zip_cache.get(path)
-        if zf is None:
-            zf = zipfile.ZipFile(path)
-            self._zip_cache[path] = zf
-        return zf
+    def _archive(self, path, archive_type):
+        key = (path, archive_type)
+        archive = self._zip_cache.get(key)
+        if archive is None:
+            if archive_type == 'tar' or is_tar_archive(path):
+                archive = tarfile.open(path)
+            else:
+                archive = zipfile.ZipFile(path)
+            self._zip_cache[key] = archive
+        return archive
 
     def _crop_face(self, img, bbox):
         if not bbox:
             return img
         w, h = img.size
         x1, y1, x2, y2 = bbox
-        pad_x = (x2 - x1) * 0.14
-        pad_y = (y2 - y1) * 0.14
+        pad_x = (x2 - x1) * self.crop_pad_ratio
+        pad_y = (y2 - y1) * self.crop_pad_ratio
         x1 = max(0, int(x1 - pad_x))
         y1 = max(0, int(y1 - pad_y))
         x2 = min(w, int(x2 + pad_x))
@@ -315,8 +659,17 @@ class ZipFaceDataset(Dataset):
     def __getitem__(self, idx):
         row = self.rows[idx]
         try:
-            with self._zip(row['zip_path']).open(row['member']) as fp:
-                img = Image.open(io.BytesIO(fp.read())).convert('RGB')
+            archive_type = row.get('archive_type') or ('tar' if is_tar_archive(row['zip_path']) else 'zip')
+            archive = self._archive(row['zip_path'], archive_type)
+            if archive_type == 'tar':
+                extracted = archive.extractfile(row['member'])
+                if extracted is None:
+                    raise FileNotFoundError(row['member'])
+                raw = extracted.read()
+            else:
+                with archive.open(row['member']) as fp:
+                    raw = fp.read()
+            img = Image.open(io.BytesIO(raw)).convert('RGB')
         except Exception:
             img = Image.new('RGB', (self.transform.transforms[0].size[0], self.transform.transforms[0].size[1]), (0, 0, 0))
         img = self._crop_face(img, row.get('bbox'))
@@ -369,7 +722,10 @@ def metrics_from_confusion(confusion):
             'support': int(sum(confusion[i])),
         }
         f1_values.append(f1)
-    distress_labels = {'anger', 'anxiety', 'hurt', 'sadness'}
+    if 'distress' in CLASS_NAMES:
+        distress_labels = {'distress'}
+    else:
+        distress_labels = {'anger', 'anxiety', 'hurt', 'sadness'}
     tp = tn = fp = fn = 0
     for truth_idx, row in enumerate(confusion):
         truth_positive = CLASS_NAMES[truth_idx] in distress_labels
@@ -406,17 +762,108 @@ def metrics_from_confusion(confusion):
     }
 
 
+def selection_score(metrics, mode='macro_f1', min_distress_precision=0.0, min_distress_recall=0.0):
+    mode = str(mode or 'macro_f1').strip()
+    distress = (metrics or {}).get('distress_binary') or {}
+    macro_f1 = float((metrics or {}).get('macro_f1') or 0.0)
+    distress_f1 = float(distress.get('f1') or 0.0)
+    precision = float(distress.get('precision') or 0.0)
+    recall = float(distress.get('recall') or 0.0)
+    if mode == 'distress_f1':
+        return distress_f1
+    if mode == 'operating_distress':
+        score = distress_f1
+        if precision < min_distress_precision:
+            score -= (min_distress_precision - precision) * 1.25
+        if recall < min_distress_recall:
+            score -= (min_distress_recall - recall) * 0.75
+        # A small stability bonus keeps all-class collapse from winning on one metric.
+        score += min(macro_f1, distress_f1) * 0.05
+        return max(0.0, round(score, 6))
+    return macro_f1
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=1.5, label_smoothing=0.0):
+        super().__init__()
+        self.register_buffer('weight', weight if weight is not None else None)
+        self.gamma = max(0.0, float(gamma))
+        self.label_smoothing = max(0.0, float(label_smoothing))
+
+    def forward(self, logits, target):
+        ce = F.cross_entropy(
+            logits,
+            target,
+            weight=self.weight,
+            label_smoothing=self.label_smoothing,
+            reduction='none',
+        )
+        with torch.no_grad():
+            probs = torch.softmax(logits, dim=1)
+            pt = probs.gather(1, target.view(-1, 1)).view(-1).clamp(1e-6, 1.0)
+        return (((1.0 - pt) ** self.gamma) * ce).mean()
+
+
+def distress_boundary_penalty(logits, target, margin=0.0, penalty_weight=0.0):
+    if penalty_weight <= 0 or margin <= 0 or len(CLASS_NAMES) != 2 or 'distress' not in CLASS_NAMES:
+        return logits.new_tensor(0.0)
+    distress_idx = CLASS_NAMES.index('distress')
+    probs = torch.softmax(logits, dim=1)[:, distress_idx]
+    positive = target == distress_idx
+    high_cut = min(0.95, 0.5 + float(margin))
+    low_cut = max(0.05, 0.5 - float(margin))
+    parts = []
+    if torch.any(positive):
+        parts.append(F.relu(high_cut - probs[positive]).pow(2).mean())
+    if torch.any(~positive):
+        parts.append(F.relu(probs[~positive] - low_cut).pow(2).mean())
+    if not parts:
+        return logits.new_tensor(0.0)
+    return torch.stack(parts).mean() * float(penalty_weight)
+
+
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
     confusion = [[0 for _ in CLASS_NAMES] for _ in CLASS_NAMES]
+    binary_scores = []
+    binary_truth = []
+    distress_idx = CLASS_NAMES.index('distress') if 'distress' in CLASS_NAMES else None
     for x, y in loader:
         x = x.to(device)
         logits = model(x)
-        pred = logits.argmax(dim=1).cpu()
+        probs = torch.softmax(logits, dim=1).cpu()
+        pred = probs.argmax(dim=1)
         for truth, guess in zip(y.view(-1).tolist(), pred.view(-1).tolist()):
             confusion[int(truth)][int(guess)] += 1
-    return metrics_from_confusion(confusion)
+        if distress_idx is not None and len(CLASS_NAMES) == 2:
+            for truth, score in zip(y.view(-1).tolist(), probs[:, distress_idx].view(-1).tolist()):
+                binary_truth.append(int(truth))
+                binary_scores.append(float(score))
+    metrics = metrics_from_confusion(confusion)
+    if distress_idx is None or len(CLASS_NAMES) != 2 or not binary_scores:
+        return metrics
+
+    argmax_metrics = dict(metrics)
+    best_threshold = 0.50
+    best_metrics = metrics
+    for step in range(30, 71):
+        threshold = step / 100.0
+        tuned_confusion = [[0 for _ in CLASS_NAMES] for _ in CLASS_NAMES]
+        for truth, score in zip(binary_truth, binary_scores):
+            pred_idx = distress_idx if score >= threshold else (1 - distress_idx)
+            tuned_confusion[int(truth)][int(pred_idx)] += 1
+        tuned = metrics_from_confusion(tuned_confusion)
+        tuned['decision_threshold'] = round(threshold, 2)
+        tuned['argmax_macro_f1'] = argmax_metrics.get('macro_f1')
+        tuned['argmax_accuracy'] = argmax_metrics.get('accuracy')
+        if tuned.get('macro_f1', 0.0) > best_metrics.get('macro_f1', 0.0) + 1e-9:
+            best_threshold = threshold
+            best_metrics = tuned
+    best_metrics['decision_threshold'] = round(best_threshold, 2)
+    best_metrics['threshold_tuned'] = True
+    best_metrics['argmax_metrics'] = argmax_metrics
+    return best_metrics
 
 
 def main():
@@ -435,17 +882,31 @@ def main():
     parser.add_argument('--train-min-agreement', type=int, default=None)
     parser.add_argument('--val-min-agreement', type=int, default=None)
     parser.add_argument('--model-type', choices=['mobilenet_v3_small', 'mobilenet_v3_large'], default='mobilenet_v3_small')
+    parser.add_argument('--label-policy', choices=sorted(LABEL_POLICY_CONFIGS), default='seven')
+    parser.add_argument('--crop-pad-ratio', type=float, default=0.14)
+    parser.add_argument('--augment-strength', choices=['none', 'light', 'medium'], default='medium')
     parser.add_argument('--label-smoothing', type=float, default=0.0)
+    parser.add_argument('--class-weight-multipliers', default='')
+    parser.add_argument('--max-epochs-without-improvement', type=int, default=0)
+    parser.add_argument('--selection-metric', choices=['macro_f1', 'distress_f1', 'operating_distress'], default='macro_f1')
+    parser.add_argument('--min-distress-precision', type=float, default=0.0)
+    parser.add_argument('--min-distress-recall', type=float, default=0.0)
+    parser.add_argument('--loss-type', choices=['ce', 'focal'], default='ce')
+    parser.add_argument('--focal-gamma', type=float, default=1.5)
+    parser.add_argument('--distress-boundary-margin', type=float, default=0.0)
+    parser.add_argument('--distress-boundary-penalty', type=float, default=0.0)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--no-pretrained', action='store_true')
     args = parser.parse_args()
 
+    configure_label_policy(args.label_policy)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     start = time.time()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    scan_started = time.time()
     label_zips, source_zips = find_zips(args.dataset_root)
     print(f'[scan] label_zips={len(label_zips)} source_zips={len(source_zips)}', flush=True)
     labels, label_stats = load_labels(label_zips)
@@ -459,6 +920,7 @@ def main():
     counts = Counter((r['label'], r.get('split', 'train')) for r in rows)
     split_counts = Counter(r.get('split', 'train') for r in rows)
     print(f'[rows] total={len(rows)} split_counts={dict(split_counts)} class_counts={dict(counts)}', flush=True)
+    print(f'[timing] dataset_scan_sec={time.time() - scan_started:.2f}', flush=True)
     if args.dry_run:
         return
     if not rows:
@@ -476,24 +938,62 @@ def main():
         train_rows = train_rows[n_val:]
     print(f'[split] train={len(train_rows)} val={len(val_rows)}', flush=True)
 
-    train_ds = ZipFaceDataset(train_rows, class_to_idx, args.image_size, train=True)
-    val_ds = ZipFaceDataset(val_rows, class_to_idx, args.image_size, train=False)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=False)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=False)
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    train_ds = ZipFaceDataset(
+        train_rows,
+        class_to_idx,
+        args.image_size,
+        train=True,
+        crop_pad_ratio=args.crop_pad_ratio,
+        augment_strength=args.augment_strength,
+    )
+    val_ds = ZipFaceDataset(
+        val_rows,
+        class_to_idx,
+        args.image_size,
+        train=False,
+        crop_pad_ratio=args.crop_pad_ratio,
+        augment_strength='none',
+    )
+    loader_kwargs = {
+        'num_workers': args.num_workers,
+        'pin_memory': device.type == 'cuda',
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update({
+            'persistent_workers': True,
+            'prefetch_factor': 2,
+        })
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    print(
+        f'[loader] device={device.type} batch_size={args.batch_size} '
+        f'num_workers={args.num_workers} pin_memory={loader_kwargs["pin_memory"]}',
+        flush=True,
+    )
+
     model = make_model(len(CLASS_NAMES), pretrained=not args.no_pretrained, model_type=args.model_type).to(device)
     class_counts = Counter(r['label'] for r in train_rows)
+    class_weight_multipliers = parse_class_weight_multipliers(args.class_weight_multipliers)
     weights = [1.0 / max(class_counts.get(label, 1), 1) for label in CLASS_NAMES]
+    weights = [weight * float(class_weight_multipliers.get(label, 1.0)) for weight, label in zip(weights, CLASS_NAMES)]
     weights = torch.tensor(weights, dtype=torch.float32, device=device)
     weights = weights / weights.mean()
-    try:
-        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=float(args.label_smoothing))
-    except TypeError:
-        criterion = nn.CrossEntropyLoss(weight=weights)
+    if args.loss_type == 'focal':
+        criterion = FocalLoss(
+            weight=weights,
+            gamma=float(args.focal_gamma),
+            label_smoothing=float(args.label_smoothing),
+        )
+    else:
+        try:
+            criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=float(args.label_smoothing))
+        except TypeError:
+            criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     best = None
+    epochs_without_improvement = 0
     history = []
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -505,6 +1005,14 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
             loss = criterion(logits, y)
+            boundary_loss = distress_boundary_penalty(
+                logits,
+                y,
+                margin=float(args.distress_boundary_margin),
+                penalty_weight=float(args.distress_boundary_penalty),
+            )
+            if float(boundary_loss.detach().cpu().item()) > 0:
+                loss = loss + boundary_loss
             loss.backward()
             optimizer.step()
             running_loss += float(loss.item()) * int(y.numel())
@@ -514,25 +1022,48 @@ def main():
         metrics = evaluate(model, val_loader, device)
         metrics['epoch'] = epoch
         metrics['train_loss'] = round(running_loss / max(seen, 1), 4)
+        metrics['selection_metric'] = args.selection_metric
+        metrics['selection_score'] = selection_score(
+            metrics,
+            mode=args.selection_metric,
+            min_distress_precision=args.min_distress_precision,
+            min_distress_recall=args.min_distress_recall,
+        )
         history.append(metrics)
         distress = metrics.get('distress_binary') or {}
         print(
             f"[eval] epoch={epoch} acc={metrics['accuracy']:.4f} "
-            f"macro_f1={metrics['macro_f1']:.4f} distress_f1={float(distress.get('f1', 0.0)):.4f}",
+            f"macro_f1={metrics['macro_f1']:.4f} distress_f1={float(distress.get('f1', 0.0)):.4f} "
+            f"distress_precision={float(distress.get('precision', 0.0)):.4f} "
+            f"distress_recall={float(distress.get('recall', 0.0)):.4f} "
+            f"selection={metrics['selection_score']:.4f}",
             flush=True,
         )
-        if best is None or metrics['macro_f1'] > best['macro_f1']:
+        if best is None or metrics['selection_score'] > best.get('selection_score', best.get('macro_f1', 0.0)):
             best = metrics
+            epochs_without_improvement = 0
             ckpt = {
                 'model_type': args.model_type,
+                'label_policy': LABEL_POLICY,
                 'class_names': CLASS_NAMES,
                 'class_to_korean': CLASS_TO_KOR,
                 'image_size': args.image_size,
+                'crop_pad_ratio': float(args.crop_pad_ratio),
+                'augment_strength': args.augment_strength,
                 'state_dict': model.state_dict(),
                 'metrics': metrics,
                 'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             }
             torch.save(ckpt, out_dir / 'aihub82_facial_emotion_mobilenetv3.pt')
+        else:
+            epochs_without_improvement += 1
+            if args.max_epochs_without_improvement > 0 and epochs_without_improvement >= args.max_epochs_without_improvement:
+                print(
+                    f'[early-stop] no macro_f1 improvement for {epochs_without_improvement} epoch(s); '
+                    f'best={best["macro_f1"]:.4f}',
+                    flush=True,
+                )
+                break
 
     summary = {
         'ready': True,
@@ -542,8 +1073,20 @@ def main():
         'label_zips': len(label_zips),
         'source_zips': len(source_zips),
         'model_type': args.model_type,
+        'label_policy': LABEL_POLICY,
+        'raw_classes': RAW_CLASS_NAMES,
         'min_agreement': min_agreement,
+        'crop_pad_ratio': float(args.crop_pad_ratio),
+        'augment_strength': args.augment_strength,
         'label_smoothing': float(args.label_smoothing),
+        'class_weight_multipliers': class_weight_multipliers,
+        'loss_type': args.loss_type,
+        'focal_gamma': float(args.focal_gamma),
+        'distress_boundary_margin': float(args.distress_boundary_margin),
+        'distress_boundary_penalty': float(args.distress_boundary_penalty),
+        'selection_metric': args.selection_metric,
+        'min_distress_precision': float(args.min_distress_precision),
+        'min_distress_recall': float(args.min_distress_recall),
         'train_rows': len(train_rows),
         'val_rows': len(val_rows),
         'best_metrics': best,

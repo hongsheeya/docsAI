@@ -73,6 +73,46 @@ def load_video_analysis():
     return module.VideoAnalysis(None)
 
 
+def _selected_total_samples(job_type: str, intake: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    full_total = int(
+        (intake.get("fall_sample_count", 0) or 0)
+        + (intake.get("posture_sample_count", 0) or 0)
+        + (intake.get("Y", 0) or 0)
+        + (intake.get("N", 0) or 0)
+        + (intake.get("posture_intake_total", 0) or 0)
+    )
+    sample_plan: dict[str, Any] = {
+        "full_total": full_total,
+        "selected_total": full_total,
+        "max_per_class": 0,
+        "strategy": str(os.environ.get("FALLAI_RF_TRAIN_SAMPLE_STRATEGY", "spread") or "spread"),
+        "by_class": {},
+    }
+    if job_type != "rf":
+        return full_total, sample_plan
+    try:
+        max_per_class = int(float(os.environ.get("FALLAI_RF_TRAIN_MAX_PER_CLASS", "0") or 0))
+    except Exception:
+        max_per_class = 0
+    max_per_class = max(0, max_per_class)
+    sample_plan["max_per_class"] = max_per_class
+    if max_per_class <= 0:
+        return full_total, sample_plan
+    y_count = int(intake.get("Y", 0) or 0)
+    n_count = int(intake.get("N", 0) or 0)
+    selected_y = min(y_count, max_per_class)
+    selected_n = min(n_count, max_per_class)
+    selected_total = selected_y + selected_n
+    sample_plan.update({
+        "selected_total": selected_total,
+        "by_class": {
+            "Y": {"available": y_count, "selected": selected_y},
+            "N": {"available": n_count, "selected": selected_n},
+        },
+    })
+    return selected_total, sample_plan
+
+
 def _run_step(name: str, fn: Callable[[], dict[str, Any] | None]) -> dict[str, Any]:
     started = time.time()
     try:
@@ -180,19 +220,15 @@ def main() -> int:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--job-file", required=True)
     parser.add_argument("--job-type", default="full", choices=["full", "rf", "posture"])
+    parser.add_argument("--target-model", default="rf-dual")
     args = parser.parse_args()
+    os.environ["FALLAI_DASHBOARD_JOB_ID"] = args.job_id
 
     job_file = Path(args.job_file)
     started = time.time()
     analyzer = load_video_analysis()
     intake = analyzer._intake_summary()
-    total_samples = int(
-        (intake.get("fall_sample_count", 0) or 0)
-        + (intake.get("posture_sample_count", 0) or 0)
-        + (intake.get("Y", 0) or 0)
-        + (intake.get("N", 0) or 0)
-        + (intake.get("posture_intake_total", 0) or 0)
-    )
+    total_samples, sample_plan = _selected_total_samples(args.job_type, intake)
 
     write_status(
         job_file,
@@ -205,7 +241,10 @@ def main() -> int:
         eta_sec=None,
         started_at=_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         started_monotonic=started,
+        target_model=args.target_model,
         intake_summary=intake,
+        sample_plan=sample_plan,
+        max_per_class=sample_plan.get("max_per_class", 0),
         message="학습 환경 준비 중",
         steps=[],
     )
@@ -275,7 +314,33 @@ def main() -> int:
 
     model_comparison = analyzer._build_model_comparison_report(baseline_summary, rf_pipeline_summary, rf_pose_summary)
     elapsed_total = round(time.time() - started, 2)
-    status = "failed" if errors and not any(step.get("ok") for step in finished_steps) else "completed_pending_apply"
+    step_results = {
+        str(step.get("name")): (step.get("result") or {})
+        for step in finished_steps
+        if isinstance(step, dict)
+    }
+    def step_was_skipped(step: dict[str, Any]) -> bool:
+        result = step.get("result") or {}
+        summary = result.get("summary") or {}
+        return bool(summary.get("skipped"))
+
+    actual_training_steps = [
+        step for step in finished_steps
+        if step.get("ok") and not step_was_skipped(step)
+    ]
+    all_steps_skipped = bool(finished_steps) and not actual_training_steps
+    status = "failed" if errors and not any(step.get("ok") for step in finished_steps) else ("blocked" if all_steps_skipped else "completed_pending_apply")
+    skip_reasons = [
+        ((step.get("result") or {}).get("summary") or {}).get("reason")
+        for step in finished_steps
+        if step_was_skipped(step)
+    ]
+    xg_posture_result = (
+        step_results.get("xg_posture_sequence")
+        or step_results.get("xg_posture")
+        or {}
+    )
+    xg_posture_summary = xg_posture_result.get("summary", {}) if isinstance(xg_posture_result, dict) else {}
     write_status(
         job_file,
         status=status,
@@ -294,11 +359,23 @@ def main() -> int:
             "evaluation": (baseline_summary or {}).get("evaluation", {}),
             "action_behavior_training": behavior_summary,
             "rf_pipeline_training": rf_pipeline_summary,
-            "xg_posture_training": (finished_steps[-1].get("result") or {}).get("summary", {}) if finished_steps else {},
+            "xg_posture_training": xg_posture_summary,
             "model_comparison": model_comparison,
+            "intake_training_usage": {
+                "intake_summary": intake,
+                "sample_plan": sample_plan,
+                "enough_binary_intake_for_rf": enough_binary_intake,
+                "step_names": [step.get("name") for step in finished_steps],
+                "xg_posture_hitl_counts": (((xg_posture_summary.get("external_pose_dataset") or {}).get("hitl_posture_intake_counts")) or {}),
+                "xg_posture_hitl_used_files": (((xg_posture_summary.get("external_pose_dataset") or {}).get("hitl_posture_intake_used_files")) or []),
+            },
         },
-        message="학습 완료. 적용 버튼을 눌러 캐시를 갱신하고 운영 화면에 반영하세요." if status != "failed" else "학습 실패",
-        manual_apply_required=status != "failed",
+        message=(
+            "학습 시작 조건을 만족하지 못해 후보를 만들지 않았습니다: " + " / ".join([reason for reason in skip_reasons if reason])
+            if status == "blocked"
+            else ("학습 완료. 적용 버튼을 눌러 캐시를 갱신하고 운영 화면에 반영하세요." if status != "failed" else "학습 실패")
+        ),
+        manual_apply_required=status == "completed_pending_apply",
     )
     return 0 if status != "failed" else 1
 

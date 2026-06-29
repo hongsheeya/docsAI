@@ -3,44 +3,52 @@ input(type="file", accept="video/*,.zip,.tar,.tar.gz,.tgz", multiple="",
     #fileInput="",
     (change)="onFileSelected($event)",
     style="display:none")
+input(type="file", accept="video/*,.zip,.tar,.tar.gz,.tgz", multiple="", webkitdirectory="", directory="",
+    #folderInput="",
+    (change)="onFolderSelected($event)",
+    style="display:none")
 
 //- ── 네비게이션 헤더 ──
-nav(class="shrink-0 bg-white border-b border-zinc-200 z-30")
-    div(class="max-w-[1800px] mx-auto px-4 sm:px-6 h-[52px] flex items-center justify-between")
+nav(class="shrink-0 border-b border-zinc-200 bg-white z-30")
+    div(class="max-w-[1800px] mx-auto px-4 sm:px-6 h-[56px] flex items-center justify-between gap-4")
         div(class="flex items-center gap-3")
             span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
                 img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
             div
                 span(class="text-lg font-semibold text-zinc-950") FallAI
                 span(class="ml-2 text-xs text-zinc-400") RF-Dual · XG-Posture
-        div(class="flex items-center gap-2")
+        div(class="flex min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap")
             a(routerLink="/",
-                class="inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-[13px] font-semibold text-sky-700") 메인
+                class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 text-[13px] font-semibold text-sky-700") 메인
             a(routerLink="/pipeline",
-                class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 파이프라인
+                class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 파이프라인
+            a(routerLink="/models",
+                class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 모델 관리
             a(routerLink="/manual",
-                class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
+                class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
+            a(routerLink="/presentation",
+                class="inline-flex h-9 min-w-[96px] items-center justify-center rounded-xl border border-orange-200 bg-orange-50 px-4 text-[13px] font-semibold text-orange-700 hover:bg-orange-100") 포트폴리오
             a(*ngIf="service.auth?.check?.role('admin') === true",
                 routerLink="/admin/analysis",
-                class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 관리자
+                class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 관리자
             div(class="inline-flex items-center rounded-xl border border-zinc-300 bg-zinc-50 p-0.5")
                 button(type="button",
                     (click)="setPrivacyViewMode('skeleton')",
-                    class="px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors",
+                    class="h-8 rounded-lg px-3 text-[12px] font-semibold transition-colors",
                     [ngClass]="isSkeletonPrivacyMode() ? 'bg-zinc-900 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-800'") 스켈레톤
                 button(type="button",
                     (click)="setPrivacyViewMode('raw')",
-                    class="px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors",
+                    class="h-8 rounded-lg px-3 text-[12px] font-semibold transition-colors",
                     [ngClass]="canShowRawVideo() ? 'bg-zinc-900 text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-800'") 원본
             button(*ngIf="inputMode === 'upload'",
                 (click)="switchInputMode('webcam')",
-                class="text-xs px-3 py-1 rounded-lg border border-zinc-200 hover:bg-zinc-50 text-zinc-600") 실시간 모드
+                class="inline-flex h-9 min-w-[96px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 실시간 모드
             button(*ngIf="inputMode === 'webcam'",
                 (click)="switchInputMode('upload')",
-                class="text-xs px-3 py-1 rounded-lg border border-zinc-200 hover:bg-zinc-50 text-zinc-600") 업로드 모드
+                class="inline-flex h-9 min-w-[96px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 업로드 모드
             button(type="button",
                 (click)="switchInputMode('upload'); setUploadWorkflowMode('train')",
-                class="text-xs px-3 py-1 rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold") 학습 모드
+                class="inline-flex h-9 min-w-[96px] items-center justify-center rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-[13px] font-semibold text-emerald-700 hover:bg-emerald-100") 학습 모드
 
 //- ── 히어로 섹션 (업로드 모드만) ──
 section(*ngIf="inputMode !== 'webcam'",
@@ -48,7 +56,7 @@ section(*ngIf="inputMode !== 'webcam'",
     div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
         h1(class="text-lg font-semibold text-zinc-950 mb-1") AI 낙상 감지 분석 / 학습
         p(class="text-[13px] text-zinc-500 mb-4") 분석용 단일 영상과 학습용 대량 영상/압축 파일을 같은 화면에서 처리합니다
-        div(class="grid md:grid-cols-3 gap-4")
+        div(class="grid md:grid-cols-4 gap-4")
             div(class="bg-white rounded-xl border border-zinc-200 p-4")
                 div(class="text-xs text-zinc-400 mb-1") 지원 포맷
                 div(class="text-[13px] text-zinc-700") MP4, MOV, AVI, MKV, WebM, ZIP/TAR
@@ -62,7 +70,8 @@ section(*ngIf="inputMode !== 'webcam'",
                     class="mt-1 break-all text-[10px] text-zinc-400") {{ currentModelWeightsPath() }}
             div(class="bg-white rounded-xl border border-zinc-200 p-4")
                 div(class="text-xs text-zinc-400 mb-1") 학습 데이터
-                div(class="text-[13px] text-zinc-700") {{ prototypeInfo?.dataset_summary?.fall_sample_count || 0 }}건
+                div(class="text-[13px] text-zinc-700") {{ prototypeInfo?.dataset_summary?.total_training_samples || prototypeInfo?.dataset_summary?.fall_sample_count || 0 }}건
+                div(class="mt-1 text-[10px] text-zinc-400", *ngIf="prototypeInfo?.dataset_summary?.fall_sample_note") {{ prototypeInfo?.dataset_summary?.fall_sample_note }}
         div(class="mt-4 rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3", *ngIf="prototypeInfo?.chunk_policy?.upload")
             p(class="text-[13px] font-semibold text-indigo-900") 업로드 분할 정책
             p(class="mt-1 text-xs text-indigo-700") {{ prototypeInfo?.chunk_policy?.upload?.headline }}
@@ -83,8 +92,7 @@ section(*ngIf="inputMode === 'webcam'",
                     class="w-full h-full object-contain transition-opacity duration-200",
                     style="z-index:0",
                     [attr.aria-hidden]="isSkeletonPrivacyMode() ? 'true' : null",
-                    [style.opacity]="isSkeletonPrivacyMode() ? 0 : 1",
-                    [style.visibility]="isSkeletonPrivacyMode() ? 'hidden' : 'visible'")
+                    [style.opacity]="isSkeletonPrivacyMode() ? 0 : 1")
                 div(*ngIf="isSkeletonPrivacyMode()",
                     class="absolute inset-0 bg-black pointer-events-none",
                     style="z-index:1")
@@ -98,9 +106,35 @@ section(*ngIf="inputMode === 'webcam'",
                 div(*ngIf="isSkeletonPrivacyMode()",
                     class="absolute bottom-3 left-3 z-10 rounded-full border border-white/10 bg-black/60 px-3 py-1 text-[10px] font-semibold text-zinc-200 backdrop-blur")
                     span {{ privacyViewLabel() }}
+                div(*ngIf="hasMultiPersonCards()",
+                    class="absolute left-3 top-3 z-20 overflow-y-auto pointer-events-auto",
+                    style="width:300px; max-height:220px")
+                    div(class="rounded-2xl border border-white/10 bg-black/70 p-3 backdrop-blur-md")
+                        div(class="mb-2 flex items-center justify-between gap-2")
+                            div(class="text-[11px] font-semibold text-zinc-100") 사람별 행동 분석
+                            div(class="text-[10px] text-zinc-400") {{ multiPersonPeople().length }}명
+                        div(class="space-y-2")
+                            button(*ngFor="let item of multiPersonCardItems()",
+                                type="button",
+                                (click)="selectPersonAnalysis(item.id)",
+                                class="w-full rounded-xl border px-3 py-2 text-left shadow-sm transition hover:border-sky-300",
+                                [ngClass]="personCardClass(item)")
+                                div(class="flex items-center justify-between gap-2")
+                                    div(class="flex min-w-0 items-center gap-2")
+                                        span(class="h-2 w-2 shrink-0 rounded-full",
+                                            [ngClass]="personCardDotClass(item)")
+                                        span(class="truncate text-[12px] font-semibold") {{ item.person_label }}
+                                        span(*ngIf="item.is_primary",
+                                            class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700") 대표
+                                    span(class="shrink-0 text-[11px] font-semibold") {{ personCardRiskText(item) }}
+                                div(class="mt-1 truncate text-[11px] text-zinc-600") {{ item.behavior_label }}
+                                div(class="mt-0.5 text-[10px] text-zinc-500") {{ personCardMetaText(item) }}
+
                 //- 실시간 오버레이 패널
-                div(*ngIf="realtimeActive || analysisResult",
-                    class="absolute top-3 left-3 z-10",
+                div(*ngIf="(realtimeActive || analysisResult) && selectedPersonDetailsVisible()",
+                    class="absolute left-3 z-10 overflow-y-auto",
+                    [style.top]="realtimeDetailOverlayTop()",
+                    [style.bottom]="hasMultiPersonCards() ? '12px' : null",
                     style="min-width:260px; max-width:380px")
                     div(class="rounded-2xl backdrop-blur-md p-3",
                         [ngClass]="{'bg-black/70': realtimeOverlayLevel !== 'high', 'bg-rose-900/80': realtimeOverlayLevel === 'high', 'ring-2 ring-rose-400': realtimeOverlayFlash}")
@@ -181,8 +215,10 @@ section(*ngIf="inputMode === 'webcam'",
                     //- 시작/중지
                     button(*ngIf="!realtimeActive",
                         (click)="startRealtimeAnalysis()",
-                        [disabled]="!webcamReady",
-                        class="px-4 py-2 rounded-lg bg-emerald-600 text-white text-[13px] font-medium hover:bg-emerald-700 disabled:opacity-50") ▶ 분석 시작
+                        [disabled]="!webcamReady || realtimeStarting",
+                        class="px-4 py-2 rounded-lg bg-emerald-600 text-white text-[13px] font-medium hover:bg-emerald-700 disabled:opacity-50")
+                        span(*ngIf="!realtimeStarting") ▶ 분석 시작
+                        span(*ngIf="realtimeStarting") 준비 중...
                     button(*ngIf="realtimeActive",
                         (click)="stopRealtimeAnalysis()",
                         class="px-4 py-2 rounded-lg bg-rose-600 text-white text-[13px] font-medium hover:bg-rose-700") ■ 중지
@@ -198,16 +234,18 @@ section(*ngIf="inputMode === 'webcam'",
                         class="text-[10px] text-zinc-500") 예열 {{ realtimePerfStats.warmupMs | number:'1.0-0' }}ms
                     //- 청크 정책 + 큐 상태
                     span(*ngIf="realtimeActive",
-                        class="text-[10px] px-1.5 py-0.5 rounded bg-sky-800 text-sky-200") {{ prototypeInfo?.chunk_policy?.realtime?.version === 'dense-bootstrap-v2' ? '4초 · 3fps · 무삭제 큐' : '4초 레거시' }}
+                        class="text-[10px] px-1.5 py-0.5 rounded bg-sky-800 text-sky-200") {{ (prototypeInfo?.chunk_policy?.realtime?.steady_sec || 4) + '초 창 · ' + (prototypeInfo?.chunk_policy?.realtime?.stride_sec || 2) + '초 stride · 무삭제 큐' }}
+                    span(*ngIf="realtimeActive && realtimePerfStats.discarded > 0",
+                        class="text-[10px] text-zinc-500") 중복 {{ realtimePerfStats.discarded }}
                     span(*ngIf="realtimeActive && dispatchQueueSize > 0",
                         class="text-[10px] text-amber-400") 큐 {{ dispatchQueueSize }}
                     span(*ngIf="realtimeActive && realtimePerfStats.retrying > 0",
                         class="text-[10px] text-amber-300") 재시도 {{ realtimePerfStats.retrying }}
                     //- 모델 선택
                     select([(ngModel)]="selectedModelType",
-                        disabled="",
-                        class="text-[10px] bg-zinc-700 text-zinc-300 rounded px-2 py-1 border-none opacity-80")
-                        option(value="rf-dual") RF-Dual
+                        (ngModelChange)="onAnalysisModelChanged()",
+                        class="max-w-[260px] text-[10px] bg-zinc-700 text-zinc-100 rounded px-2 py-1 border border-zinc-600")
+                        option(*ngFor="let item of analysisModelOptionsForView()", [value]="item.key") {{ item.label }}
 
         //- 우측: 로그 사이드 패널
         div(class="flex flex-col min-h-0 overflow-hidden bg-zinc-800 border-l border-zinc-700")
@@ -262,33 +300,39 @@ section(*ngIf="inputMode === 'webcam'",
 section(*ngIf="inputMode === 'upload'",
     class="py-6")
     div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
-        div(class="grid md:grid-cols-2 gap-6")
+        div(class="grid gap-5 xl:grid-cols-2 items-start")
             //- 비디오 프리뷰 / 드래그앤드롭
-            div(class="relative")
+            div(class="relative space-y-4")
                 div(*ngIf="!selectedVideoUrl",
                     (drop)="onDrop($event)",
                     (dragover)="onDragOver($event)",
                     (dragleave)="onDragLeave($event)",
                     (click)="fileInput.click()",
-                    class="border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-colors",
+                    class="min-h-[360px] border-2 border-dashed rounded-2xl bg-white p-8 text-center cursor-pointer transition-colors flex flex-col items-center justify-center",
                     [class.border-blue-400]="dragover",
                     [class.border-zinc-300]="!dragover",
                     [class.bg-blue-50]="dragover")
                     div(class="text-4xl mb-3") 🎬
                     div(class="text-[13px] text-zinc-600") 영상/압축 파일을 드래그하거나 클릭하여 선택
                     div(class="text-xs text-zinc-400 mt-1") 여러 영상 또는 ZIP/TAR 일괄 등록 지원
+                    div(class="mt-4 flex items-center justify-center gap-2")
+                        button(type="button",
+                            (click)="fileInput.click(); $event.stopPropagation()",
+                            class="rounded-lg border border-blue-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-blue-700 hover:bg-blue-50") 파일 선택
+                        button(type="button",
+                            (click)="folderInput.click(); $event.stopPropagation()",
+                            class="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-zinc-700 hover:bg-zinc-50") 폴더 선택
                 div(*ngIf="selectedVideoUrl",
                     class="relative rounded-2xl overflow-hidden bg-black")
                     video(#uploadPreviewVideo="",
                         [src]="selectedVideoUrl",
                         [attr.controls]="canShowRawVideo() ? '' : null",
                         (timeupdate)="onUploadVideoTimeUpdate()",
-                        class="w-full max-h-[500px] object-contain transition-opacity duration-200",
+                        class="w-full max-h-[460px] object-contain transition-opacity duration-200",
                         style="z-index:0",
                         [attr.aria-hidden]="isSkeletonPrivacyMode() ? 'true' : null",
                         [style.pointer-events]="isSkeletonPrivacyMode() ? 'none' : 'auto'",
-                        [style.opacity]="isSkeletonPrivacyMode() ? 0 : 1",
-                        [style.visibility]="isSkeletonPrivacyMode() ? 'hidden' : 'visible'")
+                        [style.opacity]="isSkeletonPrivacyMode() ? 0 : 1")
                     div(*ngIf="isSkeletonPrivacyMode()",
                         class="absolute inset-0 bg-black pointer-events-none",
                         style="z-index:1")
@@ -305,8 +349,66 @@ section(*ngIf="inputMode === 'upload'",
                         style="background:rgba(0,0,0,0.5)") ✕
                 div(*ngIf="selectedUploadCount() > 0",
                     class="mt-3 rounded-xl border border-sky-100 bg-sky-50 px-4 py-3")
-                    div(class="text-[12px] font-semibold text-sky-900") {{ selectedUploadSummary() }}
-                    div(class="mt-1 text-[11px] text-sky-700") {{ selectedUploadTrainingHint() }}
+                    div(class="flex items-start justify-between gap-3")
+                        div
+                            div(class="text-[12px] font-semibold text-sky-900") {{ selectedUploadSummary() }}
+                            div(class="mt-1 text-[11px] text-sky-700") {{ selectedUploadTrainingHint() }}
+                        button(type="button",
+                            (click)="clearSelectedFile()",
+                            class="rounded-lg border border-sky-200 bg-white px-2 py-1 text-[10px] font-semibold text-sky-700 hover:bg-sky-50") 전체 취소
+                    div(*ngIf="selectedUploadFolderGroups().length > 0",
+                        class="mt-2 flex flex-wrap gap-1.5")
+                        button(type="button",
+                            *ngFor="let folder of selectedUploadFolderGroups()",
+                            (click)="removeSelectedUploadFolder(folder.key, $event)",
+                            class="rounded-full border border-sky-200 bg-white px-2 py-1 text-[10px] font-semibold text-sky-700 hover:bg-sky-50") {{ folder.label }} 폴더 취소 · {{ folder.count }}
+                    div(class="mt-2 max-h-72 overflow-y-auto rounded-lg border border-sky-100 bg-white")
+                        div(*ngFor="let item of selectedUploadItems()",
+                            class="flex items-center justify-between gap-2 border-b border-sky-50 px-2 py-1.5 last:border-b-0")
+                            div(class="min-w-0")
+                                div(class="truncate text-[11px] font-medium text-zinc-700") {{ item.name }}
+                                div(class="text-[10px] text-zinc-400") {{ item.type }} · {{ item.size_mb }}MB
+                            button(type="button",
+                                (click)="removeSelectedUploadFile(item.index, $event)",
+                                class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold text-rose-500 hover:bg-rose-50") 취소
+                        div(*ngIf="selectedUploadHiddenCount() > 0",
+                            class="px-2 py-1.5 text-[10px] text-zinc-400") 외 {{ selectedUploadHiddenCount() }}개 더 선택됨
+                div(*ngIf="uploadWorkflowMode === 'train'",
+                    class="rounded-2xl border border-emerald-100 bg-white p-4 shadow-sm")
+                    div(class="flex items-center justify-between gap-3")
+                        div
+                            div(class="text-[13px] font-semibold text-zinc-800") 학습 등록 요약
+                            div(class="mt-1 text-[11px] text-zinc-500") 선택 파일과 라벨을 확인한 뒤 오른쪽에서 등록/학습을 시작합니다.
+                        span(class="rounded-full bg-emerald-50 px-2.5 py-1 text-[10px] font-bold text-emerald-700") {{ trainingTargetLabel() }}
+                    div(class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3")
+                        div(class="rounded-xl border border-zinc-100 bg-zinc-50 px-3 py-2")
+                            div(class="text-[10px] font-semibold text-zinc-400") 선택 파일
+                            div(class="mt-1 text-[16px] font-bold text-zinc-900") {{ selectedUploadCount() }}
+                        div(class="rounded-xl border border-zinc-100 bg-zinc-50 px-3 py-2")
+                            div(class="text-[10px] font-semibold text-zinc-400") 낙상 라벨
+                            div(class="mt-1 text-[16px] font-bold text-zinc-900") {{ trainingUploadLabel || '-' }}
+                        div(class="rounded-xl border border-zinc-100 bg-zinc-50 px-3 py-2")
+                            div(class="text-[10px] font-semibold text-zinc-400") 행동 라벨
+                            div(class="mt-1 text-[16px] font-bold text-zinc-900") {{ trainingUploadPostureClass || '미지정' }}
+                    div(class="mt-3 rounded-xl border border-amber-100 bg-amber-50 px-3 py-2 text-[11px] text-amber-800") 가림/수직 가림/오분류 메모를 남기면 이후 가림 보조모델 학습 필터링에 활용하기 쉽습니다.
+                    div(*ngIf="modelTrainingStatCards().length > 0",
+                        class="mt-3 rounded-2xl border border-zinc-200 bg-zinc-50 p-3")
+                        div(class="mb-2 flex items-center justify-between gap-2")
+                            div(class="text-[11px] font-semibold text-zinc-700") 현재 연결 모델 수치
+                            div(class="text-[10px] text-zinc-400") {{ modelTrainingStatCards().length }}개 모델
+                        div(class="grid grid-cols-1 gap-2 lg:grid-cols-2")
+                            div(*ngFor="let item of modelTrainingStatCards()",
+                                class="rounded-lg border border-zinc-200 bg-white px-2 py-2")
+                                div(class="flex items-center justify-between gap-2")
+                                    div(class="flex min-w-0 items-center gap-1")
+                                        div(class="truncate text-[10px] font-semibold text-zinc-700") {{ item.base_label || item.label }}
+                                        span(*ngIf="modelVersionBadge(item)",
+                                            class="shrink-0 rounded-full bg-indigo-50 px-1.5 py-0.5 text-[9px] font-bold text-indigo-700") {{ modelVersionBadge(item) }}
+                                    div(class="shrink-0 text-[10px] text-zinc-400") {{ item.sample_count || 0 }}건
+                                div(class="mt-1 text-[10px] text-zinc-500") {{ modelMetricText(item) }}
+                                div(class="mt-1 truncate text-[10px] text-zinc-400") {{ modelVersionText(item) }}
+                                div(*ngIf="modelContinuousTrainingText(item)",
+                                    class="mt-1 truncate rounded-md bg-emerald-50 px-1.5 py-1 text-[10px] text-emerald-700") {{ modelContinuousTrainingText(item) }}
             //- 업로드 컨트롤
             div(class="space-y-4")
                 div(class="bg-white rounded-xl border border-zinc-200 p-2")
@@ -319,18 +421,33 @@ section(*ngIf="inputMode === 'upload'",
                             (click)="setUploadWorkflowMode('train')",
                             class="rounded-lg px-3 py-2 text-[12px] font-semibold transition-colors",
                             [ngClass]="uploadWorkflowMode === 'train' ? 'bg-emerald-600 text-white shadow-sm' : 'bg-zinc-50 text-zinc-600 hover:bg-zinc-100'") 학습 모드
+                div(class="grid grid-cols-1 gap-2 sm:grid-cols-2")
+                    div(class="rounded-xl border border-zinc-200 bg-white px-3 py-2")
+                        div(class="text-[10px] font-semibold text-zinc-400") 선택 상태
+                        div(class="mt-0.5 truncate text-[12px] font-semibold text-zinc-800") {{ selectedUploadSummary() }}
+                    div(class="rounded-xl border px-3 py-2",
+                        [ngClass]="uploadWorkflowMode === 'train' ? 'border-emerald-200 bg-emerald-50' : 'border-blue-200 bg-blue-50'")
+                        div(class="text-[10px] font-semibold",
+                            [ngClass]="uploadWorkflowMode === 'train' ? 'text-emerald-500' : 'text-blue-500'") 현재 작업
+                        div(class="mt-0.5 truncate text-[12px] font-semibold",
+                            [ngClass]="uploadWorkflowMode === 'train' ? 'text-emerald-800' : 'text-blue-800'") {{ uploadSelectionModeText() }}
                 div(class="bg-white rounded-xl border border-zinc-200 p-4 space-y-3")
-                    div(class="text-[13px] font-medium text-zinc-700") 분석 설정
+                    div(class="flex items-center justify-between gap-2")
+                        div(class="text-[13px] font-medium text-zinc-700") {{ uploadSettingsTitle() }}
+                        span(class="rounded-full bg-zinc-100 px-2 py-1 text-[10px] font-semibold text-zinc-500") {{ uploadWorkflowMode === 'train' ? 'intake' : 'analysis' }}
                     div(class="flex items-center gap-2")
                         label(class="text-xs text-zinc-500 w-16") 모델
                         select([(ngModel)]="selectedModelType",
-                            disabled="",
-                            class="flex-1 text-[13px] border border-zinc-200 rounded-lg px-3 py-2 bg-zinc-50 text-zinc-600")
-                            option(value="rf-dual") RF-Dual (Fall+Posture)
+                            (ngModelChange)="onAnalysisModelChanged()",
+                            class="flex-1 text-[13px] border border-zinc-200 rounded-lg px-3 py-2 bg-white text-zinc-800")
+                            option(*ngFor="let item of analysisModelOptionsForView()", [value]="item.key") {{ item.label }}
                     div(class="text-[10px] text-zinc-400") 예상 소요: {{ modelSpeedHint() }}
                     div(class="rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2", *ngIf="prototypeInfo?.chunk_policy?.upload")
                         p(class="text-[11px] font-semibold text-indigo-900") 분할 로그 정책
                         p(class="mt-1 text-[10px] text-indigo-700") {{ prototypeInfo?.chunk_policy?.upload?.headline }}
+                    div(class="rounded-xl border border-sky-100 bg-sky-50 px-3 py-2", *ngIf="uploadWorkflowMode === 'analyze'")
+                        p(class="text-[11px] font-semibold text-sky-900") 분석 속도
+                        p(class="mt-1 text-[10px] text-sky-700") {{ llmModeHint() }}
                 button(*ngIf="uploadWorkflowMode === 'analyze'",
                     (click)="analyze()",
                     [disabled]="!selectedFile || analyzing",
@@ -347,24 +464,74 @@ section(*ngIf="inputMode === 'upload'",
                         div
                             div(class="text-[13px] font-semibold text-zinc-800") 추가 학습 데이터 등록
                             div(class="mt-0.5 text-[10px] text-zinc-500") 선택한 영상/압축 파일 전체를 intake 라벨 폴더에 저장합니다.
-                        span(class="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700") training
-                    div(class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3")
+                        span(class="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700") {{ trainingTargetLabel() }}
+                    div(*ngIf="continuousTrainingCards().length > 0 || completedTrainingLogCards().length > 0",
+                        class="rounded-xl border border-emerald-100 bg-emerald-50/70 px-3 py-3")
                         div(class="flex items-center justify-between gap-2")
                             div
-                                div(class="text-[12px] font-semibold text-emerald-900") 82번 표정 모델 연속 학습
-                                div(class="mt-1 text-[10px] text-emerald-700") {{ continuousTrainingStageText() }}
+                                div(class="text-[12px] font-semibold text-emerald-900") 백그라운드 학습 현황
+                                div(class="mt-1 text-[10px] text-emerald-700") {{ trainingStatusMainCountText() }}
                             button(type="button",
                                 (click)="loadContinuousTrainingStatus()",
                                 class="rounded-lg border border-emerald-200 bg-white px-2 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50") 새로고침
-                        div(class="mt-2 grid grid-cols-1 gap-2 text-[10px] text-emerald-800 sm:grid-cols-2")
-                            div(class="rounded-lg border border-emerald-100 bg-white px-2 py-1.5")
-                                div(class="text-emerald-500") 성능
-                                div(class="mt-0.5 font-semibold") {{ continuousTrainingMetricText() }}
-                            div(class="rounded-lg border border-emerald-100 bg-white px-2 py-1.5")
-                                div(class="text-emerald-500") 최근 갱신
-                                div(class="mt-0.5 font-semibold") {{ continuousTrainingUpdatedText() }}
-                        div(*ngIf="continuousTrainingStatus?.latest_log",
-                            class="mt-2 truncate text-[10px] text-emerald-700") {{ continuousTrainingStatus.latest_log }}
+                        div(*ngIf="continuousTrainingCards().length > 0",
+                            class="mt-3 grid grid-cols-1 gap-3",
+                            [ngClass]="continuousTrainingGridClass()")
+                            div(*ngFor="let item of continuousTrainingCards()",
+                                class="rounded-xl border px-3 py-3",
+                                [ngClass]="continuousTrainingCardClass(item)")
+                                div(class="flex items-start justify-between gap-2")
+                                    div(class="min-w-0")
+                                        div(class="truncate text-[12px] font-semibold text-zinc-900") {{ continuousTrainingCardTitle(item) }}
+                                        div(class="mt-1 text-[10px] text-zinc-600") {{ continuousTrainingStageText(item) }}
+                                    div(class="flex shrink-0 items-center gap-1")
+                                        button(type="button",
+                                            (click)="resumeContinuousTraining(item); $event.stopPropagation()",
+                                            [disabled]="isContinuousTrainingResuming(item)",
+                                            class="rounded-full border border-white/80 bg-white/90 px-2 py-1 text-[9px] font-bold text-emerald-700 shadow-sm hover:bg-emerald-50 disabled:opacity-50") {{ continuousTrainingResumeButtonText(item) }}
+                                        span(class="rounded-full bg-white/80 px-2 py-1 text-[9px] font-bold text-zinc-600") {{ continuousTrainingStageBadgeText(item) }}
+                                div(class="mt-2 grid grid-cols-2 gap-2 text-[10px] text-zinc-700")
+                                    div(class="rounded-lg border border-white/70 bg-white/80 px-2 py-1.5")
+                                        div(class="text-zinc-400") 버전
+                                        div(class="mt-0.5 font-semibold") {{ continuousTrainingVersionText(item) }}
+                                    div(class="rounded-lg border border-white/70 bg-white/80 px-2 py-1.5")
+                                        div(class="text-zinc-400") 성능
+                                        div(class="mt-0.5 font-semibold break-words") {{ continuousTrainingMetricText(item) }}
+                                    div(class="rounded-lg border border-white/70 bg-white/80 px-2 py-1.5")
+                                        div(class="text-zinc-400") 데이터 확보
+                                        div(class="mt-0.5 font-semibold break-words") {{ continuousTrainingDataProgressText(item) }}
+                                    div(class="rounded-lg border border-white/70 bg-white/80 px-2 py-1.5")
+                                        div(class="text-zinc-400") ETA
+                                        div(class="mt-0.5 font-semibold break-words") {{ continuousTrainingEtaText(item) }}
+                                div(*ngIf="continuousTrainingDownloadProgressPercent(item) > 0",
+                                    class="mt-2 h-1.5 overflow-hidden rounded-full bg-white/80")
+                                    div(class="h-full rounded-full bg-emerald-500 transition-all",
+                                        [style.width.%]="continuousTrainingDownloadProgressPercent(item)")
+                                div(*ngIf="item.latest_log",
+                                    class="mt-2 truncate text-[10px] text-zinc-600") {{ item.latest_log }}
+                                div(*ngIf="item.message && item.message !== item.latest_log",
+                                    class="mt-1 max-h-8 overflow-hidden text-[10px] leading-4 text-zinc-600") {{ item.message }}
+                        details(*ngIf="completedTrainingLogCards().length > 0",
+                            class="mt-3 rounded-xl border border-emerald-100 bg-white/80 px-3 py-2")
+                            summary(class="cursor-pointer text-[11px] font-semibold text-emerald-800") 완료 기록 {{ completedTrainingLogCount() }}개
+                            div(class="mt-2 space-y-1.5")
+                                div(*ngFor="let item of completedTrainingLogCards()",
+                                    class="flex items-center justify-between gap-2 rounded-lg border border-zinc-100 bg-white px-2 py-1.5")
+                                    div(class="min-w-0")
+                                        div(class="truncate text-[10px] font-semibold text-zinc-700") {{ continuousTrainingCardTitle(item) }}
+                                        div(class="truncate text-[10px] text-zinc-400") {{ continuousTrainingMetricText(item) }}
+                                    div(class="shrink-0 text-right")
+                                        div(class="text-[9px] font-semibold text-zinc-500") {{ continuousTrainingStageBadgeText(item) }}
+                                        div(class="text-[9px] text-zinc-400") {{ continuousTrainingUpdatedTextFor(item) }}
+                    label(class="space-y-1")
+                        span(class="text-[10px] font-semibold text-zinc-500") 학습 대상 모델
+                        select([(ngModel)]="trainingTargetModel",
+                            (ngModelChange)="onTrainingTargetModelChanged()",
+                            class="w-full text-[12px] border border-zinc-200 rounded-lg px-3 py-2 bg-white")
+                            option(*ngFor="let item of trainingTargetOptionsForView()", [value]="item.key") {{ item.label }}
+                        div(class="text-[10px] text-zinc-500") {{ trainingTargetDescription() }}
+                    div(class="rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-[10px] text-emerald-700",
+                        *ngIf="!trainingTargetSupportsDashboardJob()") 이 모델은 대시보드 HITL job을 새로 시작하지 않고 전용/연속 학습 상태만 추적합니다.
                     div(class="grid grid-cols-1 sm:grid-cols-2 gap-2")
                         label(class="space-y-1")
                             span(class="text-[10px] font-semibold text-zinc-500") 낙상 라벨
@@ -417,11 +584,14 @@ section(*ngIf="inputMode === 'upload'",
                         div(class="flex items-center justify-between gap-2")
                             div(class="text-[12px] font-semibold text-zinc-800") 학습 현황
                             span(class="rounded-full px-2 py-1 text-[10px] font-semibold",
-                                [ngClass]="{'bg-emerald-100 text-emerald-700': trainingJob.status === 'completed_pending_apply' || trainingJob.status === 'applied', 'bg-blue-100 text-blue-700': trainingJob.status === 'running' || trainingJob.status === 'queued', 'bg-rose-100 text-rose-700': trainingJob.status === 'failed'}") {{ trainingJobStatusText() }}
+                                [ngClass]="{'bg-emerald-100 text-emerald-700': trainingJob.status === 'completed_pending_apply' || trainingJob.status === 'applied' || trainingJob.status === 'completed', 'bg-blue-100 text-blue-700': trainingJob.status === 'running' || trainingJob.status === 'queued', 'bg-amber-100 text-amber-700': trainingJob.status === 'blocked', 'bg-rose-100 text-rose-700': trainingJob.status === 'failed'}") {{ trainingJobStatusText() }}
                         div(class="h-2 rounded-full bg-zinc-200 overflow-hidden")
                             div(class="h-full rounded-full bg-emerald-500 transition-all",
                                 [style.width.%]="trainingJobProgressPercent()")
-                        div(class="grid grid-cols-3 gap-2 text-[11px] text-zinc-600")
+                        div(class="grid grid-cols-2 gap-2 text-[11px] text-zinc-600 sm:grid-cols-4")
+                            div
+                                div(class="text-zinc-400") 버전
+                                div(class="font-semibold text-zinc-800") {{ trainingJobVersionText() }}
                             div
                                 div(class="text-zinc-400") 진행
                                 div(class="font-semibold text-zinc-800") {{ trainingJobProgressPercent() }}%
@@ -432,14 +602,16 @@ section(*ngIf="inputMode === 'upload'",
                                 div(class="text-zinc-400") ETA
                                 div(class="font-semibold text-zinc-800") {{ trainingJobEtaText() }}
                         div(class="text-[11px] text-zinc-500") {{ trainingJob.message || trainingJob.stage }}
-                        div(*ngIf="trainingJob.result",
-                            class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]")
+                        div(class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]")
                             div(class="rounded-lg bg-white border border-zinc-200 px-3 py-2")
-                                div(class="text-zinc-400") RF 학습 샘플
-                                div(class="font-semibold text-zinc-900") {{ trainingJob.result?.rf_pipeline_training?.training_samples || '-' }}
+                                div(class="text-zinc-400") 학습 샘플
+                                div(class="font-semibold text-zinc-900") {{ trainingJobTrainingSampleText() }}
                             div(class="rounded-lg bg-white border border-zinc-200 px-3 py-2")
-                                div(class="text-zinc-400") 자세 F1
-                                div(class="font-semibold text-zinc-900") {{ trainingJob.result?.xg_posture_training?.cv?.f1_macro || '-' }}
+                                div(class="text-zinc-400") 후보 성능
+                                div(class="font-semibold text-zinc-900") {{ trainingJobCandidateMetricText() }}
+                            div(class="rounded-lg bg-white border border-zinc-200 px-3 py-2")
+                                div(class="text-zinc-400") 라벨 균형
+                                div(class="font-semibold text-zinc-900") {{ trainingJobClassBalanceText() }}
                         button(*ngIf="trainingJobCanApply()",
                             (click)="applyTrainingJob()",
                             [disabled]="trainingJobApplying",
@@ -457,7 +629,8 @@ section(*ngIf="inputMode === 'upload'",
 div(*ngIf="analysisResult && inputMode !== 'webcam'",
     class="max-w-[1800px] mx-auto px-4 sm:px-6 pb-12")
     //- ── 결과 요약 ──
-    div(class="mb-6")
+    div(*ngIf="selectedPersonDetailsVisible()",
+        class="mb-6")
         div(class="rounded-2xl border p-6",
             [ngClass]="riskBgClass(analysisResult.risk_level)")
             div(class="grid md:grid-cols-4 gap-6")
@@ -523,8 +696,34 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
                 (click)="emergencyPopupOpen = true",
                 class="text-xs px-3 py-1 bg-rose-600 text-white rounded-lg hover:bg-rose-700") 🚨 응급 프로토콜
 
+    div(*ngIf="hasMultiPersonCards()",
+        class="mb-4 lg:float-left lg:mr-4 lg:w-[280px]")
+        div(class="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm")
+            div(class="flex items-center justify-between gap-2")
+                div
+                    div(class="text-[13px] font-semibold text-zinc-900") 사람별 행동 분석
+                    div(class="mt-1 text-[11px] text-zinc-500") {{ multiPersonSummaryLine() }}
+                div(class="rounded-full bg-sky-50 px-2 py-1 text-[10px] font-semibold text-sky-700") {{ selectedPersonHeaderText() }}
+            div(class="mt-3 space-y-2")
+                button(*ngFor="let item of multiPersonCardItems()",
+                    type="button",
+                    (click)="selectPersonAnalysis(item.id)",
+                    class="w-full rounded-xl border px-3 py-2 text-left transition hover:border-sky-300 hover:bg-sky-50",
+                    [ngClass]="personCardClass(item)")
+                    div(class="flex items-center justify-between gap-2")
+                        div(class="flex min-w-0 items-center gap-2")
+                            span(class="h-2 w-2 shrink-0 rounded-full",
+                                [ngClass]="personCardDotClass(item)")
+                            span(class="truncate text-[12px] font-semibold") {{ item.person_label }}
+                            span(*ngIf="item.is_primary",
+                                class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700") 대표
+                        span(class="shrink-0 text-[11px] font-semibold") {{ personCardRiskText(item) }}
+                    div(class="mt-1 truncate text-[11px] text-zinc-600") {{ item.behavior_label }}
+                    div(class="mt-0.5 text-[10px] text-zinc-500") {{ personCardMetaText(item) }}
+
     //- ── 분석 결과 상세 ──
-    div(class="space-y-6")
+    div(*ngIf="selectedPersonDetailsVisible()",
+        class="space-y-6")
         //- 분석 요약
         div(*ngIf="analysisResult.analysis_overview",
             class="bg-white rounded-xl border border-zinc-200 p-4")
@@ -538,7 +737,9 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
                 div
                     div(class="text-[13px] font-semibold text-zinc-800") 업로드 분할 로그
                     p(class="mt-1 text-xs text-zinc-500", *ngIf="prototypeInfo?.chunk_policy?.upload") {{ prototypeInfo?.chunk_policy?.upload?.headline }}
-                span(class="text-xs text-zinc-400") {{ uploadLogEntries.length }}건
+                div(class="flex items-center gap-2")
+                    span(class="rounded-full bg-indigo-50 px-2 py-1 text-[10px] font-semibold text-indigo-700", *ngIf="prototypeInfo?.chunk_policy?.upload") {{ prototypeInfo?.chunk_policy?.upload?.steady_sec || 4 }}초 창 · {{ prototypeInfo?.chunk_policy?.upload?.stride_sec || 2 }}초 stride
+                    span(class="text-xs text-zinc-400") {{ uploadLogEntries.length }}건
             div(class="mt-3 rounded-xl border border-indigo-100 bg-indigo-50 px-3 py-2 text-[11px] text-indigo-800", *ngIf="uploadChunkSummary?.line") {{ uploadChunkSummary?.line }}
             div(class="mt-4 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3", *ngIf="uploadLogEntries.length > 0")
                 div(class="flex items-center justify-between gap-2")
@@ -565,6 +766,7 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
                             div(class="flex items-center gap-2 flex-wrap")
                                 span(class="text-[12px] font-semibold", [ngClass]="logRiskClass(entry.level)") {{ entry.chunkLabel || entry.label }}
                                 span(class="text-[11px] text-zinc-500") {{ (entry.score * 100) | number:'1.0-0' }}%
+                                span(*ngIf="entry.rawLevel && entry.rawLevel !== entry.level", class="text-[10px] rounded-full bg-amber-100 px-2 py-0.5 text-amber-700") {{ chunkRiskLabel(entry) }}
                                 span(*ngIf="entry.postureLabel", class="text-[11px] text-sky-600") {{ entry.postureLabel }}
                                 span(*ngIf="entry.facialLabel", class="text-[11px] text-cyan-600") 표정 {{ entry.facialLabel }} {{ entry.facialPercent }}%
                                 span(*ngIf="entry.chunkWindow?.start_sec != null && entry.chunkWindow?.end_sec != null", class="text-[10px] rounded-full bg-zinc-100 px-2 py-0.5 text-zinc-500") {{ entry.chunkWindow?.start_sec }}s → {{ entry.chunkWindow?.end_sec }}s
@@ -707,7 +909,13 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
         //- 서버 타이밍 E2E
         div(*ngIf="analysisResult.server_timing",
             class="bg-white rounded-xl border border-zinc-200 p-4")
-            div(class="text-[13px] font-semibold text-zinc-800 mb-2") 처리 시간 상세
+            div(class="flex items-start justify-between gap-3 mb-2")
+                div
+                    div(class="text-[13px] font-semibold text-zinc-800") 처리 시간 상세
+                    div(class="mt-1 text-[11px] text-zinc-500") {{ getUploadAnalysisSlowReason() }}
+                div(class="shrink-0 text-right")
+                    div(class="text-[10px] text-zinc-400") LLM
+                    div(class="text-[12px] font-semibold text-zinc-700") {{ (analysisResult.server_timing.llm_sec || 0) | number:'1.2-2' }}초
             div(class="space-y-1")
                 div(*ngFor="let item of getServerTimingDetail()",
                     class="flex items-center gap-2 text-xs")
@@ -733,8 +941,10 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
                 (input)="seekDetectionReplay($event.target.value)",
                 class="w-full accent-blue-500")
 
+    div(class="clear-both")
+
     //- ── 2-Level 피드백 (업로드 모드) ──
-    div(*ngIf="analysisResult && inputMode !== 'webcam'",
+    div(*ngIf="analysisResult && inputMode !== 'webcam' && selectedPersonDetailsVisible()",
         class="mt-6 bg-white rounded-xl border border-zinc-200 p-4")
         div(class="text-[13px] font-semibold text-zinc-800 mb-3") 결과 피드백
         //- Level 1: 낙상 판정
@@ -813,12 +1023,17 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
 section(*ngIf="inputMode !== 'webcam'",
     class="py-8 bg-zinc-50")
     div(class="max-w-[1800px] mx-auto px-4 sm:px-6")
-        div(class="grid md:grid-cols-3 gap-4")
+        div(class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4")
             div((click)="goPipelinePage()",
                 class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
                 div(class="text-sm mb-1") 🔬
                 div(class="text-[13px] font-medium text-zinc-800") AI 파이프라인
                 div(class="text-xs text-zinc-400") 모델 흐름도 확인
+            div(routerLink="/models",
+                class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
+                div(class="text-sm mb-1") 📦
+                div(class="text-[13px] font-medium text-zinc-800") 모델 관리
+                div(class="text-xs text-zinc-400") 업로드·비교·삭제
             div((click)="goManualPage()",
                 class="bg-white rounded-xl border border-zinc-200 p-4 cursor-pointer hover:shadow-sm transition-shadow")
                 div(class="text-sm mb-1") 📖

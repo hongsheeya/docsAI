@@ -102,13 +102,13 @@ def prototype_info():
             }
             data = video_analysis.save_alert_settings(settings)
         except Exception as e:
-            _status(400, message=str(e))
-        _status(200, **data)
+            return _status(400, message=str(e))
+        return _status(200, **data)
     try:
         data = video_analysis.prototype_info()
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **data)
+        return _status(400, message=str(e))
+    return _status(200, **data)
 
 
 def analyze_upload():
@@ -122,8 +122,8 @@ def analyze_upload():
     try:
         result = video_analysis.analyze_upload(uploaded_file, metadata)
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def warmup_models():
@@ -131,8 +131,44 @@ def warmup_models():
     try:
         result = video_analysis.warmup_models(model_type=wiz.request.query("model_type", "rf-dual"))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
+
+
+def model_registry():
+    video_analysis = video_analysis_model()
+    try:
+        result = video_analysis.model_registry()
+    except Exception as e:
+        return _status(400, message=str(e))
+    return _status(200, **result)
+
+
+def upload_model_asset():
+    video_analysis = video_analysis_model()
+    uploaded_file = wiz.request.file("model")
+    family = wiz.request.query("family", "rf-fall-v2")
+    label = wiz.request.query("label", "")
+    note = wiz.request.query("note", "")
+    metadata_raw = wiz.request.query("metadata", "{}")
+    try:
+        metadata = json.loads(metadata_raw)
+    except Exception:
+        metadata = {}
+    try:
+        result = video_analysis.upload_model_asset(uploaded_file, family=family, label=label, note=note, metadata=metadata)
+    except Exception as e:
+        return _status(400, message=str(e))
+    return _status(200, **result)
+
+
+def delete_model_asset():
+    video_analysis = video_analysis_model()
+    try:
+        result = video_analysis.delete_model_asset(wiz.request.query("model_id", ""))
+    except Exception as e:
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def submit_training_sample():
@@ -148,8 +184,8 @@ def submit_training_sample():
     try:
         result = video_analysis.submit_training_sample(uploaded_file, label, note, metadata)
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def retrain_baseline():
@@ -157,8 +193,8 @@ def retrain_baseline():
     try:
         result = video_analysis.retrain_baseline()
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def start_training_job():
@@ -168,10 +204,12 @@ def start_training_job():
             job_type=wiz.request.query("job_type", "full"),
             note=wiz.request.query("note", ""),
             apply_mode=wiz.request.query("apply_mode", "manual"),
+            target_model=wiz.request.query("target_model", "rf-dual"),
+            max_per_class=wiz.request.query("max_per_class", ""),
         )
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def training_job_status():
@@ -179,8 +217,8 @@ def training_job_status():
     try:
         result = video_analysis.training_job_status(wiz.request.query("job_id", "latest"))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def continuous_training_status():
@@ -188,8 +226,19 @@ def continuous_training_status():
     try:
         result = video_analysis.continuous_training_status(wiz.request.query("name", "aihub82"))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
+
+
+def resume_continuous_training():
+    video_analysis = video_analysis_model()
+    try:
+        result = video_analysis.resume_continuous_training(
+            target=wiz.request.query("target", "all"),
+        )
+    except Exception as e:
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def apply_training_job():
@@ -197,8 +246,8 @@ def apply_training_job():
     try:
         result = video_analysis.apply_training_job(wiz.request.query("job_id", "latest"))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def submit_analysis_feedback():
@@ -218,8 +267,8 @@ def submit_analysis_feedback():
             short_clip_flag=wiz.request.query("short_clip_flag", "false"),
         )
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def dispatch_risk_alerts():
@@ -236,8 +285,8 @@ def dispatch_risk_alerts():
             event_label=wiz.request.query("event_label", "대표 분석 구간"),
         )
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def reference_preview_info():
@@ -245,8 +294,8 @@ def reference_preview_info():
     try:
         result = video_analysis.reference_preview_info(wiz.request.query("scene_id", ""))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def reference_preview():
@@ -254,10 +303,10 @@ def reference_preview():
     try:
         result = video_analysis.reference_preview_info(wiz.request.query("scene_id", ""))
     except Exception as e:
-        _status(400, message=str(e))
+        return _status(400, message=str(e))
     clip_path = ((result.get('clip_info', {}) or {}).get('clip_path', ''))
     if len(clip_path) == 0 or not os.path.exists(clip_path):
-        _status(404, message='클립 파일을 찾을 수 없습니다.')
+        return _status(404, message='클립 파일을 찾을 수 없습니다.')
     wiz.response.download(clip_path, as_attachment=False)
 
 
@@ -269,8 +318,8 @@ def chunk_preview_info():
             wiz.request.query("chunk_id", ""),
         )
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def chunk_preview():
@@ -281,10 +330,10 @@ def chunk_preview():
             wiz.request.query("chunk_id", ""),
         )
     except Exception as e:
-        _status(400, message=str(e))
+        return _status(400, message=str(e))
     clip_path = ((result.get('clip_info', {}) or {}).get('clip_path', ''))
     if len(clip_path) == 0 or not os.path.exists(clip_path):
-        _status(404, message='부분 영상 파일을 찾을 수 없습니다.')
+        return _status(404, message='부분 영상 파일을 찾을 수 없습니다.')
     wiz.response.download(clip_path, as_attachment=False)
 
 
@@ -293,8 +342,8 @@ def analysis_video_info():
     try:
         result = video_analysis.upload_video_info(wiz.request.query("saved_name", ""))
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def analysis_video():
@@ -302,10 +351,10 @@ def analysis_video():
     try:
         result = video_analysis.upload_video_info(wiz.request.query("saved_name", ""))
     except Exception as e:
-        _status(400, message=str(e))
+        return _status(400, message=str(e))
     video_path = result.get('video_path', '')
     if len(video_path) == 0 or not os.path.exists(video_path):
-        _status(404, message='원본 영상 파일을 찾을 수 없습니다.')
+        return _status(404, message='원본 영상 파일을 찾을 수 없습니다.')
     wiz.response.download(video_path, as_attachment=False)
 
 
@@ -316,8 +365,8 @@ def shadow_report():
     try:
         result = video_analysis.shadow_comparison_report(days=days)
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def rf_pose_deletion_status():
@@ -326,8 +375,8 @@ def rf_pose_deletion_status():
     try:
         result = video_analysis.rf_pose_deletion_status()
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def evaluate_system():
@@ -337,8 +386,8 @@ def evaluate_system():
     try:
         result = video_analysis.evaluate_system(eval_type=eval_type)
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)
 
 
 def baseline_report():
@@ -347,5 +396,5 @@ def baseline_report():
     try:
         result = video_analysis.generate_baseline_report()
     except Exception as e:
-        _status(400, message=str(e))
-    _status(200, **result)
+        return _status(400, message=str(e))
+    return _status(200, **result)

@@ -1,0 +1,307 @@
+input(type="file", accept=".pkl,.joblib,.pt,.pth,.onnx,.json,.zip,.tar,.tgz,.gz", multiple="", #modelFileInput="", (change)="onModelFilesSelected($event)", style="display:none")
+input(type="file", accept=".pkl,.joblib,.pt,.pth,.onnx,.json,.zip,.tar,.tgz,.gz", multiple="", webkitdirectory="", directory="", #modelFolderInput="", (change)="onModelFilesSelected($event)", style="display:none")
+
+div(class="min-h-screen bg-slate-50")
+    nav(class="shrink-0 border-b border-zinc-200 bg-white")
+        div(class="mx-auto flex h-[56px] max-w-[1800px] items-center justify-between gap-4 px-4 sm:px-6")
+            div(class="flex items-center gap-3")
+                span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
+                    img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
+                div
+                    p(class="text-lg font-semibold text-zinc-950") 모델 관리
+                    p(class="text-xs text-zinc-400") 업로드 · 비교 · 선택 가능한 모델 버전 관리
+            div(class="flex min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap")
+                a(routerLink="/", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 메인
+                a(routerLink="/pipeline", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 파이프라인
+                a(routerLink="/models", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 text-[13px] font-semibold text-sky-700") 모델 관리
+                a(routerLink="/manual", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
+
+    div(class="mx-auto max-w-[1800px] px-4 py-8 sm:px-6")
+        div(class="rounded-3xl border border-zinc-200 bg-white p-5 shadow-sm")
+            div(class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between")
+                div
+                    p(class="text-[12px] font-semibold uppercase tracking-[0.16em] text-sky-600") Model Center
+                    h1(class="mt-2 text-2xl font-semibold text-zinc-950") 운영 상태를 먼저 보고, 필요한 작업만 선택하세요
+                    p(class="mt-2 max-w-3xl text-sm leading-6 text-zinc-500") 일반 사용자는 현재 모델 상태와 학습 진행만 확인하면 됩니다. 모델 등록, 감도 조절, 후보 삭제 같은 고급 작업은 아래 작업 탭에서 분리했습니다.
+                div(class="flex flex-wrap gap-2")
+                    button(type="button", (click)="setModelManagerMode('overview')", class="rounded-xl border px-4 py-2 text-[12px] font-semibold", [ngClass]="modelManagerModeClass('overview')") 상태만 보기
+                    button(type="button", (click)="setModelManagerMode('upload')", class="rounded-xl border px-4 py-2 text-[12px] font-semibold", [ngClass]="modelManagerModeClass('upload')") 모델 등록
+                    button(type="button", (click)="setModelManagerMode('sensitivity')", class="rounded-xl border px-4 py-2 text-[12px] font-semibold", [ngClass]="modelManagerModeClass('sensitivity')") 감도 조절
+                    button(type="button", (click)="setModelManagerMode('advanced')", class="rounded-xl border px-4 py-2 text-[12px] font-semibold", [ngClass]="modelManagerModeClass('advanced')") 고급 관리
+            div(class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4")
+                div(*ngFor="let card of modelOverviewCards()", class="rounded-2xl border px-4 py-4", [ngClass]="overviewCardClass(card)")
+                    p(class="text-[11px] font-semibold uppercase tracking-wide opacity-70") {{ card.label }}
+                    p(class="mt-2 truncate text-xl font-bold") {{ card.value }}
+                    p(class="mt-1 text-[12px] leading-5 opacity-75") {{ card.note }}
+
+        div(*ngIf="modelManagerMode === 'overview'", class="mt-5 grid gap-5 xl:grid-cols-[1fr_420px]")
+            div(class="space-y-5")
+                div(class="rounded-3xl border border-zinc-200 bg-white p-5 shadow-sm")
+                    div(class="flex flex-wrap items-center justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-zinc-900") 현재 사용 중인 모델
+                            p(class="mt-1 text-xs text-zinc-500") 일반 사용자가 확인해야 하는 운영 모델만 먼저 보여줍니다.
+                        span(class="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-semibold text-zinc-600") {{ activeModelItems().length }}개
+                    div(class="mt-4 grid gap-3 md:grid-cols-2")
+                        div(*ngFor="let item of activeModelItems()", class="rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-4")
+                            div(class="flex items-start justify-between gap-3")
+                                div(class="min-w-0")
+                                    p(class="truncate text-sm font-semibold text-zinc-950") {{ modelTitle(item) }}
+                                    p(class="mt-1 truncate text-[11px] text-zinc-500") {{ item.family_label }} · {{ versionText(item) }}
+                                span(class="shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold", [ngClass]="badgeClass(item)") {{ sourceText(item) }}
+                            div(class="mt-3 grid grid-cols-2 gap-2 text-[11px]")
+                                div(class="rounded-xl bg-white px-3 py-2")
+                                    p(class="text-zinc-400") 성능
+                                    p(class="mt-1 font-semibold text-zinc-900") {{ itemMetricText(item) }}
+                                div(class="rounded-xl bg-white px-3 py-2")
+                                    p(class="text-zinc-400") 샘플
+                                    p(class="mt-1 font-semibold text-zinc-900") {{ itemSampleText(item) }}
+                div(class="rounded-3xl border border-amber-200 bg-amber-50 p-5 shadow-sm")
+                    p(class="text-[13px] font-semibold text-amber-950") 표정 모델 병목 요약
+                    p(class="mt-1 text-xs text-amber-700") 성능이 왜 88%대에서 막히는지 자동 리포트에서 뽑은 핵심만 표시합니다.
+                    ul(class="mt-3 space-y-2")
+                        li(*ngFor="let line of facialBottleneckLines()", class="rounded-xl border border-amber-200 bg-white px-3 py-2 text-[12px] leading-5 text-amber-900") {{ line }}
+            div(class="space-y-5")
+                div(class="rounded-3xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm")
+                    div(class="flex items-center justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-emerald-950") 백그라운드 학습 현황
+                            p(class="mt-1 text-xs text-emerald-700") 학습이 실제로 도는지 여기서 확인합니다.
+                        button(type="button", (click)="loadRegistry()", class="rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-50") 새로고침
+                    div(class="mt-4 space-y-3")
+                        div(*ngFor="let item of friendlyTrainingItems()", class="rounded-2xl border border-emerald-200 bg-white px-4 py-4")
+                            div(class="flex items-start justify-between gap-3")
+                                div(class="min-w-0")
+                                    p(class="truncate text-sm font-semibold text-zinc-950") {{ trainingItemTitle(item) }}
+                                    p(class="mt-1 truncate text-[11px] text-zinc-500") {{ trainingItemVersionText(item) }}
+                                span(class="shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold", [ngClass]="trainingItemStageClass(item)") {{ trainingItemStageLabel(item) }}
+                            div(class="mt-3 h-2 overflow-hidden rounded-full bg-emerald-50")
+                                div(class="h-full rounded-full bg-emerald-500 transition-all", [style.width.%]="trainingItemProgressPercent(item)")
+                            div(class="mt-3 grid grid-cols-2 gap-2 text-[11px]")
+                                div(class="rounded-xl bg-emerald-50 px-3 py-2")
+                                    p(class="text-emerald-500") 성능
+                                    p(class="mt-1 font-semibold text-emerald-950") {{ trainingItemMetricText(item) }}
+                                div(class="rounded-xl bg-emerald-50 px-3 py-2")
+                                    p(class="text-emerald-500") ETA
+                                    p(class="mt-1 font-semibold text-emerald-950") {{ trainingItemEtaText(item) }}
+                        div(*ngIf="friendlyTrainingItems().length === 0", class="rounded-2xl border border-dashed border-emerald-200 bg-white px-4 py-8 text-center text-xs text-emerald-700") 표시할 학습 상태가 없습니다.
+                div(class="rounded-3xl border border-zinc-200 bg-white p-5 shadow-sm")
+                    p(class="text-[13px] font-semibold text-zinc-900") 지금 할 수 있는 작업
+                    div(class="mt-3 space-y-2")
+                        button(*ngFor="let action of modelQuickActions()", type="button", (click)="setModelManagerMode(action.mode)", class="w-full rounded-2xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-left hover:bg-white")
+                            div(class="flex items-center justify-between gap-3")
+                                div
+                                    p(class="text-sm font-semibold text-zinc-950") {{ action.title }}
+                                    p(class="mt-1 text-[12px] leading-5 text-zinc-500") {{ action.description }}
+                                span(class="shrink-0 rounded-lg bg-white px-2.5 py-1 text-[11px] font-semibold text-zinc-700") {{ action.button }}
+
+        div(*ngIf="modelManagerMode !== 'overview'", class="mt-5 grid gap-5 xl:grid-cols-[420px_1fr]")
+            div(class="space-y-5")
+                div(*ngIf="modelManagerMode === 'upload' || modelManagerMode === 'advanced'", class="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm")
+                    div(class="flex items-start justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-zinc-900") 모델 업로드
+                            p(class="mt-1 text-xs text-zinc-500") 파일 또는 폴더를 선택해 하나의 모델 버전으로 등록합니다.
+                        button(type="button", (click)="loadRegistry()", class="rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-zinc-600 hover:bg-zinc-50") 새로고침
+                    div(class="mt-4 space-y-3")
+                        label(class="block")
+                            span(class="text-[11px] font-semibold text-zinc-500") 모델 종류
+                            select([(ngModel)]="uploadFamily", class="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-[13px]")
+                                option(*ngFor="let family of families()", [value]="family.key") {{ family.label }}
+                        label(class="block")
+                            span(class="text-[11px] font-semibold text-zinc-500") 표시 이름
+                            input(type="text", [(ngModel)]="uploadLabel", placeholder="예: RF-Fall v5 holdout 후보", class="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-[13px]")
+                        label(class="block")
+                            span(class="text-[11px] font-semibold text-zinc-500") 메모
+                            textarea([(ngModel)]="uploadNote", rows="2", placeholder="데이터셋, threshold, 검증 조건 등", class="mt-1 w-full resize-none rounded-xl border border-zinc-200 bg-white px-3 py-2 text-[13px]")
+                        div(class="rounded-2xl border-2 border-dashed border-sky-200 bg-sky-50 px-4 py-5 text-center")
+                            p(class="text-[12px] font-semibold text-sky-900") {{ selectedFileSummary() }}
+                            p(class="mt-1 text-[11px] text-sky-700") 모델 파일과 training_summary.json을 같은 폴더로 올리면 성능 비교까지 자동 반영됩니다.
+                            div(class="mt-3 flex items-center justify-center gap-2")
+                                button(type="button", (click)="modelFileInput.click()", class="rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-sky-700 hover:bg-sky-50") 파일 선택
+                                button(type="button", (click)="modelFolderInput.click()", class="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-zinc-700 hover:bg-zinc-50") 폴더 선택
+                                button(type="button", *ngIf="uploadFiles.length > 0", (click)="clearUploadFiles()", class="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-[12px] font-semibold text-rose-600 hover:bg-rose-50") 취소
+                        button(type="button", (click)="uploadSelectedModels()", [disabled]="uploadFiles.length === 0 || uploading", class="w-full rounded-xl px-4 py-3 text-[13px] font-semibold text-white disabled:opacity-50", [ngClass]="uploading ? 'bg-zinc-400' : 'bg-zinc-900 hover:bg-black'")
+                            span(*ngIf="!uploading") 모델 등록
+                            span(*ngIf="uploading") 등록 중 {{ uploadDone }}/{{ uploadFiles.length }}
+                        div(*ngIf="uploadMessage", class="rounded-xl px-3 py-2 text-[12px]", [ngClass]="uploadMessageType === 'error' ? 'bg-rose-50 text-rose-700' : (uploadMessageType === 'success' ? 'bg-emerald-50 text-emerald-700' : 'bg-sky-50 text-sky-700')") {{ uploadMessage }}
+
+                div(*ngIf="modelManagerMode === 'sensitivity' || modelManagerMode === 'advanced'", class="rounded-2xl border border-rose-200 bg-white p-5 shadow-sm")
+                    div(class="flex items-start justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-zinc-900") 낙상 감도 조절
+                            p(class="mt-1 text-xs text-zinc-500") 실시간/업로드 낙상 판정 threshold에 같이 적용됩니다.
+                        span(class="rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700") {{ sensitivityLabel() }} {{ sensitivityLevel }}
+                    div(class="mt-4 rounded-xl border border-zinc-100 bg-zinc-50 px-3 py-3")
+                        input(type="range", min="0", max="100", step="1", [(ngModel)]="sensitivityLevel", class="w-full accent-rose-600")
+                        div(class="mt-2 flex items-center justify-between text-[10px] font-semibold text-zinc-400")
+                            span 보수
+                            span 균형
+                            span 민감
+                    div(class="mt-3 grid grid-cols-3 gap-2")
+                        button(type="button", (click)="setSensitivityPreset(20)", [disabled]="sensitivitySaving", class="rounded-lg border border-zinc-200 bg-white px-2.5 py-2 text-[11px] font-semibold text-zinc-600 hover:bg-zinc-50 disabled:opacity-50") 보수
+                        button(type="button", (click)="setSensitivityPreset(50)", [disabled]="sensitivitySaving", class="rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-2 text-[11px] font-semibold text-sky-700 hover:bg-sky-100 disabled:opacity-50") 균형
+                        button(type="button", (click)="setSensitivityPreset(80)", [disabled]="sensitivitySaving", class="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-2 text-[11px] font-semibold text-rose-700 hover:bg-rose-100 disabled:opacity-50") 민감
+                    button(type="button", (click)="saveFallSensitivity()", [disabled]="sensitivitySaving", class="mt-3 w-full rounded-xl bg-zinc-900 px-4 py-2.5 text-[12px] font-semibold text-white hover:bg-black disabled:opacity-50") {{ sensitivitySaving ? '저장 중' : '감도 저장' }}
+                    div(class="mt-3 rounded-xl border border-rose-100 bg-rose-50 px-3 py-2")
+                        p(class="text-[11px] font-semibold text-rose-900") {{ sensitivityThresholdText() }}
+                        p(class="mt-1 text-[10px] text-rose-700") 조정값 {{ sensitivityDeltaText() }} · {{ sensitivityHelpText() }}
+
+                div(*ngIf="modelManagerMode === 'advanced'", class="rounded-2xl border border-emerald-200 bg-emerald-50 p-5 shadow-sm")
+                    p(class="text-[13px] font-semibold text-emerald-950") 커스텀 최종 모델 생성
+                    p(class="mt-2 text-[12px] leading-6 text-emerald-800") {{ registry?.runtime_composition?.headline }}
+                    div(class="mt-4 space-y-3")
+                        div(*ngFor="let row of compositionRows()", class="rounded-xl border border-emerald-200 bg-white px-3 py-3")
+                            div(class="flex items-start justify-between gap-3")
+                                div(class="min-w-0")
+                                    p(class="truncate text-[12px] font-semibold text-emerald-950") {{ row.family_label }}
+                                    p(class="mt-1 truncate text-[10px] text-emerald-600") 현재 {{ row.effective_label }} · {{ row.effective_version || '-' }}
+                                span(class="shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold", [ngClass]="row.overridden ? 'bg-emerald-100 text-emerald-800' : 'bg-zinc-100 text-zinc-500'") {{ row.overridden ? '선택 적용' : 'active' }}
+                            select([value]="row.selected_model_id || ''", (change)="setRuntimeSelection(row, $event)", [disabled]="savingFamily === row.family", class="mt-3 w-full rounded-lg border border-emerald-200 bg-white px-3 py-2 text-[11px] text-emerald-950 disabled:opacity-50")
+                                option(*ngFor="let option of compositionOptions(row)", [value]="option.model_id || ''") {{ runtimeOptionText(option) }}
+                    div(class="mt-4 rounded-xl border border-emerald-200 bg-white px-3 py-3")
+                        p(class="text-[12px] font-semibold text-emerald-950") 최종 모델 저장/적용
+                        div(class="mt-2 flex gap-2")
+                            input(type="text", [(ngModel)]="bundleLabel", placeholder="예: RF-Dual final v1", class="min-w-0 flex-1 rounded-lg border border-emerald-200 bg-white px-3 py-2 text-[11px] text-emerald-950")
+                            button(type="button", (click)="saveRuntimeBundle()", [disabled]="bundleSaving", class="shrink-0 rounded-lg bg-emerald-700 px-3 py-2 text-[11px] font-semibold text-white hover:bg-emerald-800 disabled:opacity-50") {{ bundleSaving ? '생성 중' : '최종 모델 생성' }}
+                        div(class="mt-3 space-y-2", *ngIf="runtimeBundles().length > 0")
+                            div(*ngFor="let bundle of runtimeBundles()", class="rounded-lg border px-3 py-2", [ngClass]="bundle.active ? 'border-emerald-300 bg-emerald-50' : 'border-zinc-100 bg-zinc-50'")
+                                div(class="flex items-start justify-between gap-2")
+                                    div(class="min-w-0")
+                                        p(class="truncate text-[11px] font-semibold", [ngClass]="bundle.active ? 'text-emerald-950' : 'text-zinc-800'") {{ bundle.label }}
+                                        p(class="mt-0.5 truncate text-[10px]", [ngClass]="bundle.active ? 'text-emerald-700' : 'text-zinc-500'") {{ bundleSelectionText(bundle) }}
+                                    span(class="shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold", [ngClass]="bundle.active ? 'bg-emerald-200 text-emerald-900' : 'bg-white text-zinc-500'") {{ bundle.active ? '사용 중' : bundle.selection_count + '개' }}
+                                div(class="mt-2 flex justify-end gap-2")
+                                    button(type="button", (click)="applyRuntimeBundle(bundle)", [disabled]="bundle.active || applyingBundleId === bundle.bundle_id || bundle.missing_count > 0", class="rounded-lg border border-emerald-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50") {{ applyingBundleId === bundle.bundle_id ? '적용 중' : '사용' }}
+                                    button(type="button", (click)="deleteRuntimeBundle(bundle)", [disabled]="deletingBundleId === bundle.bundle_id || bundle.active", class="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50") {{ deletingBundleId === bundle.bundle_id ? '예약 중' : '삭제 예약' }}
+
+                div(*ngIf="modelManagerMode === 'advanced'", class="rounded-2xl border border-violet-200 bg-violet-50 p-5 shadow-sm")
+                    p(class="text-[13px] font-semibold text-violet-950") 가림 보조 작동 기준
+                    p(class="mt-2 text-[12px] leading-6 text-violet-800") {{ registry?.occlusion_policy?.headline }}
+                    div(class="mt-3 rounded-xl border border-violet-200 bg-white px-3 py-3")
+                        div(class="flex items-center justify-between gap-3")
+                            p(class="text-[12px] font-semibold text-violet-950") 현재 학습 상태
+                            span(class="rounded-full bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-700") {{ registry?.occlusion_policy?.training_status?.stage || '-' }}
+                        p(class="mt-1 text-[11px] leading-5 text-violet-700") {{ occlusionStatusText() }}
+                        p(class="mt-1 text-[10px] text-violet-500") {{ occlusionVersionText() }}
+                        p(class="mt-1 text-[10px] text-violet-500") {{ occlusionSequenceText() }} · ETA {{ registry?.occlusion_policy?.training_status?.eta_text || '-' }} · 목표 F1 {{ ((registry?.occlusion_policy?.training_status?.target_macro_f1 || 0.97) * 100).toFixed(0) }}%
+                    div(class="mt-4 grid grid-cols-3 gap-2")
+                        div(class="rounded-xl border border-violet-200 bg-white px-3 py-2")
+                            p(class="text-[10px] text-violet-500") avg_conf
+                            p(class="mt-1 text-lg font-bold text-violet-950") &lt; {{ registry?.occlusion_policy?.avg_conf_lt || 0.38 }}
+                        div(class="rounded-xl border border-violet-200 bg-white px-3 py-2")
+                            p(class="text-[10px] text-violet-500") lower visibility
+                            p(class="mt-1 text-lg font-bold text-violet-950") &lt; {{ registry?.occlusion_policy?.lower_body_visibility_lt || 0.42 }}
+                        div(class="rounded-xl border border-violet-200 bg-white px-3 py-2")
+                            p(class="text-[10px] text-violet-500") margin
+                            p(class="mt-1 text-lg font-bold text-violet-950") &lt; {{ registry?.occlusion_policy?.posture_margin_lt || 0.07 }}
+                    ul(class="mt-4 space-y-2")
+                        li(*ngFor="let line of occlusionLines()", class="text-[12px] leading-5 text-violet-800") {{ line }}
+                    div(class="mt-4 rounded-xl border border-violet-200 bg-white px-3 py-3")
+                        p(class="text-[12px] font-semibold text-violet-950") 성능 개선 검증 방법
+                        ol(class="mt-2 space-y-1")
+                            li(*ngFor="let line of occlusionTuningPlan(); let i = index", class="text-[12px] leading-5 text-violet-800") {{ i + 1 }}. {{ line }}
+
+            div(class="space-y-5")
+                div(class="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm")
+                    div(class="flex flex-wrap items-center justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-zinc-900") 성능 비교
+                            p(class="mt-1 text-xs text-zinc-500") 운영 active, 학습 후보, 직접 업로드 모델을 같은 기준으로 비교합니다.
+                        div(class="flex items-center gap-2")
+                            select([(ngModel)]="familyFilter", class="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-[12px]")
+                                option(value="all") 전체 모델
+                                option(*ngFor="let family of families()", [value]="family.key") {{ family.label }}
+                            select([(ngModel)]="compareMetric", class="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-[12px]")
+                                option(value="f1") F1
+                                option(value="accuracy") Accuracy
+                                option(value="recall") Recall
+                                option(value="precision") Precision
+                    div(class="mt-5 rounded-xl border border-zinc-200 bg-zinc-50 p-3")
+                        div(class="flex flex-wrap items-center justify-between gap-2")
+                            div
+                                p(class="text-[12px] font-semibold text-zinc-900") 비교할 모델 선택
+                                p(class="mt-1 text-[10px] text-zinc-500") 선택 {{ comparisonSelectedCount() }}개 · 선택한 모델만 아래 그래프에 표시됩니다.
+                            div(class="flex items-center gap-2")
+                                button(type="button", (click)="selectBestComparisonRows()", class="rounded-lg border border-zinc-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-zinc-600 hover:bg-zinc-50") 상위 선택
+                                button(type="button", (click)="clearComparisonSelection()", class="rounded-lg border border-zinc-200 bg-white px-2.5 py-1 text-[11px] font-semibold text-zinc-500 hover:bg-zinc-50") 해제
+                        div(class="mt-3 grid max-h-[220px] gap-2 overflow-y-auto md:grid-cols-2 2xl:grid-cols-3")
+                            label(*ngFor="let row of comparisonCandidateRows()", class="flex cursor-pointer items-start gap-2 rounded-lg border px-2.5 py-2", [ngClass]="isCompareSelected(row) ? 'border-sky-300 bg-white shadow-sm' : 'border-zinc-100 bg-white/70 hover:bg-white'")
+                                input(type="checkbox", class="mt-0.5", [checked]="isCompareSelected(row)", (change)="toggleCompareRow(row)")
+                                div(class="min-w-0")
+                                    p(class="truncate text-[11px] font-semibold text-zinc-800") {{ row.comparison_label || row.display_name || row.label }}
+                                    p(class="mt-0.5 truncate text-[10px] text-zinc-400") {{ row.family_label }} · {{ row.source }} · {{ row.display_version || '-' }} · {{ metricText(row) }}
+                    div(class="mt-5 space-y-2")
+                        div(class="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3", *ngIf="selectedComparisonRow()?.model_id")
+                            div(class="flex flex-wrap items-center justify-between gap-3")
+                                div(class="min-w-0")
+                                    p(class="truncate text-sm font-semibold text-sky-950") 대표 선택 · {{ selectedComparisonRow().comparison_label || selectedComparisonRow().display_name || selectedComparisonRow().label }}
+                                    p(class="mt-1 text-[11px] text-sky-700") {{ selectedComparisonRow().family_label }} · {{ selectedComparisonRow().source }} · {{ selectedComparisonRow().display_version || '-' }}
+                                div(class="text-right")
+                                    p(class="text-lg font-bold text-sky-950") {{ metricText(selectedComparisonRow()) }}
+                                    p(class="text-[11px] text-sky-700") {{ compareMetric.toUpperCase() }} 기준
+                        div(*ngFor="let row of comparisonRows()", (click)="selectComparisonRow(row)", class="grid cursor-pointer grid-cols-[220px_1fr_82px] items-center gap-3 rounded-xl border px-3 py-2", [ngClass]="isSelected(row) ? 'border-sky-300 bg-sky-50' : 'border-zinc-100 bg-zinc-50 hover:bg-white'")
+                            div(class="min-w-0")
+                                p(class="truncate text-[12px] font-semibold text-zinc-800") {{ row.comparison_label || row.display_name || row.label }}
+                                p(class="text-[10px] text-zinc-400") {{ row.family_label }} · {{ row.source }} · {{ row.display_version || '-' }}
+                            div(class="h-2 overflow-hidden rounded-full bg-white")
+                                div(class="h-full rounded-full bg-sky-500", [style.width]="metricBarWidth(row)")
+                            div(class="text-right text-[12px] font-semibold text-zinc-800") {{ metricText(row) }}
+                        div(*ngIf="comparisonCandidateRows().length === 0", class="rounded-xl border border-dashed border-zinc-200 px-4 py-8 text-center text-xs text-zinc-400") 비교 가능한 성능 수치가 없습니다.
+
+                div(class="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm")
+                    div(class="flex flex-wrap items-center justify-between gap-3")
+                        div
+                            p(class="text-[13px] font-semibold text-zinc-900") 모델 목록
+                            p(class="mt-1 text-xs text-zinc-500") 선택 가능한 모델은 메인 화면의 실시간/업로드 분석 모델 선택에 표시됩니다.
+                        div(class="flex flex-wrap items-center gap-2")
+                            button(type="button", (click)="cleanupCandidates()", [disabled]="cleanupBusy", class="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-700 hover:bg-amber-100 disabled:opacity-50") {{ cleanupBusy ? '정리 중' : '저성능 후보 정리' }}
+                            span(class="rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700") {{ deletableCount() }}개 삭제 가능
+                            span(class="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-semibold text-zinc-600") {{ visibleItems().length }}개
+                    div(class="mt-3 rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] leading-5 text-rose-700")
+                        | 삭제는 오른쪽 관리 열의 버튼 하나로만 예약합니다. 저성능 후보 정리는 F1/Acc 90% 미만 후보와 종류별 하위 후보를 24시간 유예 삭제로 한 번에 예약합니다.
+                    div(class="mt-4 overflow-x-auto")
+                        table(class="w-full min-w-[980px] text-left text-[12px]")
+                            thead
+                                tr(class="border-b border-zinc-200 text-zinc-500")
+                                    th(class="py-2 pr-3 font-semibold") 모델
+                                    th(class="py-2 pr-3 font-semibold") 버전
+                                    th(class="py-2 pr-3 font-semibold") 종류
+                                    th(class="py-2 pr-3 font-semibold") 성능
+                                    th(class="py-2 pr-3 font-semibold") 샘플
+                                    th(class="py-2 pr-3 font-semibold") 파일
+                                    th(class="py-2 pr-3 text-right font-semibold") 관리
+                            tbody
+                                tr(*ngFor="let item of visibleItems()", class="border-b border-zinc-100 align-top")
+                                    td(class="py-3 pr-3")
+                                        div(class="font-semibold text-zinc-900") {{ modelTitle(item) }}
+                                        div(class="mt-1 text-[10px] text-zinc-400") {{ item.model_id }}
+                                        div(class="mt-1 text-[11px] text-zinc-500", *ngIf="item.note") {{ item.note }}
+                                    td(class="py-3 pr-3 text-zinc-700")
+                                        div(class="font-semibold") {{ versionText(item) }}
+                                        div(class="mt-1 text-[10px] text-zinc-400", *ngIf="item.version_source") {{ item.version_source }}
+                                    td(class="py-3 pr-3")
+                                        div(class="inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold", [ngClass]="badgeClass(item)") {{ sourceText(item) }}
+                                        div(class="mt-1 text-[11px] text-zinc-500") {{ item.family_label }}
+                                    td(class="py-3 pr-3 text-zinc-700") {{ itemMetricText(item) }}
+                                    td(class="py-3 pr-3 text-zinc-700") {{ itemSampleText(item) }}
+                                    td(class="py-3 pr-3")
+                                        div(class="max-w-[280px] truncate text-[10px] text-zinc-400") {{ item.primary_model_path_display || item.primary_model_path || '-' }}
+                                        div(class="max-w-[280px] truncate text-[10px] text-zinc-400", *ngIf="item.summary_path_display") {{ item.summary_path_display }}
+                                    td(class="py-3 pr-3 text-right")
+                                        button(type="button", *ngIf="item.deletable !== false", (click)="deleteModel(item)", [disabled]="deletingId === item.model_id", class="rounded-lg bg-rose-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-rose-700 disabled:opacity-50") {{ deletingId === item.model_id ? '예약 중' : '삭제 예약' }}
+                                        div(*ngIf="item.deletable === false", class="flex flex-col items-end gap-1")
+                                            button(type="button", disabled="", class="rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-[11px] font-semibold text-zinc-400") 삭제 불가
+                                            span(class="inline-flex rounded-lg border px-2.5 py-1 text-[11px] font-semibold", [ngClass]="manageBadgeClass(item)") {{ itemManageText(item) }}
+                    div(*ngIf="trashRows().length > 0", class="mt-5 rounded-xl border border-rose-200 bg-rose-50 p-4")
+                        p(class="text-[12px] font-semibold text-rose-900") 삭제 예정 모델
+                        p(class="mt-1 text-[11px] text-rose-700") 예약된 모델은 목록에서 숨겨지고, 삭제 예정 시각 전까지 파일은 보존됩니다.
+                        div(class="mt-3 space-y-2")
+                            div(*ngFor="let item of trashRows()", class="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2")
+                                div(class="min-w-0")
+                                    p(class="truncate text-[11px] font-semibold text-rose-950") {{ item.display_name || item.label || item.model_id }}
+                                    p(class="truncate text-[10px] text-rose-500") {{ item.family_label }} · {{ item.source }} · {{ item.model_id }}
+                                div(class="shrink-0 text-right")
+                                    p(class="text-[11px] font-semibold text-rose-800") {{ item.remaining_text }}
+                                    p(class="text-[10px] text-rose-500") {{ item.delete_after }}
+                                    button(type="button", (click)="cancelDelete(item)", [disabled]="cancelingDeleteId === item.model_id", class="mt-1 rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50") {{ cancelingDeleteId === item.model_id ? '취소 중' : '삭제 취소' }}

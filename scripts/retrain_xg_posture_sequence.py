@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import datetime
+import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -9,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -23,11 +26,26 @@ PROGRESS_PATH = REPORT_DIR / 'xg_posture_sequence_training_progress.log'
 CLASSES = ['stand', 'walk', 'run', 'sit', 'lie']
 LOWER_OCCLUSION_MODES = ['waist', 'thigh', 'knee']
 VERTICAL_OCCLUSION_MODES = ['left', 'right']
+RANDOM_LOWER_OCCLUSION_MODES = ['random_mild', 'random_moderate', 'random_severe']
+RANDOM_VERTICAL_OCCLUSION_MODES = [
+    'left_mild', 'left_moderate', 'left_severe',
+    'right_mild', 'right_moderate', 'right_severe',
+]
 LOWER_BODY_KP = {11, 12, 13, 14, 15, 16}
 LOWER_DISTAL_KP = {13, 14, 15, 16}
 ANKLE_KP = {15, 16}
 LEFT_BODY_KP = {5, 7, 9, 11, 13, 15}
 RIGHT_BODY_KP = {6, 8, 10, 12, 14, 16}
+LOWER_OCCLUSION_BOUNDARIES = {
+    'mild': (0.70, 0.84),
+    'moderate': (0.55, 0.70),
+    'severe': (0.42, 0.58),
+}
+VERTICAL_OCCLUSION_EXTENTS = {
+    'mild': (0.18, 0.30),
+    'moderate': (0.30, 0.45),
+    'severe': (0.45, 0.58),
+}
 
 
 class _Fs:
@@ -58,6 +76,66 @@ def env_int(name, default):
         return int(os.environ.get(name, default) or default)
     except Exception:
         return int(default)
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default) or default)
+    except Exception:
+        return float(default)
+
+
+def env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def stable_unit(*parts):
+    raw = '|'.join(str(part) for part in parts).encode('utf-8', errors='ignore')
+    digest = hashlib.sha256(raw).hexdigest()
+    return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+
+
+def parse_modes(raw, default_modes, allowed_modes):
+    values = [item.strip() for item in str(raw or '').split(',') if item.strip()]
+    if not values:
+        values = list(default_modes)
+    allowed = set(allowed_modes)
+    selected = [mode for mode in values if mode in allowed]
+    return selected or list(default_modes)
+
+
+def parse_class_weight_multipliers(class_names):
+    raw = str(os.environ.get('POSTURE_CLASS_WEIGHT_MULTIPLIERS') or '').strip()
+    multipliers = {name: 1.0 for name in class_names}
+    if not raw:
+        return multipliers
+    for item in raw.split(','):
+        if ':' not in item:
+            continue
+        name, value = item.split(':', 1)
+        name = name.strip()
+        if name not in multipliers:
+            continue
+        try:
+            multipliers[name] = max(0.05, float(value.strip()))
+        except Exception:
+            continue
+    return multipliers
+
+
+def apply_class_weight_multipliers(weights, y, class_names, multipliers):
+    import numpy as np
+
+    adjusted = np.asarray(weights, dtype=float).copy()
+    for idx, class_name in enumerate(class_names):
+        multiplier = float(multipliers.get(class_name, 1.0) or 1.0)
+        if abs(multiplier - 1.0) < 1e-9:
+            continue
+        adjusted[np.asarray(y) == idx] *= multiplier
+    return adjusted
 
 
 def load_video_analysis():
@@ -169,6 +247,418 @@ def _frame_from_aihub61_json(va, data, name, frame_idx):
     }
 
 
+def _iter_aihub61_clip_jsons(source_path):
+    source_path = str(source_path or '')
+    if os.path.isfile(source_path) and source_path.endswith('.zip'):
+        try:
+            archive = zipfile.ZipFile(source_path)
+        except zipfile.BadZipFile as exc:
+            log(f'aihub61 zip skip source={source_path} reason=bad_zip:{str(exc)[:140]}')
+            return
+        except Exception as exc:
+            log(f'aihub61 zip skip source={source_path} reason={type(exc).__name__}:{str(exc)[:140]}')
+            return
+        with archive:
+            by_clip = defaultdict(list)
+            for name in archive.namelist():
+                if not name.endswith('.json') or '/._' in name or os.path.basename(name).startswith('._'):
+                    continue
+                by_clip[os.path.dirname(name)].append(name)
+            if not by_clip:
+                log(f'aihub61 zip skip source={source_path} reason=no_json_labels')
+            for clip_id in sorted(by_clip):
+                frames = []
+                for name in sorted(by_clip[clip_id]):
+                    try:
+                        data = json.loads(archive.read(name).decode('utf-8'))
+                    except Exception:
+                        continue
+                    frames.append((name, data))
+                if frames:
+                    yield clip_id, frames
+        return
+
+    if os.path.isdir(source_path):
+        for root, _dirs, files in os.walk(source_path):
+            json_names = [
+                name for name in files
+                if name.endswith('.json') and not name.startswith('._')
+            ]
+            if not json_names:
+                continue
+            clip_id = os.path.relpath(root, source_path).replace(os.sep, '/')
+            frames = []
+            for name in sorted(json_names):
+                path = os.path.join(root, name)
+                try:
+                    with open(path, 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                except Exception:
+                    continue
+                rel_name = os.path.relpath(path, source_path).replace(os.sep, '/')
+                frames.append((rel_name, data))
+            if frames:
+                yield clip_id, frames
+
+
+def _valid_local_zip_header_at(file, offset, file_size):
+    if offset < 0 or offset + 30 > file_size:
+        return False
+    here = file.tell()
+    try:
+        file.seek(offset)
+        if file.read(4) != b'PK\x03\x04':
+            return False
+        header = file.read(26)
+        if len(header) < 26:
+            return False
+        import struct
+
+        _version, _flag, method, _mtime, _mdate, _crc, _csize, _usize, name_len, extra_len = struct.unpack('<HHHHHIIIHH', header)
+        if method not in {0, 8} or name_len <= 0 or name_len > 4096:
+            return False
+        if offset + 30 + name_len + extra_len > file_size:
+            return False
+        raw_name = file.read(name_len)
+        return bool(raw_name and b'\x00' not in raw_name)
+    finally:
+        file.seek(here)
+
+
+def _find_next_local_zip_header(file, start_offset, file_size):
+    chunk_size = 1024 * 1024
+    overlap = b''
+    pos = start_offset
+    while pos < file_size:
+        file.seek(pos)
+        chunk = file.read(min(chunk_size, file_size - pos))
+        if not chunk:
+            break
+        data = overlap + chunk
+        search_from = 0
+        while True:
+            idx = data.find(b'PK\x03\x04', search_from)
+            if idx < 0:
+                break
+            candidate = pos - len(overlap) + idx
+            if candidate > start_offset and _valid_local_zip_header_at(file, candidate, file_size):
+                return candidate
+            search_from = idx + 1
+        if len(chunk) < chunk_size:
+            break
+        overlap = data[-3:]
+        pos += len(chunk)
+    return None
+
+
+def _local_zip_ply_index(source_path):
+    import struct
+
+    members = []
+    source_path = str(source_path or '')
+    try:
+        size = os.path.getsize(source_path)
+        with open(source_path, 'rb') as file:
+            while file.tell() + 30 <= size:
+                sig = file.read(4)
+                if sig != b'PK\x03\x04':
+                    break
+                header = file.read(26)
+                if len(header) < 26:
+                    break
+                _version, flag, method, _mtime, _mdate, _crc, csize, usize, name_len, extra_len = struct.unpack('<HHHHHIIIHH', header)
+                raw_name = file.read(name_len)
+                file.seek(extra_len, os.SEEK_CUR)
+                data_offset = file.tell()
+                try:
+                    name = raw_name.decode('utf-8' if flag & 0x800 else 'cp437', errors='replace')
+                except Exception:
+                    name = raw_name.decode('utf-8', errors='replace')
+                if csize > 0:
+                    data_size = int(csize)
+                    next_offset = data_offset + data_size
+                elif method == 0 and name.endswith('/'):
+                    data_size = 0
+                    next_offset = data_offset
+                else:
+                    found_next = _find_next_local_zip_header(file, data_offset, size)
+                    next_offset = found_next if found_next is not None else size
+                    data_size = max(0, int(next_offset - data_offset))
+                if name.lower().endswith('.ply') and method in {0, 8} and data_size > 0:
+                    members.append({
+                        'name': name,
+                        'offset': data_offset,
+                        'size': data_size,
+                        'compressed': method == 8,
+                    })
+                if next_offset <= data_offset:
+                    continue
+                file.seek(next_offset, os.SEEK_SET)
+    except Exception as exc:
+        log(f'aihub61 local-zip scan skip source={source_path} reason={type(exc).__name__}:{str(exc)[:140]}')
+    return members
+
+
+def _ply_clip_key(name):
+    directory = os.path.dirname(str(name or '')).replace('\\', '/')
+    stem = re.sub(r'\.ply$', '', os.path.basename(str(name or '')), flags=re.IGNORECASE)
+    stem = re.sub(r'_[0-9]+$', '', stem)
+    return f'{directory}/{stem}'.strip('/') or stem or 'unknown'
+
+
+def _evenly_spaced(items, limit):
+    items = list(items or [])
+    limit = int(limit or 0)
+    if limit <= 0 or len(items) <= limit:
+        return items
+    if limit == 1:
+        return [items[len(items) // 2]]
+    indexes = sorted({round(i * (len(items) - 1) / (limit - 1)) for i in range(limit)})
+    return [items[int(idx)] for idx in indexes]
+
+
+def _ply_bounds_from_bytes(raw, max_points=None):
+    max_points = int(max_points or env_int('POSTURE_AIHUB61_PLY_MAX_POINTS', 1200))
+    try:
+        text = raw.decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+    lines = text.splitlines()
+    vertex_count = 0
+    body_start = 0
+    for idx, line in enumerate(lines[:80]):
+        if line.startswith('element vertex'):
+            try:
+                vertex_count = int(line.split()[-1])
+            except Exception:
+                vertex_count = 0
+        if line.strip() == 'end_header':
+            body_start = idx + 1
+            break
+    body = lines[body_start:]
+    if not body:
+        return None
+    if vertex_count <= 0:
+        vertex_count = len(body)
+    stride = max(1, vertex_count // max(max_points, 1))
+    xs, ys, zs = [], [], []
+    for idx, line in enumerate(body[:vertex_count]):
+        if idx % stride:
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+        except Exception:
+            continue
+        xs.append(x)
+        ys.append(y)
+        zs.append(z)
+    if len(xs) < 20 or len(ys) < 20 or len(zs) < 20:
+        return None
+    return {
+        'x_min': min(xs), 'x_max': max(xs),
+        'y_min': min(ys), 'y_max': max(ys),
+        'z_min': min(zs), 'z_max': max(zs),
+        'n_points': len(xs),
+    }
+
+
+def _pseudo_keypoints_from_bbox(cx, y_top, w, h, conf=0.68):
+    def point(x, y):
+        return {'x': max(0.0, min(1.0, x)), 'y': max(0.0, min(1.0, y)), 'conf': conf}
+
+    left = cx - w * 0.24
+    right = cx + w * 0.24
+    hip_left = cx - w * 0.18
+    hip_right = cx + w * 0.18
+    knee_left = cx - w * 0.16
+    knee_right = cx + w * 0.16
+    ankle_left = cx - w * 0.14
+    ankle_right = cx + w * 0.14
+    y_shoulder = y_top + h * 0.22
+    y_elbow = y_top + h * 0.36
+    y_wrist = y_top + h * 0.48
+    y_hip = y_top + h * 0.54
+    y_knee = y_top + h * 0.75
+    y_ankle = y_top + h * 0.96
+    return [
+        point(cx, y_top + h * 0.04),
+        point(cx - w * 0.04, y_top + h * 0.03),
+        point(cx + w * 0.04, y_top + h * 0.03),
+        point(cx - w * 0.08, y_top + h * 0.05),
+        point(cx + w * 0.08, y_top + h * 0.05),
+        point(left, y_shoulder),
+        point(right, y_shoulder),
+        point(left - w * 0.08, y_elbow),
+        point(right + w * 0.08, y_elbow),
+        point(left - w * 0.10, y_wrist),
+        point(right + w * 0.10, y_wrist),
+        point(hip_left, y_hip),
+        point(hip_right, y_hip),
+        point(knee_left, y_knee),
+        point(knee_right, y_knee),
+        point(ankle_left, y_ankle),
+        point(ankle_right, y_ankle),
+    ]
+
+
+def _resample_ply_stats(stats_rows, target_frames):
+    stats_rows = list(stats_rows or [])
+    target_frames = int(target_frames or 0)
+    if len(stats_rows) < 2 or target_frames <= len(stats_rows):
+        return stats_rows
+
+    fields = ['x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max', 'n_points']
+    resampled = []
+    for idx in range(target_frames):
+        pos = idx * (len(stats_rows) - 1) / max(target_frames - 1, 1)
+        left = int(math.floor(pos))
+        right = min(left + 1, len(stats_rows) - 1)
+        frac = pos - left
+        row = {}
+        for field in fields:
+            start = float(stats_rows[left].get(field, 0.0) or 0.0)
+            end = float(stats_rows[right].get(field, start) or start)
+            row[field] = start + (end - start) * frac
+        resampled.append(row)
+    return resampled
+
+
+def _frames_from_ply_bounds(stats_rows):
+    if len(stats_rows) < 2:
+        return []
+    stats_rows = _resample_ply_stats(
+        stats_rows,
+        env_int('POSTURE_AIHUB61_PLY_RESAMPLED_FRAMES', 48),
+    )
+    x_range = max(row['x_max'] for row in stats_rows) - min(row['x_min'] for row in stats_rows)
+    z_range = max(row['z_max'] for row in stats_rows) - min(row['z_min'] for row in stats_rows)
+    axis = 'x' if x_range >= z_range else 'z'
+    a_min = min(row[f'{axis}_min'] for row in stats_rows)
+    a_max = max(row[f'{axis}_max'] for row in stats_rows)
+    y_min = min(row['y_min'] for row in stats_rows)
+    y_max = max(row['y_max'] for row in stats_rows)
+    a_span = max(1e-6, a_max - a_min)
+    y_span = max(1e-6, y_max - y_min)
+    frames = []
+    for idx, row in enumerate(stats_rows):
+        lo = row[f'{axis}_min']
+        hi = row[f'{axis}_max']
+        cx = ((lo + hi) / 2.0 - a_min) / a_span
+        w = max(0.02, min(1.0, (hi - lo) / a_span))
+        y_top = 1.0 - ((row['y_max'] - y_min) / y_span)
+        y_bottom = 1.0 - ((row['y_min'] - y_min) / y_span)
+        h = max(0.02, min(1.0, abs(y_bottom - y_top)))
+        cy = max(0.0, min(1.0, (y_top + y_bottom) / 2.0))
+        y_top = max(0.0, min(1.0, min(y_top, y_bottom)))
+        bbox = {
+            'cx': max(0.0, min(1.0, cx)),
+            'cy': cy,
+            'w': w,
+            'h': h,
+            'aspect_ratio': w / (h + 1e-9),
+            'area': w * h,
+            'conf': 0.72,
+        }
+        frames.append({
+            'frame_idx': idx,
+            'time_sec': idx / 10.0,
+            'bbox': bbox,
+            'keypoints': _pseudo_keypoints_from_bbox(bbox['cx'], y_top, w, h),
+        })
+    return frames
+
+
+def _iter_aihub61_clip_ply_timeseries(source_path):
+    source_path = str(source_path or '')
+    frames_per_clip = max(8, env_int('POSTURE_AIHUB61_PLY_FRAMES_PER_CLIP', 14))
+    grouped = defaultdict(list)
+    zip_archive = None
+    local_members = []
+
+    if os.path.isfile(source_path) and zipfile.is_zipfile(source_path):
+        try:
+            zip_archive = zipfile.ZipFile(source_path)
+            for name in zip_archive.namelist():
+                if name.lower().endswith('.ply') and '/._' not in name and not os.path.basename(name).startswith('._'):
+                    grouped[_ply_clip_key(name)].append({'name': name, 'source': 'zip'})
+        except Exception as exc:
+            log(f'aihub61 ply zip scan skip source={source_path} reason={type(exc).__name__}:{str(exc)[:140]}')
+            zip_archive = None
+    elif os.path.isfile(source_path):
+        local_members = _local_zip_ply_index(source_path)
+        for item in local_members:
+            grouped[_ply_clip_key(item['name'])].append({**item, 'source': 'local'})
+    elif os.path.isdir(source_path):
+        for root, _dirs, files in os.walk(source_path):
+            for file_name in files:
+                if not file_name.lower().endswith('.ply') or file_name.startswith('._'):
+                    continue
+                path = os.path.join(root, file_name)
+                rel = os.path.relpath(path, source_path).replace(os.sep, '/')
+                grouped[_ply_clip_key(rel)].append({'name': rel, 'path': path, 'source': 'file'})
+
+    if not grouped:
+        return
+    log(
+        f'aihub61 ply fallback source={source_path} '
+        f'clips={len(grouped)} frames_per_clip={frames_per_clip} '
+        f'resampled_frames={env_int("POSTURE_AIHUB61_PLY_RESAMPLED_FRAMES", 48)} '
+        f'local_members={len(local_members)}'
+    )
+
+    def read_member(item):
+        if item['source'] == 'zip' and zip_archive is not None:
+            return zip_archive.read(item['name'])
+        if item['source'] == 'local':
+            with open(source_path, 'rb') as file:
+                file.seek(int(item['offset']))
+                raw = file.read(int(item['size']))
+            if item.get('compressed'):
+                decompressor = zlib.decompressobj(-15)
+                return decompressor.decompress(raw) + decompressor.flush()
+            return raw
+        with open(item['path'], 'rb') as file:
+            return file.read()
+
+    try:
+        for clip_id in sorted(grouped):
+            selected = _evenly_spaced(sorted(grouped[clip_id], key=lambda row: row['name']), frames_per_clip)
+            stats_rows = []
+            for item in selected:
+                try:
+                    stats = _ply_bounds_from_bytes(read_member(item))
+                except Exception:
+                    stats = None
+                if stats is not None:
+                    stats_rows.append(stats)
+            timeseries = _frames_from_ply_bounds(stats_rows)
+            if timeseries:
+                yield clip_id, timeseries
+    finally:
+        if zip_archive is not None:
+            zip_archive.close()
+
+
+def _iter_aihub61_clip_timeseries(va, source_path):
+    yielded = False
+    for clip_id, frame_items in _iter_aihub61_clip_jsons(source_path):
+        timeseries = []
+        for frame_idx, (name, data) in enumerate(frame_items):
+            frame = _frame_from_aihub61_json(va, data, name, frame_idx)
+            if frame is not None:
+                timeseries.append(frame)
+        if timeseries:
+            yielded = True
+            yield clip_id, timeseries
+    if yielded:
+        return
+    for clip_id, timeseries in _iter_aihub61_clip_ply_timeseries(source_path):
+        yield clip_id, timeseries
+
+
 def _motion_score(window):
     return (
         float(window.get('center_dx_abs_mean', 0.0) or 0.0)
@@ -219,7 +709,9 @@ def select_sequence_windows(label, windows, windows_per_clip):
     ranked_motion = sorted(range(len(windows)), key=lambda idx: _motion_score(windows[idx]), reverse=True)
     ranked_steady = sorted(range(len(windows)), key=lambda idx: _steady_score(windows[idx]), reverse=True)
     anchors = [0, len(windows) // 2, len(windows) - 1]
-    if label in ('walk', 'run'):
+    if label == 'stand':
+        pools = [ranked_steady, anchors, ranked_motion[:1]]
+    elif label in ('walk', 'run'):
         pools = [ranked_motion, anchors, ranked_steady[:2]]
     elif label == 'sit':
         ranked_sit = sorted(range(len(windows)), key=lambda idx: _sit_score(windows[idx]), reverse=True)
@@ -243,67 +735,122 @@ def select_sequence_windows(label, windows, windows_per_clip):
     return selected[:windows_per_clip]
 
 
-def load_aihub61_sequence_rows(va, feature_cols, class_clip_limits=None, windows_per_clip=4):
-    limits = dict(class_clip_limits or {'walk': 180, 'run': 180, 'sit': 180, 'lie': 180})
+def load_hitl_posture_intake_rows(va, feature_cols, windows_per_clip=3):
+    intake_root = Path(va._training_dir())
     rows = []
     counts = Counter()
     clip_counts = Counter()
-    scanned_clips = Counter()
-    used_zips = []
-    for label, zip_path in va._aihub61_label_zip_paths():
-        if label not in limits or limits[label] <= 0:
+    skipped = []
+    used_files = []
+    video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    target_fps = max(2, env_int('POSTURE_HITL_TARGET_FPS', 6))
+    if not intake_root.exists():
+        return {
+            'rows': rows,
+            'counts': {},
+            'clip_counts': {},
+            'used_files': [],
+            'skipped': [],
+            'intake_root': str(intake_root),
+        }
+
+    for label in CLASSES:
+        class_dir = intake_root / label
+        if not class_dir.is_dir():
             continue
-        used_zips.append(zip_path)
-        log(f'aihub61 sequence scan label={label} zip={os.path.basename(zip_path)}')
-        with zipfile.ZipFile(zip_path) as archive:
-            by_clip = defaultdict(list)
-            for name in archive.namelist():
-                if not name.endswith('.json') or '/._' in name or os.path.basename(name).startswith('._'):
-                    continue
-                by_clip[os.path.dirname(name)].append(name)
-            for clip_id in sorted(by_clip):
-                if clip_counts[label] >= limits[label]:
-                    break
-                names = sorted(by_clip[clip_id])
-                scanned_clips[label] += 1
-                timeseries = []
-                for frame_idx, name in enumerate(names):
-                    try:
-                        data = json.loads(archive.read(name).decode('utf-8'))
-                    except Exception:
-                        continue
-                    frame = _frame_from_aihub61_json(va, data, name, frame_idx)
-                    if frame is not None:
-                        timeseries.append(frame)
-                if len(timeseries) < 8:
-                    continue
+        for path in sorted(class_dir.iterdir()):
+            if path.name.startswith('.') or path.suffix.lower() == '.json' or path.suffix.lower() not in video_exts:
+                continue
+            try:
+                extracted = va._extract_unified_timeseries(
+                    str(path),
+                    input_source='file',
+                    target_fps_override=target_fps,
+                )
                 windows = va._build_xg_feature_windows(
-                    timeseries,
-                    {'width': 1920, 'height': 1080, 'fps': 30.0},
+                    extracted.get('timeseries', []),
+                    extracted.get('vid_meta', {}),
                     window_sec=1.5,
-                    stride_sec=0.75,
+                    stride_sec=0.5,
                 )
                 if not windows:
+                    skipped.append({'video': path.name, 'class': label, 'reason': 'no valid windows'})
                     continue
                 selected = select_sequence_windows(label, windows, windows_per_clip)
-                for seq_idx, win_idx in enumerate(selected):
+                for win_idx in selected:
                     row = {
-                        'video': f'aihub61seq:{clip_id}:w{win_idx}',
+                        'video': f'hitl:{label}:{path.name}:w{win_idx}',
+                        'group_id': f'hitl:{label}:{path.stem}',
                         'posture': label,
-                        'source': 'external-aihub61-sequence',
+                        'source': 'hitl-posture-intake',
                     }
                     for col in feature_cols:
                         row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
                     rows.append(row)
                     counts[label] += 1
                 clip_counts[label] += 1
+                used_files.append(str(path))
+            except Exception as exc:
+                skipped.append({'video': path.name, 'class': label, 'reason': str(exc)})
+    return {
+        'rows': rows,
+        'counts': dict(counts),
+        'clip_counts': dict(clip_counts),
+        'used_files': used_files,
+        'skipped': skipped[:100],
+        'intake_root': str(intake_root),
+        'target_fps': target_fps,
+        'windows_per_clip': windows_per_clip,
+    }
+
+
+def load_aihub61_sequence_rows(va, feature_cols, class_clip_limits=None, windows_per_clip=4):
+    limits = dict(class_clip_limits or {'walk': 180, 'run': 180, 'sit': 180, 'lie': 180})
+    rows = []
+    counts = Counter()
+    clip_counts = Counter()
+    scanned_clips = Counter()
+    used_sources = []
+    for label, source_path in va._aihub61_label_zip_paths():
+        if label not in limits or limits[label] <= 0:
+            continue
+        if clip_counts[label] >= limits[label]:
+            continue
+        used_sources.append(source_path)
+        log(f'aihub61 sequence scan label={label} source={source_path}')
+        for clip_id, timeseries in _iter_aihub61_clip_timeseries(va, source_path):
+            if clip_counts[label] >= limits[label]:
+                break
+            scanned_clips[label] += 1
+            if len(timeseries) < 8:
+                continue
+            windows = va._build_xg_feature_windows(
+                timeseries,
+                {'width': 1920, 'height': 1080, 'fps': 30.0},
+                window_sec=1.5,
+                stride_sec=0.75,
+            )
+            if not windows:
+                continue
+            selected = select_sequence_windows(label, windows, windows_per_clip)
+            for seq_idx, win_idx in enumerate(selected):
+                row = {
+                    'video': f'aihub61seq:{clip_id}:w{win_idx}',
+                    'posture': label,
+                    'source': 'external-aihub61-sequence',
+                }
+                for col in feature_cols:
+                    row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
+                rows.append(row)
+                counts[label] += 1
+            clip_counts[label] += 1
         log(f'aihub61 sequence label={label} clips={clip_counts[label]} rows={counts[label]}')
     return {
         'rows': rows,
         'counts': dict(counts),
         'clip_counts': dict(clip_counts),
         'scanned_clips': dict(scanned_clips),
-        'zip_files': used_zips,
+        'zip_files': used_sources,
     }
 
 
@@ -347,8 +894,36 @@ def _apply_visible_bbox(frame, padding=0.035):
     return frame
 
 
-def _occlude_lower_body_frame(frame, mode):
+def _lower_random_severity(mode):
+    if 'mild' in mode:
+        return 'mild'
+    if 'severe' in mode:
+        return 'severe'
+    return 'moderate'
+
+
+def _occlude_lower_body_frame(frame, mode, seed_tag=''):
     item = _copy_frame(frame)
+    if mode.startswith('random_'):
+        severity = _lower_random_severity(mode)
+        lo, hi = LOWER_OCCLUSION_BOUNDARIES[severity]
+        frame_idx = int(float(item.get('frame_idx', 0) or 0))
+        clip_bucket = frame_idx // 8
+        boundary = lo + (hi - lo) * stable_unit(seed_tag, mode, clip_bucket)
+        soft_band = 0.08 if severity != 'severe' else 0.12
+        for idx, point in enumerate(item.get('keypoints') or []):
+            if idx not in LOWER_BODY_KP:
+                continue
+            y = float(point.get('y', 0.0) or 0.0)
+            if y >= boundary:
+                point['conf'] = 0.0
+            elif y >= max(0.0, boundary - soft_band):
+                fade = 0.20 + 0.35 * stable_unit(seed_tag, mode, frame_idx, idx)
+                point['conf'] = float(point.get('conf', 0.0) or 0.0) * fade
+        bbox = dict(item.get('bbox') or {})
+        bbox['conf'] = max(0.05, float(bbox.get('conf', 1.0) or 1.0) * {'mild': 0.88, 'moderate': 0.78, 'severe': 0.64}[severity])
+        item['bbox'] = bbox
+        return _apply_visible_bbox(item, padding=0.025)
     if mode == 'waist':
         hidden = LOWER_BODY_KP
         softened = {}
@@ -367,12 +942,44 @@ def _occlude_lower_body_frame(frame, mode):
     return _apply_visible_bbox(item)
 
 
-def _occlude_lower_body_timeseries(timeseries, mode):
-    return [_occlude_lower_body_frame(frame, mode) for frame in timeseries]
+def _occlude_lower_body_timeseries(timeseries, mode, seed_tag=''):
+    return [_occlude_lower_body_frame(frame, mode, seed_tag=seed_tag) for frame in timeseries]
 
 
-def _occlude_vertical_body_frame(frame, mode):
+def _vertical_side_and_severity(mode):
+    side = 'right' if str(mode).startswith('right') else 'left'
+    if 'mild' in mode:
+        severity = 'mild'
+    elif 'severe' in mode:
+        severity = 'severe'
+    else:
+        severity = 'moderate'
+    return side, severity
+
+
+def _occlude_vertical_body_frame(frame, mode, seed_tag=''):
     item = _copy_frame(frame)
+    if mode in RANDOM_VERTICAL_OCCLUSION_MODES:
+        side, severity = _vertical_side_and_severity(mode)
+        lo, hi = VERTICAL_OCCLUSION_EXTENTS[severity]
+        frame_idx = int(float(item.get('frame_idx', 0) or 0))
+        clip_bucket = frame_idx // 8
+        extent = lo + (hi - lo) * stable_unit(seed_tag, mode, clip_bucket)
+        boundary = extent if side == 'left' else 1.0 - extent
+        soft_band = 0.08 if severity != 'severe' else 0.12
+        for idx, point in enumerate(item.get('keypoints') or []):
+            x = float(point.get('x', 0.5) or 0.5)
+            hidden = x <= boundary if side == 'left' else x >= boundary
+            softened = (boundary < x <= boundary + soft_band) if side == 'left' else (boundary - soft_band <= x < boundary)
+            if hidden:
+                point['conf'] = 0.0
+            elif softened:
+                fade = 0.25 + 0.40 * stable_unit(seed_tag, mode, frame_idx, idx)
+                point['conf'] = float(point.get('conf', 0.0) or 0.0) * fade
+        bbox = dict(item.get('bbox') or {})
+        bbox['conf'] = max(0.05, float(bbox.get('conf', 1.0) or 1.0) * {'mild': 0.86, 'moderate': 0.72, 'severe': 0.58}[severity])
+        item['bbox'] = bbox
+        return _apply_visible_bbox(item, padding=0.02)
     if mode == 'left':
         hidden = LEFT_BODY_KP
         softened = {6: 0.70, 8: 0.75, 10: 0.80, 12: 0.70, 14: 0.75, 16: 0.80}
@@ -390,158 +997,142 @@ def _occlude_vertical_body_frame(frame, mode):
     return _apply_visible_bbox(item, padding=0.025)
 
 
-def _occlude_vertical_body_timeseries(timeseries, mode):
-    return [_occlude_vertical_body_frame(frame, mode) for frame in timeseries]
+def _occlude_vertical_body_timeseries(timeseries, mode, seed_tag=''):
+    return [_occlude_vertical_body_frame(frame, mode, seed_tag=seed_tag) for frame in timeseries]
 
 
 def load_aihub61_lower_occlusion_sequence_rows(va, feature_cols, class_clip_limits=None, windows_per_clip=2, modes=None):
     limits = dict(class_clip_limits or {'walk': 48, 'run': 48, 'sit': 48, 'lie': 48})
-    selected_modes = [mode for mode in (modes or LOWER_OCCLUSION_MODES) if mode in LOWER_OCCLUSION_MODES]
+    allowed_modes = LOWER_OCCLUSION_MODES + RANDOM_LOWER_OCCLUSION_MODES
+    default_modes = parse_modes(
+        os.environ.get('POSTURE_SYNTH_LOWER_OCCLUSION_MODES', 'waist,thigh,knee,random_mild,random_moderate,random_severe'),
+        LOWER_OCCLUSION_MODES + RANDOM_LOWER_OCCLUSION_MODES,
+        allowed_modes,
+    )
+    selected_modes = parse_modes(','.join(modes or []), default_modes, allowed_modes) if modes else default_modes
     rows = []
     counts = Counter()
     clip_counts = Counter()
     scanned_clips = Counter()
-    used_zips = []
-    for label, zip_path in va._aihub61_label_zip_paths():
+    used_sources = []
+    for label, source_path in va._aihub61_label_zip_paths():
         if label not in limits or limits[label] <= 0:
             continue
-        used_zips.append(zip_path)
-        log(f'aihub61 lower-occlusion scan label={label} zip={os.path.basename(zip_path)} modes={",".join(selected_modes)}')
-        with zipfile.ZipFile(zip_path) as archive:
-            by_clip = defaultdict(list)
-            for name in archive.namelist():
-                if not name.endswith('.json') or '/._' in name or os.path.basename(name).startswith('._'):
-                    continue
-                by_clip[os.path.dirname(name)].append(name)
-            for clip_id in sorted(by_clip):
-                if clip_counts[label] >= limits[label]:
-                    break
-                names = sorted(by_clip[clip_id])
-                scanned_clips[label] += 1
-                timeseries = []
-                for frame_idx, name in enumerate(names):
-                    try:
-                        data = json.loads(archive.read(name).decode('utf-8'))
-                    except Exception:
-                        continue
-                    frame = _frame_from_aihub61_json(va, data, name, frame_idx)
-                    if frame is not None:
-                        timeseries.append(frame)
-                if len(timeseries) < 8:
-                    continue
+        if clip_counts[label] >= limits[label]:
+            continue
+        used_sources.append(source_path)
+        log(f'aihub61 lower-occlusion scan label={label} source={source_path} modes={",".join(selected_modes)}')
+        for clip_id, timeseries in _iter_aihub61_clip_timeseries(va, source_path):
+            if clip_counts[label] >= limits[label]:
+                break
+            scanned_clips[label] += 1
+            if len(timeseries) < 8:
+                continue
 
-                accepted = False
-                for mode in selected_modes:
-                    occluded = _occlude_lower_body_timeseries(timeseries, mode)
-                    windows = va._build_xg_feature_windows(
-                        occluded,
-                        {'width': 1920, 'height': 1080, 'fps': 30.0},
-                        window_sec=1.5,
-                        stride_sec=0.75,
-                    )
-                    if not windows:
-                        continue
-                    selected = select_sequence_windows(label, windows, windows_per_clip)
-                    for seq_idx, win_idx in enumerate(selected):
-                        row = {
-                            'video': f'aihub61occ:{mode}:{clip_id}:w{win_idx}',
-                            'posture': label,
-                            'source': 'external-aihub61-lower-occlusion',
-                            'augmentation': f'lower_body_{mode}_occlusion',
-                        }
-                        for col in feature_cols:
-                            row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
-                        rows.append(row)
-                        counts[label] += 1
-                    accepted = accepted or bool(selected)
-                if accepted:
-                    clip_counts[label] += 1
+            accepted = False
+            for mode in selected_modes:
+                occluded = _occlude_lower_body_timeseries(timeseries, mode, seed_tag=clip_id)
+                windows = va._build_xg_feature_windows(
+                    occluded,
+                    {'width': 1920, 'height': 1080, 'fps': 30.0},
+                    window_sec=1.5,
+                    stride_sec=0.75,
+                )
+                if not windows:
+                    continue
+                selected = select_sequence_windows(label, windows, windows_per_clip)
+                for seq_idx, win_idx in enumerate(selected):
+                    row = {
+                        'video': f'aihub61occ:{mode}:{clip_id}:w{win_idx}',
+                        'posture': label,
+                        'source': 'external-aihub61-lower-occlusion',
+                        'augmentation': f'lower_body_{mode}_occlusion',
+                    }
+                    for col in feature_cols:
+                        row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
+                    rows.append(row)
+                    counts[label] += 1
+                accepted = accepted or bool(selected)
+            if accepted:
+                clip_counts[label] += 1
         log(f'aihub61 lower-occlusion label={label} clips={clip_counts[label]} rows={counts[label]}')
     return {
         'rows': rows,
         'counts': dict(counts),
         'clip_counts': dict(clip_counts),
         'scanned_clips': dict(scanned_clips),
-        'zip_files': used_zips,
+        'zip_files': used_sources,
         'modes': selected_modes,
     }
 
 
 def load_aihub61_vertical_occlusion_sequence_rows(va, feature_cols, class_clip_limits=None, windows_per_clip=2, modes=None):
     limits = dict(class_clip_limits or {'walk': 36, 'run': 36, 'sit': 36, 'lie': 36})
-    selected_modes = [mode for mode in (modes or VERTICAL_OCCLUSION_MODES) if mode in VERTICAL_OCCLUSION_MODES]
+    allowed_modes = VERTICAL_OCCLUSION_MODES + RANDOM_VERTICAL_OCCLUSION_MODES
+    default_modes = parse_modes(
+        os.environ.get('POSTURE_SYNTH_VERTICAL_OCCLUSION_MODES', 'left,right,left_mild,left_moderate,left_severe,right_mild,right_moderate,right_severe'),
+        VERTICAL_OCCLUSION_MODES + RANDOM_VERTICAL_OCCLUSION_MODES,
+        allowed_modes,
+    )
+    selected_modes = parse_modes(','.join(modes or []), default_modes, allowed_modes) if modes else default_modes
     rows = []
     counts = Counter()
     clip_counts = Counter()
     scanned_clips = Counter()
-    used_zips = []
-    for label, zip_path in va._aihub61_label_zip_paths():
+    used_sources = []
+    for label, source_path in va._aihub61_label_zip_paths():
         if label not in limits or limits[label] <= 0:
             continue
-        used_zips.append(zip_path)
-        log(f'aihub61 vertical-occlusion scan label={label} zip={os.path.basename(zip_path)} modes={",".join(selected_modes)}')
-        with zipfile.ZipFile(zip_path) as archive:
-            by_clip = defaultdict(list)
-            for name in archive.namelist():
-                if not name.endswith('.json') or '/._' in name or os.path.basename(name).startswith('._'):
-                    continue
-                by_clip[os.path.dirname(name)].append(name)
-            for clip_id in sorted(by_clip):
-                if clip_counts[label] >= limits[label]:
-                    break
-                names = sorted(by_clip[clip_id])
-                scanned_clips[label] += 1
-                timeseries = []
-                for frame_idx, name in enumerate(names):
-                    try:
-                        data = json.loads(archive.read(name).decode('utf-8'))
-                    except Exception:
-                        continue
-                    frame = _frame_from_aihub61_json(va, data, name, frame_idx)
-                    if frame is not None:
-                        timeseries.append(frame)
-                if len(timeseries) < 8:
-                    continue
+        if clip_counts[label] >= limits[label]:
+            continue
+        used_sources.append(source_path)
+        log(f'aihub61 vertical-occlusion scan label={label} source={source_path} modes={",".join(selected_modes)}')
+        for clip_id, timeseries in _iter_aihub61_clip_timeseries(va, source_path):
+            if clip_counts[label] >= limits[label]:
+                break
+            scanned_clips[label] += 1
+            if len(timeseries) < 8:
+                continue
 
-                accepted = False
-                for mode in selected_modes:
-                    occluded = _occlude_vertical_body_timeseries(timeseries, mode)
-                    windows = va._build_xg_feature_windows(
-                        occluded,
-                        {'width': 1920, 'height': 1080, 'fps': 30.0},
-                        window_sec=1.5,
-                        stride_sec=0.75,
-                    )
-                    if not windows:
-                        continue
-                    selected = select_sequence_windows(label, windows, windows_per_clip)
-                    for seq_idx, win_idx in enumerate(selected):
-                        row = {
-                            'video': f'aihub61vertocc:{mode}:{clip_id}:w{win_idx}',
-                            'posture': label,
-                            'source': 'external-aihub61-vertical-occlusion',
-                            'augmentation': f'vertical_body_{mode}_occlusion',
-                        }
-                        for col in feature_cols:
-                            row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
-                        rows.append(row)
-                        counts[label] += 1
-                    accepted = accepted or bool(selected)
-                if accepted:
-                    clip_counts[label] += 1
+            accepted = False
+            for mode in selected_modes:
+                occluded = _occlude_vertical_body_timeseries(timeseries, mode, seed_tag=clip_id)
+                windows = va._build_xg_feature_windows(
+                    occluded,
+                    {'width': 1920, 'height': 1080, 'fps': 30.0},
+                    window_sec=1.5,
+                    stride_sec=0.75,
+                )
+                if not windows:
+                    continue
+                selected = select_sequence_windows(label, windows, windows_per_clip)
+                for seq_idx, win_idx in enumerate(selected):
+                    row = {
+                        'video': f'aihub61vertocc:{mode}:{clip_id}:w{win_idx}',
+                        'posture': label,
+                        'source': 'external-aihub61-vertical-occlusion',
+                        'augmentation': f'vertical_body_{mode}_occlusion',
+                    }
+                    for col in feature_cols:
+                        row[col] = float(windows[win_idx].get(col, 0.0) or 0.0)
+                    rows.append(row)
+                    counts[label] += 1
+                accepted = accepted or bool(selected)
+            if accepted:
+                clip_counts[label] += 1
         log(f'aihub61 vertical-occlusion label={label} clips={clip_counts[label]} rows={counts[label]}')
     return {
         'rows': rows,
         'counts': dict(counts),
         'clip_counts': dict(clip_counts),
         'scanned_clips': dict(scanned_clips),
-        'zip_files': used_zips,
+        'zip_files': used_sources,
         'modes': selected_modes,
     }
 
 
 def build_static_lower_occlusion_rows(static_rows, feature_cols, class_limits=None):
-    limits = dict(class_limits or {'stand': 180, 'sit': 120, 'lie': 120})
+    limits = dict(class_limits or {'stand': 180, 'walk': 60, 'sit': 120, 'lie': 120})
     counts = Counter()
     rows = []
     for row in static_rows:
@@ -595,10 +1186,14 @@ def build_static_lower_occlusion_rows(static_rows, feature_cols, class_limits=No
 
 
 def build_static_vertical_occlusion_rows(static_rows, feature_cols, class_limits=None, modes=None):
-    limits = dict(class_limits or {'stand': 140, 'sit': 100, 'lie': 100})
-    selected_modes = [mode for mode in (modes or VERTICAL_OCCLUSION_MODES) if mode in VERTICAL_OCCLUSION_MODES]
-    if not selected_modes:
-        selected_modes = list(VERTICAL_OCCLUSION_MODES)
+    limits = dict(class_limits or {'stand': 140, 'walk': 60, 'sit': 100, 'lie': 100})
+    allowed_modes = VERTICAL_OCCLUSION_MODES + RANDOM_VERTICAL_OCCLUSION_MODES
+    default_modes = parse_modes(
+        os.environ.get('POSTURE_SYNTH_STATIC_VERTICAL_OCCLUSION_MODES', 'left,right,left_mild,left_moderate,left_severe,right_mild,right_moderate,right_severe'),
+        ['left', 'right', 'left_mild', 'left_moderate', 'left_severe', 'right_mild', 'right_moderate', 'right_severe'],
+        allowed_modes,
+    )
+    selected_modes = parse_modes(','.join(modes or []), default_modes, allowed_modes) if modes else default_modes
     counts = Counter()
     rows = []
     width_cols = [
@@ -656,6 +1251,59 @@ def build_static_vertical_occlusion_rows(static_rows, feature_cols, class_limits
         counts[label] += 1
     log(f'static vertical-body occlusion rows loaded={len(rows)} counts={dict(counts)} modes={selected_modes}')
     return {'rows': rows, 'counts': dict(counts), 'modes': selected_modes}
+
+
+def build_static_walk_motion_prior_rows(static_rows, feature_cols, class_limit=90):
+    """Recover walk signal when 71461 only provides isolated action-labelled frames."""
+    variants = [
+        ('slow_walk_prior', 0.050, 0.14, 0.035, 0.32),
+        ('normal_walk_prior', 0.075, 0.21, 0.052, 0.50),
+        ('occluded_walk_prior', 0.042, 0.12, 0.030, 0.26),
+    ]
+    rows = []
+    counts = Counter()
+    limit = int(class_limit or 0)
+    if limit <= 0:
+        return {'rows': rows, 'counts': {}}
+    for row in static_rows:
+        label = str(row.get('posture') or '').strip()
+        if label != 'walk':
+            continue
+        for variant, center_dx, center_span, speed_std, gait_score in variants:
+            if counts['walk'] >= limit:
+                break
+            out = dict(row)
+            out['video'] = f"staticwalkprior:{variant}:{counts['walk']}:{row.get('video', '')}"
+            out['source'] = 'external-static-walk-motion-prior'
+            out['augmentation'] = variant
+            out['group_id'] = infer_group_id(row)
+            for col in feature_cols:
+                out[col] = float(out.get(col, 0.0) or 0.0)
+
+            out['stillness'] = min(float(out.get('stillness', 1.0) or 1.0), 0.38)
+            out['center_dx_abs_mean'] = max(float(out.get('center_dx_abs_mean', 0.0) or 0.0), center_dx)
+            out['center_x_span'] = max(float(out.get('center_x_span', 0.0) or 0.0), center_span)
+            out['speed_std'] = max(float(out.get('speed_std', 0.0) or 0.0), speed_std)
+            out['upper_body_motion'] = max(float(out.get('upper_body_motion', 0.0) or 0.0), center_dx * 0.55)
+            out['horizontal_motion_energy'] = max(float(out.get('horizontal_motion_energy', 0.0) or 0.0), center_span * 1.1)
+            out['vertical_motion_energy'] = max(float(out.get('vertical_motion_energy', 0.0) or 0.0), speed_std * 0.55)
+            out['total_motion_energy'] = max(float(out.get('total_motion_energy', 0.0) or 0.0), center_span * 1.25)
+            out['gait_dynamic_score'] = max(float(out.get('gait_dynamic_score', 0.0) or 0.0), gait_score)
+            out['run_stride_score'] = min(max(float(out.get('run_stride_score', 0.0) or 0.0), gait_score * 0.28), 0.18)
+            out['dynamic_pose_ratio'] = max(float(out.get('dynamic_pose_ratio', 0.0) or 0.0), 0.34)
+            out['step_period_est'] = max(float(out.get('step_period_est', 0.0) or 0.0), 0.42)
+            out['knee_angle_cycle_strength'] = max(float(out.get('knee_angle_cycle_strength', 0.0) or 0.0), 0.24)
+            out['pre_descent_stillness'] = min(float(out.get('pre_descent_stillness', 1.0) or 1.0), 0.40)
+            out['post_descent_stillness'] = min(float(out.get('post_descent_stillness', 1.0) or 1.0), 0.42)
+            if 'upright_geometry_score' in out:
+                out['upright_geometry_score'] = max(float(out.get('upright_geometry_score', 0.0) or 0.0), 0.58)
+            for col in ['lie_geometry_score', 'flatness_score', 'horizontal_pose_score', 'horizontal_flat_pose_score', 'low_flat_still_score']:
+                if col in out:
+                    out[col] = float(out.get(col, 0.0) or 0.0) * 0.35
+            rows.append(out)
+            counts['walk'] += 1
+    log(f'static walk motion-prior rows loaded={len(rows)} counts={dict(counts)}')
+    return {'rows': rows, 'counts': dict(counts)}
 
 
 AIHUB62_ACTION_TO_LABEL = {
@@ -1105,6 +1753,224 @@ def load_lower_body_occlusion_rows(va, feature_cols, manifest_path=None, class_c
     }
 
 
+def _iter_video_files(root, labels, limit_per_label):
+    exts = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+    root = Path(root)
+    for label in labels:
+        label_dir = root / label
+        if not label_dir.is_dir():
+            continue
+        count = 0
+        for path in sorted(label_dir.iterdir()):
+            if path.suffix.lower() not in exts:
+                continue
+            yield label, path
+            count += 1
+            if limit_per_label > 0 and count >= limit_per_label:
+                break
+
+
+def _predict_posture_windows(model_bundle, windows, feature_cols, min_conf):
+    import numpy as np
+
+    if not windows:
+        return []
+    model = model_bundle.get('model') if isinstance(model_bundle, dict) else model_bundle
+    model_cols = list((model_bundle or {}).get('feature_cols') or feature_cols) if isinstance(model_bundle, dict) else list(feature_cols)
+    classes = list((model_bundle or {}).get('classes') or CLASSES) if isinstance(model_bundle, dict) else list(CLASSES)
+    if model is None or not hasattr(model, 'predict_proba'):
+        return []
+    X = []
+    for window in windows:
+        X.append([float(window.get(col, 0.0) or 0.0) for col in model_cols])
+    try:
+        probs = model.predict_proba(np.asarray(X, dtype=float))
+    except Exception:
+        return []
+    out = []
+    for idx, row in enumerate(np.asarray(probs)):
+        pred_i = int(row.argmax())
+        if pred_i < 0 or pred_i >= len(classes):
+            continue
+        label = str(classes[pred_i])
+        conf = float(row[pred_i])
+        if label in CLASSES and conf >= min_conf:
+            out.append({'window_idx': idx, 'label': label, 'confidence': conf})
+    return out
+
+
+def load_rf_intake_pseudo_occlusion_rows(va, feature_cols, class_limits=None, windows_per_clip=2):
+    """Emergency recovery path: self-train occlusion hard cases from registered RF videos.
+
+    These rows are explicitly marked as pseudo-labelled because the RF intake only has
+    Y/N labels. We keep only windows that the active XG-Posture model predicts with
+    high confidence, then apply lower-body and side occlusion to the same time-series.
+    """
+    root = Path(os.environ.get('POSTURE_RF_INTAKE_ROOT', '/mnt/data/wiz/storage/training/fall-detection/intake'))
+    labels = [item.strip() for item in os.environ.get('POSTURE_RF_INTAKE_SOURCE_LABELS', 'N,Y').split(',') if item.strip()]
+    limit_per_label = env_int('POSTURE_RF_INTAKE_SOURCE_LIMIT', 80)
+    pseudo_conf = float(os.environ.get('POSTURE_RF_INTAKE_PSEUDO_CONF', '0.88') or 0.88)
+    fps = float(os.environ.get('POSTURE_RF_INTAKE_FPS', '4') or 4)
+    max_frames = env_int('POSTURE_RF_INTAKE_MAX_FRAMES', 28)
+    limits = dict(class_limits or {c: env_int('POSTURE_RF_INTAKE_PSEUDO_CLASS_LIMIT', 160) for c in CLASSES})
+    lower_modes = parse_modes(
+        os.environ.get('POSTURE_RF_INTAKE_LOWER_MODES', 'random_mild,random_moderate,random_severe'),
+        RANDOM_LOWER_OCCLUSION_MODES,
+        LOWER_OCCLUSION_MODES + RANDOM_LOWER_OCCLUSION_MODES,
+    )
+    vertical_modes = parse_modes(
+        os.environ.get('POSTURE_RF_INTAKE_VERTICAL_MODES', 'left_mild,left_moderate,left_severe,right_mild,right_moderate,right_severe'),
+        RANDOM_VERTICAL_OCCLUSION_MODES,
+        VERTICAL_OCCLUSION_MODES + RANDOM_VERTICAL_OCCLUSION_MODES,
+    )
+
+    rows = []
+    counts = Counter()
+    clip_counts = Counter()
+    scanned = Counter()
+    skipped = []
+    attempted = Counter()
+    try:
+        posture_model = va._get_xg_posture_model()
+    except Exception as exc:
+        return {
+            'rows': rows,
+            'counts': {},
+            'clip_counts': {},
+            'scanned_clips': {},
+            'skipped': [{'reason': f'posture_model_unavailable:{type(exc).__name__}:{str(exc)[:120]}'}],
+            'source_root': str(root),
+            'modes': {'lower': lower_modes, 'vertical': vertical_modes},
+        }
+
+    log(
+        'rf-intake pseudo occlusion source '
+        f'root={root} labels={labels} source_limit={limit_per_label} '
+        f'class_limits={limits} pseudo_conf={pseudo_conf} fps={fps} max_frames={max_frames}'
+    )
+    for yn_label, video_path in _iter_video_files(root, labels, limit_per_label):
+        if all(counts.get(c, 0) >= limits.get(c, 0) for c in CLASSES):
+            break
+        attempted[yn_label] += 1
+        total_attempted = sum(attempted.values())
+        if total_attempted == 1 or total_attempted % 20 == 0:
+            log(
+                'rf-intake pseudo occlusion progress '
+                f'attempted={dict(attempted)} accepted_clips={dict(clip_counts)} '
+                f'rows={len(rows)} class_counts={dict(counts)} current={video_path.name}'
+            )
+        try:
+            extracted = va._extract_unified_timeseries(
+                str(video_path),
+                input_source='upload',
+                target_fps_override=fps,
+                max_frames_override=max_frames,
+            )
+            timeseries = extracted.get('timeseries') or []
+            vid_meta = extracted.get('vid_meta') or {'width': 1920, 'height': 1080, 'fps': 30.0}
+            if len(timeseries) < 8:
+                skipped.append({'path': str(video_path), 'reason': 'short_timeseries'})
+                continue
+            base_windows = va._build_xg_feature_windows(timeseries, vid_meta, window_sec=1.5, stride_sec=0.75)
+            pseudo_windows = _predict_posture_windows(posture_model, base_windows, feature_cols, pseudo_conf)
+            if not pseudo_windows:
+                skipped.append({'path': str(video_path), 'reason': 'no_high_conf_pseudo_windows'})
+                continue
+            scanned[yn_label] += 1
+
+            accepted_for_video = False
+            lower_cache = {}
+            vertical_cache = {}
+            for item in pseudo_windows:
+                label = item['label']
+                if counts[label] >= limits.get(label, 0):
+                    continue
+                win_idx = int(item['window_idx'])
+                group = f'rfintake-pseudo:{video_path.stem}:w{win_idx}'
+                if os.environ.get('POSTURE_RF_INTAKE_INCLUDE_BASE', '1') == '1':
+                    row = {
+                        'video': f'rfintakepseudo:{yn_label}:{video_path.stem}:w{win_idx}',
+                        'posture': label,
+                        'source': 'rf-intake-pseudo-posture',
+                        'augmentation': 'none_pseudo_base',
+                        'group_id': group,
+                        'pseudo_label_confidence': float(item['confidence']),
+                    }
+                    for col in feature_cols:
+                        row[col] = float(base_windows[win_idx].get(col, 0.0) or 0.0)
+                    rows.append(row)
+
+                for mode in lower_modes:
+                    if mode not in lower_cache:
+                        occluded = _occlude_lower_body_timeseries(timeseries, mode, seed_tag=video_path.stem)
+                        lower_cache[mode] = va._build_xg_feature_windows(occluded, vid_meta, window_sec=1.5, stride_sec=0.75)
+                    occ_windows = lower_cache.get(mode) or []
+                    if win_idx >= len(occ_windows):
+                        continue
+                    row = {
+                        'video': f'rfintakepseudoocc:{mode}:{yn_label}:{video_path.stem}:w{win_idx}',
+                        'posture': label,
+                        'source': 'rf-intake-pseudo-lower-occlusion',
+                        'augmentation': f'pseudo_lower_body_{mode}_occlusion',
+                        'group_id': group,
+                        'pseudo_label_confidence': float(item['confidence']),
+                    }
+                    for col in feature_cols:
+                        row[col] = float(occ_windows[win_idx].get(col, 0.0) or 0.0)
+                    rows.append(row)
+                    counts[label] += 1
+                    accepted_for_video = True
+                    if counts[label] >= limits.get(label, 0):
+                        break
+
+                if counts[label] >= limits.get(label, 0):
+                    continue
+                for mode in vertical_modes:
+                    if mode not in vertical_cache:
+                        occluded = _occlude_vertical_body_timeseries(timeseries, mode, seed_tag=video_path.stem)
+                        vertical_cache[mode] = va._build_xg_feature_windows(occluded, vid_meta, window_sec=1.5, stride_sec=0.75)
+                    occ_windows = vertical_cache.get(mode) or []
+                    if win_idx >= len(occ_windows):
+                        continue
+                    row = {
+                        'video': f'rfintakepseudovertocc:{mode}:{yn_label}:{video_path.stem}:w{win_idx}',
+                        'posture': label,
+                        'source': 'rf-intake-pseudo-vertical-occlusion',
+                        'augmentation': f'pseudo_vertical_body_{mode}_occlusion',
+                        'group_id': group,
+                        'pseudo_label_confidence': float(item['confidence']),
+                    }
+                    for col in feature_cols:
+                        row[col] = float(occ_windows[win_idx].get(col, 0.0) or 0.0)
+                    rows.append(row)
+                    counts[label] += 1
+                    accepted_for_video = True
+                    if counts[label] >= limits.get(label, 0):
+                        break
+            if accepted_for_video:
+                clip_counts[yn_label] += 1
+                if sum(clip_counts.values()) == 1 or sum(clip_counts.values()) % 10 == 0:
+                    log(
+                        'rf-intake pseudo occlusion accepted '
+                        f'accepted_clips={dict(clip_counts)} rows={len(rows)} '
+                        f'class_counts={dict(counts)}'
+                    )
+        except Exception as exc:
+            skipped.append({'path': str(video_path), 'reason': f'{type(exc).__name__}:{str(exc)[:140]}'})
+
+    log(f"rf-intake pseudo occlusion rows loaded={len(rows)} counts={dict(counts)} clip_counts={dict(clip_counts)} skipped={len(skipped)}")
+    return {
+        'rows': rows,
+        'counts': dict(counts),
+        'clip_counts': dict(clip_counts),
+        'scanned_clips': dict(scanned),
+        'skipped': skipped[:100],
+        'source_root': str(root),
+        'pseudo_confidence_min': pseudo_conf,
+        'modes': {'lower': lower_modes, 'vertical': vertical_modes},
+    }
+
+
 def candidate_models(n_classes):
     from xgboost import XGBClassifier
     models = {
@@ -1129,6 +1995,13 @@ def candidate_models(n_classes):
             min_child_weight=3, subsample=0.92, colsample_bytree=0.76,
             reg_alpha=0.18, reg_lambda=2.8,
         ),
+        'xgb_motion_interactions': XGBClassifier(
+            n_estimators=260, max_depth=4, learning_rate=0.032,
+            objective='multi:softprob', num_class=n_classes,
+            eval_metric='mlogloss', random_state=137, n_jobs=2,
+            min_child_weight=4, subsample=0.86, colsample_bytree=0.68,
+            reg_alpha=0.20, reg_lambda=3.0,
+        ),
     }
     if os.environ.get('POSTURE_INCLUDE_HGB') == '1':
         from sklearn.ensemble import HistGradientBoostingClassifier
@@ -1145,6 +2018,16 @@ def candidate_models(n_classes):
         models['extra_trees_balanced'] = ExtraTreesClassifier(
             n_estimators=260, max_depth=None, min_samples_leaf=2,
             max_features=0.72, class_weight='balanced', random_state=42,
+            n_jobs=2,
+        )
+        models['extra_trees_motion_breakthrough'] = ExtraTreesClassifier(
+            n_estimators=360, max_depth=None, min_samples_leaf=1,
+            max_features=0.58, class_weight='balanced', random_state=137,
+            n_jobs=2,
+        )
+        models['extra_trees_boundary_stable'] = ExtraTreesClassifier(
+            n_estimators=320, max_depth=None, min_samples_leaf=3,
+            max_features=0.64, class_weight='balanced', random_state=173,
             n_jobs=2,
         )
         models['rf_balanced'] = RandomForestClassifier(
@@ -1164,9 +2047,43 @@ def candidate_models(n_classes):
     return models
 
 
+def expand_proba_to_class_count(proba, class_labels, n_classes, n_rows=None):
+    import numpy as np
+
+    arr = np.asarray(proba, dtype=float)
+    if arr.ndim == 1:
+        rows = int(n_rows or len(arr))
+        arr = arr.reshape(rows, -1)
+    if arr.ndim != 2:
+        rows = int(n_rows or arr.shape[0])
+        arr = arr.reshape(rows, -1)
+    if arr.shape[1] == int(n_classes):
+        return arr
+
+    rows = int(n_rows or arr.shape[0])
+    full = np.zeros((rows, int(n_classes)), dtype=float)
+    for col_idx, class_idx in enumerate(list(class_labels)[:arr.shape[1]]):
+        try:
+            class_idx = int(class_idx)
+        except Exception:
+            continue
+        if 0 <= class_idx < int(n_classes):
+            full[:, class_idx] = arr[:, col_idx]
+    return full
+
+
+def expand_proba_to_all_classes(proba, class_labels, n_rows=None):
+    return expand_proba_to_class_count(proba, class_labels, len(CLASSES), n_rows=n_rows)
+
+
 def feature_sets(all_cols):
     temporal = {
         'center_dy', 'center_dx_abs_mean', 'center_x_span', 'max_down_speed',
+        'center_x_net_displacement', 'center_y_net_displacement',
+        'center_x_direction_change_ratio', 'center_y_direction_change_ratio',
+        'center_path_efficiency', 'height_change_abs_mean', 'height_change_std',
+        'pose_height_delta', 'torso_tilt_delta', 'knee_bend_delta',
+        'lower_body_visibility_min', 'lower_body_visibility_std',
         'pose_descent_mean', 'pose_descent_max', 'pose_change_mean', 'pose_change_max',
         'descent_duration', 'oscillation_count', 'speed_std', 'post_descent_stillness',
         'time_to_max_down_speed', 'time_from_peak_to_stillness', 'pre_descent_stillness',
@@ -1189,8 +2106,14 @@ def feature_sets(all_cols):
     }
     occlusion_core = {
         'lower_body_visibility', 'upper_body_motion', 'shoulder_width',
+        'lower_body_visibility_min', 'lower_body_visibility_std',
         'hip_width', 'wrist_width', 'shoulder_hip_ratio', 'wrist_shoulder_ratio',
         'elbow_bend_mean', 'arm_extension_ratio', 'body_compactness',
+        'upper_body_temporal_motion', 'upper_motion_energy',
+        'upper_center_x_span', 'upper_center_dx_abs_mean',
+        'upper_center_y_std', 'upper_center_dy_abs_mean',
+        'shoulder_center_x_span', 'shoulder_center_dx_abs_mean',
+        'shoulder_center_y_std', 'occluded_upper_motion_score',
         'pose_tilt_mean', 'pose_tilt_max', 'pose_height_ratio_mean',
         'pose_height_ratio_min', 'upright_geometry_score', 'sit_geometry_score',
         'lie_geometry_score', 'flatness_score', 'horizontal_pose_score',
@@ -1202,6 +2125,8 @@ def feature_sets(all_cols):
         'pose_tilt_mean', 'pose_tilt_max', 'pose_height_ratio_mean', 'pose_height_ratio_min',
         'pose_knee_bend_mean', 'pose_knee_bend_min', 'pose_knee_support_mean',
         'pose_knee_support_min', 'straight_leg_ratio', 'support_leg_ratio',
+        'pose_height_delta', 'torso_tilt_delta', 'knee_bend_delta',
+        'lower_body_visibility_min', 'lower_body_visibility_std',
         'bent_leg_ratio', 'pose_spread_mean', 'pose_spread_max', 'shoulder_width',
         'hip_width', 'ankle_width', 'wrist_width', 'knee_width', 'foot_y_diff',
         'shoulder_hip_ratio', 'ankle_hip_ratio', 'wrist_shoulder_ratio',
@@ -1213,6 +2138,10 @@ def feature_sets(all_cols):
     }
     behavior_scores = {
         'horizontal_motion_energy', 'vertical_motion_energy', 'total_motion_energy',
+        'upper_motion_energy', 'body_translation_signal', 'weak_body_translation_signal',
+        'walk_displacement_signal', 'gait_translation_consistency',
+        'occluded_upper_motion_score', 'upright_motion_conflict_score',
+        'sit_lie_transition_score',
         'gait_dynamic_score', 'run_stride_score', 'sit_geometry_score',
         'lie_geometry_score', 'upright_geometry_score', 'knee_bend_intensity',
         'stationary_bent_score', 'flatness_score', 'support_stability_score',
@@ -1220,9 +2149,33 @@ def feature_sets(all_cols):
         'floor_height_ratio', 'horizontal_pose_score', 'lie_stand_separation_score',
         'standing_skeleton_score', 'lying_skeleton_score', 'sitting_skeleton_score',
     }
+    upper_body_motion = {
+        'upper_body_motion', 'upper_body_temporal_motion', 'upper_motion_energy',
+        'upper_center_x_span', 'upper_center_dx_abs_mean',
+        'upper_center_y_std', 'upper_center_dy_abs_mean',
+        'shoulder_center_x_span', 'shoulder_center_dx_abs_mean',
+        'shoulder_center_y_std', 'shoulder_width', 'wrist_width',
+        'shoulder_hip_ratio', 'wrist_shoulder_ratio', 'elbow_bend_mean',
+        'arm_extension_ratio', 'torso_verticality', 'torso_tilt_delta',
+        'torso_tilt_std', 'body_translation_signal', 'weak_body_translation_signal',
+        'walk_displacement_signal', 'occluded_upper_motion_score',
+    }
+    motion_breakthrough = (
+        temporal
+        | behavior_scores
+        | upper_body_motion
+        | posture_geometry
+        | {
+            'height_ratio', 'aspect_change', 'stillness', 'floor_proximity',
+            'area_change', 'vert_horiz_ratio', 'avg_conf',
+        }
+    )
     all_cols = [c for c in all_cols if c != 'n_points']
     return {
+        'full': all_cols,
         'all_runtime_64': all_cols,
+        'geometry_motion': [c for c in all_cols if c in motion_breakthrough],
+        'motion_breakthrough': [c for c in all_cols if c in motion_breakthrough],
         'legacy_runtime_82': [c for c in all_cols if c not in pose3d_proxy],
         'occlusion_aware': [
             c for c in all_cols
@@ -1246,6 +2199,7 @@ def feature_sets(all_cols):
             c for c in all_cols
             if c in temporal
             or c in behavior_scores
+            or c in upper_body_motion
             or c in {
                 'shoulder_width', 'wrist_width', 'shoulder_hip_ratio', 'wrist_shoulder_ratio',
                 'elbow_bend_mean', 'arm_extension_ratio', 'upper_body_aspect',
@@ -1273,20 +2227,34 @@ def feature_sets(all_cols):
     }
 
 
-def sequence_group_policy(pred, avg_probs, feature_avg):
-    stand_i = CLASSES.index('stand')
-    walk_i = CLASSES.index('walk')
-    run_i = CLASSES.index('run')
-    sit_i = CLASSES.index('sit')
-    lie_i = CLASSES.index('lie')
-    if pred not in (stand_i, sit_i):
+def _class_index(class_names, name):
+    try:
+        return list(class_names).index(name)
+    except ValueError:
+        return None
+
+
+def sequence_group_policy(pred, avg_probs, feature_avg, class_names=None):
+    class_names = list(class_names or CLASSES)
+    stand_i = _class_index(class_names, 'stand')
+    sit_i = _class_index(class_names, 'sit')
+    lie_i = _class_index(class_names, 'lie')
+    if lie_i is None:
+        return pred
+    if pred not in {idx for idx in (stand_i, sit_i) if idx is not None}:
         return pred
 
-    lie_prob = float(avg_probs[lie_i])
-    stand_prob = float(avg_probs[stand_i])
-    sit_prob = float(avg_probs[sit_i])
-    walk_prob = float(avg_probs[walk_i])
-    run_prob = float(avg_probs[run_i])
+    def prob(name):
+        idx = _class_index(class_names, name)
+        if idx is None or idx >= len(avg_probs):
+            return 0.0
+        return float(avg_probs[idx])
+
+    lie_prob = prob('lie')
+    stand_prob = prob('stand')
+    sit_prob = prob('sit')
+    walk_prob = prob('walk')
+    run_prob = prob('run')
     low_motion = (
         float(feature_avg.get('center_dx_abs_mean', 0.0)) <= 0.055
         and float(feature_avg.get('speed_std', 0.0)) <= 0.035
@@ -1307,17 +2275,29 @@ def sequence_group_policy(pred, avg_probs, feature_avg):
         float(feature_avg.get('upright_geometry_score', 0.0)) <= 0.58
         or float(feature_avg.get('vert_horiz_ratio', 0.0)) <= 1.20
     )
-    no_gait = walk_prob < 0.22 and run_prob < 0.18
-    close_lie_probability = lie_prob >= max(stand_prob, sit_prob) - 0.16
-    if lie_prob >= 0.12 and close_lie_probability and lie_geometry and not_upright and low_motion and no_gait:
+    no_gait = (
+        walk_prob < env_float('POSTURE_POLICY_MAX_WALK_PROB', 0.22)
+        and run_prob < env_float('POSTURE_POLICY_MAX_RUN_PROB', 0.18)
+    )
+    close_lie_probability = lie_prob >= max(stand_prob, sit_prob) - env_float('POSTURE_POLICY_LIE_CLOSE_MARGIN', 0.16)
+    if (
+        lie_prob >= env_float('POSTURE_POLICY_LIE_PROB_MIN', 0.12)
+        and close_lie_probability
+        and lie_geometry
+        and not_upright
+        and low_motion
+        and no_gait
+    ):
         return lie_i
     return pred
 
 
-def sequence_group_metrics(df, y, groups, proba):
+def sequence_group_metrics(df, y, groups, proba, class_names=None):
     import numpy as np
     from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 
+    class_names = list(class_names or CLASSES)
+    labels = list(range(len(class_names)))
     feature_names = [
         'center_dx_abs_mean', 'speed_std', 'vert_horiz_ratio',
         'lie_geometry_score', 'flatness_score', 'upright_geometry_score',
@@ -1344,19 +2324,19 @@ def sequence_group_metrics(df, y, groups, proba):
                 feature_avg[name] = float(df.iloc[indexes][name].astype(float).mean())
             else:
                 feature_avg[name] = 0.0
-        policy_pred = sequence_group_policy(pred, avg_probs, feature_avg)
+        policy_pred = sequence_group_policy(pred, avg_probs, feature_avg, class_names=class_names)
         adjusted += int(policy_pred != pred)
         y_true.append(true_label)
         y_pred.append(policy_pred)
 
-    report = classification_report(y_true, y_pred, target_names=CLASSES, output_dict=True, zero_division=0)
+    report = classification_report(y_true, y_pred, labels=labels, target_names=class_names, output_dict=True, zero_division=0)
     return {
         'accuracy': round(float(accuracy_score(y_true, y_pred)), 4),
-        'f1_macro': round(float(f1_score(y_true, y_pred, average='macro', zero_division=0)), 4),
-        'class_recall': {c: round(float(report[c]['recall']), 4) for c in CLASSES},
-        'class_precision': {c: round(float(report[c]['precision']), 4) for c in CLASSES},
-        'class_f1': {c: round(float(report[c]['f1-score']), 4) for c in CLASSES},
-        'confusion_matrix': confusion_matrix(y_true, y_pred, labels=list(range(len(CLASSES)))).tolist(),
+        'f1_macro': round(float(f1_score(y_true, y_pred, labels=labels, average='macro', zero_division=0)), 4),
+        'class_recall': {c: round(float(report[c]['recall']), 4) for c in class_names},
+        'class_precision': {c: round(float(report[c]['precision']), 4) for c in class_names},
+        'class_f1': {c: round(float(report[c]['f1-score']), 4) for c in class_names},
+        'confusion_matrix': confusion_matrix(y_true, y_pred, labels=labels).tolist(),
         'groups': int(len(y_true)),
         'policy_adjusted_groups': int(adjusted),
     }
@@ -1455,6 +2435,11 @@ def sync_xg_posture_project_assets():
         src = persistent_root / name
         dst = project_root / name
         if src.exists():
+            try:
+                if src.resolve() == dst.resolve():
+                    continue
+            except FileNotFoundError:
+                pass
             shutil.copy2(src, dst)
 
 
@@ -1474,7 +2459,7 @@ def main():
     log('load AI-Hub 71461 static rows for stand/sit/lie boundary coverage')
     va._EXTERNAL_POSE_CLASS_LIMITS = {
         'stand': env_int('POSTURE_STATIC_STAND_LIMIT', 500),
-        'walk': env_int('POSTURE_STATIC_WALK_LIMIT', 0),
+        'walk': env_int('POSTURE_STATIC_WALK_LIMIT', 120),
         'sit': env_int('POSTURE_STATIC_SIT_LIMIT', 300),
         'lie': env_int('POSTURE_STATIC_LIE_LIMIT', 300),
     }
@@ -1488,14 +2473,30 @@ def main():
     static_rows = list(static_external.get('rows') or [])
     log(f"static rows loaded={len(static_rows)} counts={static_external.get('counts', {})}")
 
+    static_walk_motion_external = {'rows': [], 'counts': {}}
+    if os.environ.get('POSTURE_INCLUDE_STATIC_WALK_MOTION_PRIOR', '1') == '1':
+        walk_prior_limit = env_int('POSTURE_STATIC_WALK_MOTION_PRIOR_LIMIT', 90)
+        static_walk_motion_external = build_static_walk_motion_prior_rows(
+            static_rows,
+            all_feature_cols,
+            class_limit=walk_prior_limit,
+        )
+    static_walk_motion_rows = list(static_walk_motion_external.get('rows') or [])
+    static_rows_for_occlusion = static_rows + static_walk_motion_rows
+
     static_occ_external = {'rows': [], 'counts': {}}
     if os.environ.get('POSTURE_INCLUDE_SYNTH_LOWER_OCCLUSION', '0') == '1':
         static_occ_limit = int(os.environ.get('POSTURE_SYNTH_STATIC_OCC_LIMIT', '160') or 160)
         log(f'build static lower-body occlusion rows limit_per_class={static_occ_limit}')
         static_occ_external = build_static_lower_occlusion_rows(
-            static_rows,
+            static_rows_for_occlusion,
             all_feature_cols,
-            class_limits={'stand': static_occ_limit, 'sit': static_occ_limit, 'lie': static_occ_limit},
+            class_limits={
+                'stand': env_int('POSTURE_SYNTH_STATIC_OCC_STAND_LIMIT', static_occ_limit),
+                'walk': env_int('POSTURE_SYNTH_STATIC_OCC_WALK_LIMIT', static_occ_limit),
+                'sit': env_int('POSTURE_SYNTH_STATIC_OCC_SIT_LIMIT', static_occ_limit),
+                'lie': env_int('POSTURE_SYNTH_STATIC_OCC_LIE_LIMIT', static_occ_limit),
+            },
         )
     static_occ_rows = list(static_occ_external.get('rows') or [])
 
@@ -1504,9 +2505,14 @@ def main():
         static_vertical_limit = int(os.environ.get('POSTURE_SYNTH_STATIC_VERTICAL_OCC_LIMIT', '120') or 120)
         log(f'build static vertical-body occlusion rows limit_per_class={static_vertical_limit}')
         static_vertical_occ_external = build_static_vertical_occlusion_rows(
-            static_rows,
+            static_rows_for_occlusion,
             all_feature_cols,
-            class_limits={'stand': static_vertical_limit, 'sit': static_vertical_limit, 'lie': static_vertical_limit},
+            class_limits={
+                'stand': env_int('POSTURE_SYNTH_STATIC_VERTICAL_OCC_STAND_LIMIT', static_vertical_limit),
+                'walk': env_int('POSTURE_SYNTH_STATIC_VERTICAL_OCC_WALK_LIMIT', static_vertical_limit),
+                'sit': env_int('POSTURE_SYNTH_STATIC_VERTICAL_OCC_SIT_LIMIT', static_vertical_limit),
+                'lie': env_int('POSTURE_SYNTH_STATIC_VERTICAL_OCC_LIE_LIMIT', static_vertical_limit),
+            },
         )
     static_vertical_occ_rows = list(static_vertical_occ_external.get('rows') or [])
 
@@ -1610,8 +2616,34 @@ def main():
     lower_occ_rows = list(lower_occ_external.get('rows') or [])
     log(f"lower-body occlusion rows loaded={len(lower_occ_rows)} counts={lower_occ_external.get('counts', {})} clip_counts={lower_occ_external.get('clip_counts', {})}")
 
+    rf_pseudo_occ_external = {'rows': [], 'counts': {}, 'clip_counts': {}, 'scanned_clips': {}, 'skipped': [], 'modes': {}}
+    if os.environ.get('POSTURE_INCLUDE_RF_INTAKE_PSEUDO_OCCLUSION', '0') == '1':
+        pseudo_limit = int(os.environ.get('POSTURE_RF_INTAKE_PSEUDO_CLASS_LIMIT', '160') or 160)
+        log(f'build RF intake pseudo posture occlusion rows limit_per_class={pseudo_limit}')
+        rf_pseudo_occ_external = load_rf_intake_pseudo_occlusion_rows(
+            va,
+            all_feature_cols,
+            class_limits={
+                c: env_int(f'POSTURE_RF_INTAKE_PSEUDO_{c.upper()}_LIMIT', pseudo_limit)
+                for c in CLASSES
+            },
+            windows_per_clip=env_int('POSTURE_RF_INTAKE_PSEUDO_WINDOWS_PER_CLIP', 2),
+        )
+    rf_pseudo_occ_rows = list(rf_pseudo_occ_external.get('rows') or [])
+    log(f"rf-intake pseudo occlusion rows loaded={len(rf_pseudo_occ_rows)} counts={rf_pseudo_occ_external.get('counts', {})} clip_counts={rf_pseudo_occ_external.get('clip_counts', {})}")
+
+    log('load dashboard HITL posture intake rows')
+    hitl_posture_intake = load_hitl_posture_intake_rows(
+        va,
+        all_feature_cols,
+        windows_per_clip=env_int('POSTURE_HITL_WINDOWS_PER_CLIP', 3),
+    )
+    hitl_rows = list(hitl_posture_intake.get('rows') or [])
+    log(f"hitl posture intake rows loaded={len(hitl_rows)} counts={hitl_posture_intake.get('counts', {})} clip_counts={hitl_posture_intake.get('clip_counts', {})}")
+
     rows = (
         static_rows
+        + static_walk_motion_rows
         + static_occ_rows
         + static_vertical_occ_rows
         + seq_rows
@@ -1620,19 +2652,72 @@ def main():
         + seq62_rows
         + seq62_raw_rows
         + lower_occ_rows
+        + rf_pseudo_occ_rows
+        + hitl_rows
     )
+    if not rows:
+        log('no posture training rows were loaded; wait for AI-Hub 61/62/71461 or HITL/occlusion intake data before training')
+        return 2
     df = pd.DataFrame(rows)
+    if 'posture' not in df.columns:
+        log(f"loaded posture rows are missing required 'posture' column; columns={list(df.columns)}")
+        return 2
     df = df[df['posture'].isin(CLASSES)].copy()
+    if df.empty:
+        log(f'no valid posture rows remain after class filter; expected classes={CLASSES}')
+        return 2
+    loaded_class_dist = {c: int((df['posture'] == c).sum()) for c in CLASSES}
+    requested_classes = [
+        item.strip()
+        for item in os.environ.get('POSTURE_ACTIVE_CLASSES', '').split(',')
+        if item.strip()
+    ]
+    active_classes = [c for c in CLASSES if (not requested_classes or c in requested_classes)]
+    if not active_classes:
+        active_classes = list(CLASSES)
+    dropped_classes = []
+    if env_bool('POSTURE_ALLOW_MISSING_RUN', True) and 'run' in active_classes and loaded_class_dist.get('run', 0) <= 0:
+        active_classes.remove('run')
+        dropped_classes.append({
+            'class': 'run',
+            'reason': 'no run posture/action-labelled rows available; POSTURE_ALLOW_MISSING_RUN=1',
+        })
+    if env_bool('POSTURE_AUTO_DROP_EMPTY_CLASSES', False):
+        remaining = []
+        for cls in active_classes:
+            if loaded_class_dist.get(cls, 0) > 0:
+                remaining.append(cls)
+            else:
+                dropped_classes.append({
+                    'class': cls,
+                    'reason': 'no labelled rows available; POSTURE_AUTO_DROP_EMPTY_CLASSES=1',
+                })
+        active_classes = remaining
+    if len(active_classes) < 2:
+        log(f'not enough active posture classes for training active_classes={active_classes} loaded_class_dist={loaded_class_dist}')
+        return 2
+    if dropped_classes:
+        log(f'active posture classes={active_classes}; dropped={dropped_classes}')
+    df = df[df['posture'].isin(active_classes)].copy()
+    if df.empty:
+        log(f'no valid posture rows remain after active class filter; active_classes={active_classes}')
+        return 2
     df['group_id'] = [infer_group_id(row) for row in df.to_dict('records')]
-    class_dist = {c: int((df['posture'] == c).sum()) for c in CLASSES}
+    class_dist = {c: int((df['posture'] == c).sum()) for c in active_classes}
+    full_class_dist = {c: int((df['posture'] == c).sum()) for c in CLASSES}
     group_counts = df.groupby('posture')['group_id'].nunique().to_dict()
     source_counts = df.groupby(['posture', 'source']).size().to_dict()
-    log(f'training table rows={len(df)} class_dist={class_dist} group_counts={group_counts}')
+    log(f'training table rows={len(df)} active_classes={active_classes} class_dist={class_dist} loaded_class_dist={loaded_class_dist} group_counts={group_counts}')
 
-    class_to_int = {c: i for i, c in enumerate(CLASSES)}
+    class_to_int = {c: i for i, c in enumerate(active_classes)}
     y = df['posture'].map(class_to_int).to_numpy()
     groups = df['group_id'].to_numpy()
+    class_weight_multipliers = parse_class_weight_multipliers(active_classes)
+    log(f'class weight multipliers={class_weight_multipliers}')
     n_splits = min(5, min(group_counts.values()))
+    if n_splits < 2:
+        log(f'not enough groups per active class for StratifiedGroupKFold active_classes={active_classes} group_counts={group_counts}')
+        return 2
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     trials = []
@@ -1647,8 +2732,13 @@ def main():
             continue
         cols = [c for c in cols if c in df.columns]
         X = df[cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
-        weights = compute_sample_weight(class_weight='balanced', y=y)
-        models = candidate_models(len(CLASSES))
+        weights = apply_class_weight_multipliers(
+            compute_sample_weight(class_weight='balanced', y=y),
+            y,
+            active_classes,
+            class_weight_multipliers,
+        )
+        models = candidate_models(len(active_classes))
         if not models:
             raise RuntimeError('No candidate models selected. Check POSTURE_MODEL_FILTER.')
         for model_name, model in models.items():
@@ -1658,36 +2748,44 @@ def main():
                 oof_probs = cross_val_predict(model, X, y, cv=cv, groups=groups, params=params, method='predict_proba')
             else:
                 oof_probs = cross_val_predict(model, X, y, cv=cv, groups=groups, method='predict_proba')
+            oof_probs = expand_proba_to_class_count(oof_probs, sorted(np.unique(y)), len(active_classes), n_rows=len(y))
             y_oof = np.asarray(oof_probs).argmax(axis=1).flatten().astype(int)
-            report = classification_report(y, y_oof, target_names=CLASSES, output_dict=True, zero_division=0)
-            recalls = {c: round(float(report[c]['recall']), 4) for c in CLASSES}
-            precision = {c: round(float(report[c]['precision']), 4) for c in CLASSES}
-            f1s = {c: round(float(report[c]['f1-score']), 4) for c in CLASSES}
-            seq_metrics = sequence_group_metrics(df, y, groups, np.asarray(oof_probs))
+            active_labels = list(range(len(active_classes)))
+            report = classification_report(y, y_oof, labels=active_labels, target_names=active_classes, output_dict=True, zero_division=0)
+            recalls = {c: round(float(report[c]['recall']), 4) for c in active_classes}
+            precision = {c: round(float(report[c]['precision']), 4) for c in active_classes}
+            f1s = {c: round(float(report[c]['f1-score']), 4) for c in active_classes}
+            seq_metrics = sequence_group_metrics(df, y, groups, np.asarray(oof_probs), class_names=active_classes)
             trial = {
                 'feature_set': feature_set_name,
                 'model': model_name,
                 'feature_count': len(cols),
                 'accuracy': round(float(accuracy_score(y, y_oof)), 4),
-                'f1_macro': round(float(f1_score(y, y_oof, average='macro', zero_division=0)), 4),
+                'f1_macro': round(float(f1_score(y, y_oof, labels=active_labels, average='macro', zero_division=0)), 4),
                 'class_recall': recalls,
                 'class_precision': precision,
                 'class_f1': f1s,
-                'confusion_matrix': confusion_matrix(y, y_oof, labels=list(range(len(CLASSES)))).tolist(),
+                'confusion_matrix': confusion_matrix(y, y_oof, labels=active_labels).tolist(),
                 'sequence_group_cv': seq_metrics,
                 'features': cols,
+                'active_classes': list(active_classes),
+                'dropped_classes': list(dropped_classes),
+                'class_weight_multipliers': dict(class_weight_multipliers),
             }
-            boundary_score = (
-                recalls.get('walk', 0.0) + recalls.get('run', 0.0)
-                + recalls.get('sit', 0.0) + recalls.get('lie', 0.0)
-            ) / 4.0
+            boundary_members = [c for c in ('walk', 'run', 'sit', 'lie') if c in active_classes]
+            boundary_score = sum(recalls.get(c, 0.0) for c in boundary_members) / max(1, len(boundary_members))
             min_recall = min(recalls.values()) if recalls else 0.0
-            weak_class_score = (
-                recalls.get('sit', 0.0) * 0.45
-                + recalls.get('lie', 0.0) * 0.20
-                + precision.get('run', 0.0) * 0.20
-                + recalls.get('walk', 0.0) * 0.15
-            )
+            weak_terms = []
+            if 'sit' in active_classes:
+                weak_terms.append((recalls.get('sit', 0.0), 0.45))
+            if 'lie' in active_classes:
+                weak_terms.append((recalls.get('lie', 0.0), 0.20))
+            if 'run' in active_classes:
+                weak_terms.append((precision.get('run', 0.0), 0.20))
+            if 'walk' in active_classes:
+                weak_terms.append((recalls.get('walk', 0.0), 0.15))
+            weak_weight = sum(weight for _score, weight in weak_terms) or 1.0
+            weak_class_score = sum(score * weight for score, weight in weak_terms) / weak_weight
             composite_score = (
                 seq_metrics['f1_macro'] * 0.35
                 + seq_metrics['accuracy'] * 0.20
@@ -1713,21 +2811,40 @@ def main():
     def save_occlusion_aux_candidate(reason):
         if os.environ.get('POSTURE_SAVE_OCCLUSION_AUX', '0') != '1':
             return {'ready': False, 'reason': 'POSTURE_SAVE_OCCLUSION_AUX disabled'}
-        occlusion_row_count = len(static_occ_rows) + len(static_vertical_occ_rows) + len(seq_occ_rows) + len(seq_vertical_occ_rows) + len(lower_occ_rows)
+        occlusion_row_count = (
+            len(static_occ_rows)
+            + len(static_vertical_occ_rows)
+            + len(seq_occ_rows)
+            + len(seq_vertical_occ_rows)
+            + len(lower_occ_rows)
+            + len(rf_pseudo_occ_rows)
+        )
         if occlusion_row_count <= 0:
             return {'ready': False, 'reason': 'no occlusion rows in this run'}
+        trigger_policy = {
+            'lower_body_visibility_lt': float(os.environ.get('POSTURE_OCC_AUX_LOWER_VIS_LT', '0.42') or 0.42),
+            'avg_conf_lt': float(os.environ.get('POSTURE_OCC_AUX_AVG_CONF_LT', '0.38') or 0.38),
+            'main_margin_lt': float(os.environ.get('POSTURE_OCC_AUX_MARGIN_LT', '0.07') or 0.07),
+            'side_body_width_suspected': True,
+        }
 
         log(f"fit body-occlusion auxiliary feature_set={best['feature_set']} model={best_name} rows={len(df)} occlusion_rows={occlusion_row_count}")
         X_aux = df[best_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
-        aux_weights = compute_sample_weight(class_weight='balanced', y=y)
-        aux_model = candidate_models(len(CLASSES))[best_name]
+        aux_weights = apply_class_weight_multipliers(
+            compute_sample_weight(class_weight='balanced', y=y),
+            y,
+            active_classes,
+            class_weight_multipliers,
+        )
+        aux_model = candidate_models(len(active_classes))[best_name]
         if best_name.startswith('xgb'):
             aux_model.fit(X_aux, y, sample_weight=aux_weights)
         else:
             aux_model.fit(X_aux, y)
 
         y_aux = np.asarray(aux_model.predict(X_aux)).flatten().astype(int)
-        aux_train_report = classification_report(y, y_aux, target_names=CLASSES, output_dict=True, zero_division=0)
+        active_labels = list(range(len(active_classes)))
+        aux_train_report = classification_report(y, y_aux, labels=active_labels, target_names=active_classes, output_dict=True, zero_division=0)
         aux_feature_importance = {}
         if hasattr(aux_model, 'feature_importances_'):
             aux_feature_importance = {
@@ -1746,11 +2863,16 @@ def main():
             'feature_set': best['feature_set'],
             'features': list(best_cols),
             'feature_count': len(best_cols),
-            'classes': CLASSES,
-            'n_classes': len(CLASSES),
+            'classes': list(active_classes),
+            'base_class_order': list(CLASSES),
+            'active_classes': list(active_classes),
+            'dropped_classes': list(dropped_classes),
+            'n_classes': len(active_classes),
             'n_windows': int(len(df)),
             'occlusion_training_windows': int(occlusion_row_count),
             'class_distribution': class_dist,
+            'loaded_class_distribution': loaded_class_dist,
+            'full_class_distribution': full_class_dist,
             'group_distribution': {k: int(v) for k, v in group_counts.items()},
             'source_distribution': {str(k): int(v) for k, v in source_counts.items()},
             'group_cv': {
@@ -1768,16 +2890,18 @@ def main():
                 **(best.get('sequence_group_cv') or {}),
             },
             'confusion_matrix': {
-                'labels': CLASSES,
+                'labels': list(active_classes),
                 'matrix': best['confusion_matrix'],
             },
             'train_metrics': {
                 'accuracy': round(float(accuracy_score(y, y_aux)), 4),
-                'f1_macro': round(float(f1_score(y, y_aux, average='macro', zero_division=0)), 4),
-                'class_recall': {c: round(float(aux_train_report[c]['recall']), 4) for c in CLASSES},
+                'f1_macro': round(float(f1_score(y, y_aux, labels=active_labels, average='macro', zero_division=0)), 4),
+                'class_recall': {c: round(float(aux_train_report[c]['recall']), 4) for c in active_classes},
             },
             'feature_importance': aux_feature_importance,
+            'trigger_policy': trigger_policy,
             'external_pose_dataset': {
+                'static_walk_motion_prior_counts': static_walk_motion_external.get('counts', {}),
                 'static_lower_occlusion_counts': static_occ_external.get('counts', {}),
                 'static_vertical_occlusion_counts': static_vertical_occ_external.get('counts', {}),
                 'static_vertical_occlusion_modes': static_vertical_occ_external.get('modes', []),
@@ -1789,20 +2913,21 @@ def main():
                 'synthetic_vertical_occlusion_modes': seq_vertical_occ_external.get('modes', []),
                 'lower_body_occlusion_counts': lower_occ_external.get('counts', {}),
                 'lower_body_occlusion_clip_counts': lower_occ_external.get('clip_counts', {}),
+                'rf_intake_pseudo_occlusion_counts': rf_pseudo_occ_external.get('counts', {}),
+                'rf_intake_pseudo_occlusion_clip_counts': rf_pseudo_occ_external.get('clip_counts', {}),
+                'rf_intake_pseudo_occlusion_scanned_clips': rf_pseudo_occ_external.get('scanned_clips', {}),
+                'rf_intake_pseudo_occlusion_modes': rf_pseudo_occ_external.get('modes', {}),
+                'rf_intake_pseudo_label_note': 'RF-Fall Y/N intake has no ground-truth posture class; these emergency rows use high-confidence active XG-Posture pseudo labels.',
             },
         }
         aux_model_data = {
             'model': aux_model,
-            'classes': CLASSES,
+            'classes': list(active_classes),
+            'base_class_order': list(CLASSES),
             'feature_cols': list(best_cols),
             'auxiliary': True,
             'purpose': aux_summary['purpose'],
-            'trigger_policy': {
-                'lower_body_visibility_lt': 0.42,
-                'avg_conf_lt': 0.38,
-                'main_margin_lt': 0.07,
-                'side_body_width_suspected': True,
-            },
+            'trigger_policy': trigger_policy,
         }
 
         persistent_dir = Path('/opt/app/storage/training/fall-detection/xg-posture-occlusion-aux')
@@ -1811,6 +2936,82 @@ def main():
         project_dir.mkdir(parents=True, exist_ok=True)
         model_path = persistent_dir / 'xg_posture_occlusion_aux_model.pkl'
         summary_path = persistent_dir / 'training_summary.json'
+
+        def copy_if_distinct(src, dst):
+            src = Path(src)
+            dst = Path(dst)
+            try:
+                if dst.exists() and os.path.samefile(src, dst):
+                    return
+            except Exception:
+                pass
+            if os.path.abspath(src) == os.path.abspath(dst):
+                return
+            shutil.copy2(src, dst)
+
+        def occlusion_aux_version_index(summary):
+            if not isinstance(summary, dict):
+                return 0
+            raw = ' '.join(
+                str(summary.get(key) or '')
+                for key in ('model_version', 'version_badge', 'training_run_label', 'run_id')
+            )
+            found = re.findall(r'(?:^|\D)v?(\d+)(?:\D|$)', raw)
+            if not found:
+                return 0
+            try:
+                return max(int(value) for value in found)
+            except Exception:
+                return 0
+
+        existing_aux = {}
+        existing_aux_f1 = 0.0
+        if summary_path.exists():
+            try:
+                existing_aux = json.loads(summary_path.read_text(encoding='utf-8'))
+                existing_aux_f1 = float(((existing_aux.get('group_cv') or {}).get('f1_macro')) or 0.0)
+            except Exception:
+                existing_aux = {}
+                existing_aux_f1 = 0.0
+        next_version_index = max(1, occlusion_aux_version_index(existing_aux) + 1)
+        next_version_badge = f'v{next_version_index}'
+        candidate_run_id = datetime.datetime.now(datetime.timezone.utc).strftime('occlusion_aux_%Y%m%d%H%M%S')
+        aux_summary.update({
+            'model_family': 'xg-posture-occlusion-aux',
+            'candidate_model_version': next_version_badge,
+            'candidate_run_id': candidate_run_id,
+        })
+        min_save_f1 = float(os.environ.get('POSTURE_OCC_AUX_MIN_SAVE_F1', '0.0') or 0.0)
+        should_skip_aux_save = (
+            (existing_aux_f1 > 0.0 and best['f1_macro'] < existing_aux_f1)
+            or (min_save_f1 > 0.0 and best['f1_macro'] < min_save_f1)
+        )
+        if should_skip_aux_save:
+            aux_summary.update({
+                'ready': False,
+                'saved': False,
+                'reason': (
+                    f'skipped save: candidate f1_macro={best["f1_macro"]:.4f}, '
+                    f'existing auxiliary f1_macro={existing_aux_f1:.4f}, '
+                    f'min_save_f1={min_save_f1:.4f}'
+                ),
+                'existing_aux_f1_macro': existing_aux_f1,
+                'min_save_f1': min_save_f1,
+            })
+            log(aux_summary['reason'])
+            return aux_summary
+        aux_summary.update({
+            'model_version': next_version_badge,
+            'version_badge': next_version_badge,
+            'training_run_label': f'가림 보조 {next_version_badge}',
+            'run_id': candidate_run_id,
+        })
+        aux_model_data.update({
+            'model_version': next_version_badge,
+            'version_badge': next_version_badge,
+            'training_run_label': aux_summary['training_run_label'],
+            'run_id': candidate_run_id,
+        })
         fd, tmp_path = tempfile.mkstemp(suffix='.pkl.tmp', dir=str(persistent_dir))
         os.close(fd)
         try:
@@ -1821,15 +3022,20 @@ def main():
                 os.unlink(tmp_path)
             raise
         summary_path.write_text(json.dumps(aux_summary, ensure_ascii=False, indent=2), encoding='utf-8')
-        shutil.copy2(model_path, project_dir / model_path.name)
-        shutil.copy2(summary_path, project_dir / summary_path.name)
+        copy_if_distinct(model_path, project_dir / model_path.name)
+        copy_if_distinct(summary_path, project_dir / summary_path.name)
         aux_summary['model_path'] = str(model_path)
         aux_summary['summary_path'] = str(summary_path)
         log(f"body occlusion auxiliary saved model={model_path} summary={summary_path}")
         return aux_summary
 
     previous_summary = va._xg_posture_summary()
-    previous_f1 = float(((previous_summary.get('group_cv') or {}).get('f1_macro')) or 0.0)
+    previous_f1 = float(
+        ((previous_summary.get('group_cv') or {}).get('f1_macro'))
+        or previous_summary.get('f1_macro')
+        or previous_summary.get('macro_f1')
+        or 0.0
+    )
     previous_sequence = previous_summary.get('sequence_group_cv') or {}
     previous_sequence_f1 = float(previous_sequence.get('f1_macro') or previous_f1)
     previous_sit_recall = float((((previous_summary.get('group_cv') or {}).get('class_recall') or {}).get('sit')) or 0.0)
@@ -1851,6 +3057,8 @@ def main():
         or (best['f1_macro'] >= previous_f1 - 0.01 and best_sit_recall >= previous_sit_recall + 0.03)
         or xgb_policy_upgrade
     )
+    if os.environ.get('POSTURE_DISABLE_ACTIVE_REPLACEMENT', '0') == '1':
+        apply_candidate = False
     occlusion_aux_summary = save_occlusion_aux_candidate('candidate_selected_before_active_replacement_check')
     if not apply_candidate:
         report = {
@@ -1862,10 +3070,20 @@ def main():
             'candidate_sit_recall': best_sit_recall,
             'best': best,
             'class_distribution': class_dist,
+            'loaded_class_distribution': loaded_class_dist,
+            'full_class_distribution': full_class_dist,
+            'active_classes': list(active_classes),
+            'dropped_classes': list(dropped_classes),
             'group_distribution': {k: int(v) for k, v in group_counts.items()},
             'source_distribution': {str(k): int(v) for k, v in source_counts.items()},
             'trials': trials,
             'occlusion_auxiliary': occlusion_aux_summary,
+            'hitl_posture_intake': {
+                'counts': hitl_posture_intake.get('counts', {}),
+                'clip_counts': hitl_posture_intake.get('clip_counts', {}),
+                'used_files': hitl_posture_intake.get('used_files', []),
+                'skipped': hitl_posture_intake.get('skipped', []),
+            },
         }
         REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         sync_action_behavior_summary(previous_summary)
@@ -1875,19 +3093,25 @@ def main():
         return 0
     log(f"fit final best feature_set={best['feature_set']} model={best_name} f1={best['f1_macro']}")
     X_final = df[best_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
-    weights = compute_sample_weight(class_weight='balanced', y=y)
-    final_model = candidate_models(len(CLASSES))[best_name]
+    weights = apply_class_weight_multipliers(
+        compute_sample_weight(class_weight='balanced', y=y),
+        y,
+        active_classes,
+        class_weight_multipliers,
+    )
+    final_model = candidate_models(len(active_classes))[best_name]
     if best_name.startswith('xgb'):
         final_model.fit(X_final, y, sample_weight=weights)
     else:
         final_model.fit(X_final, y)
 
     y_train = np.asarray(final_model.predict(X_final)).flatten().astype(int)
-    train_report = classification_report(y, y_train, target_names=CLASSES, output_dict=True, zero_division=0)
+    active_labels = list(range(len(active_classes)))
+    train_report = classification_report(y, y_train, labels=active_labels, target_names=active_classes, output_dict=True, zero_division=0)
     train_metrics = {
         'accuracy': round(float(accuracy_score(y, y_train)), 4),
-        'f1_macro': round(float(f1_score(y, y_train, average='macro', zero_division=0)), 4),
-        'class_recall': {c: round(float(train_report[c]['recall']), 4) for c in CLASSES},
+        'f1_macro': round(float(f1_score(y, y_train, labels=active_labels, average='macro', zero_division=0)), 4),
+        'class_recall': {c: round(float(train_report[c]['recall']), 4) for c in active_classes},
     }
     feature_importance = {}
     if hasattr(final_model, 'feature_importances_'):
@@ -1898,7 +3122,8 @@ def main():
 
     model_data = {
         'model': final_model,
-        'classes': CLASSES,
+        'classes': list(active_classes),
+        'base_class_order': list(CLASSES),
         'feature_cols': list(best_cols),
         'group_split': {
             'strategy': 'StratifiedGroupKFold',
@@ -1925,19 +3150,24 @@ def main():
         'ready': True,
         'training_samples': int(len(df)),
         'class_distribution': class_dist,
+        'loaded_class_distribution': loaded_class_dist,
+        'full_class_distribution': full_class_dist,
         'group_distribution': {k: int(v) for k, v in group_counts.items()},
         'source_distribution': {str(k): int(v) for k, v in source_counts.items()},
         'features': list(best_cols),
         'feature_count': len(best_cols),
         'n_features': len(best_cols),
-        'classes': CLASSES,
-        'active_classes': CLASSES,
-        'n_classes': len(CLASSES),
+        'classes': list(active_classes),
+        'base_class_order': list(CLASSES),
+        'active_classes': list(active_classes),
+        'dropped_classes': list(dropped_classes),
+        'n_classes': len(active_classes),
         'n_windows': int(len(df)),
         'model_path': model_path,
         'algorithm': best_name,
         'feature_set': best['feature_set'],
-        'class_balance_strategy': 'sequence windows + boundary-aware sampling + balanced sample weights',
+        'class_balance_strategy': 'sequence windows + boundary-aware sampling + balanced sample weights + optional class multipliers',
+        'class_weight_multipliers': dict(class_weight_multipliers),
         'group_cv': {
             'folds': n_splits,
             'strategy': 'StratifiedGroupKFold',
@@ -1959,7 +3189,7 @@ def main():
             'f1_macro': best['f1_macro'],
         },
         'confusion_matrix': {
-            'labels': CLASSES,
+            'labels': list(active_classes),
             'matrix': best['confusion_matrix'],
         },
         'train_metrics': train_metrics,
@@ -1967,6 +3197,7 @@ def main():
         'candidate_trials': trials,
         'external_pose_dataset': {
             'static_counts': static_external.get('counts', {}),
+            'static_walk_motion_prior_counts': static_walk_motion_external.get('counts', {}),
             'static_lower_occlusion_counts': static_occ_external.get('counts', {}),
             'static_vertical_occlusion_counts': static_vertical_occ_external.get('counts', {}),
             'static_vertical_occlusion_modes': static_vertical_occ_external.get('modes', []),
@@ -1997,6 +3228,17 @@ def main():
             'lower_body_occlusion_scanned_clips': lower_occ_external.get('scanned_clips', {}),
             'lower_body_occlusion_manifest': lower_occ_external.get('manifest_path', ''),
             'lower_body_occlusion_skipped': lower_occ_external.get('skipped', []),
+            'rf_intake_pseudo_occlusion_counts': rf_pseudo_occ_external.get('counts', {}),
+            'rf_intake_pseudo_occlusion_clip_counts': rf_pseudo_occ_external.get('clip_counts', {}),
+            'rf_intake_pseudo_occlusion_scanned_clips': rf_pseudo_occ_external.get('scanned_clips', {}),
+            'rf_intake_pseudo_occlusion_skipped': rf_pseudo_occ_external.get('skipped', []),
+            'rf_intake_pseudo_occlusion_modes': rf_pseudo_occ_external.get('modes', {}),
+            'rf_intake_pseudo_label_note': 'Emergency occlusion rows generated from registered RF-Fall videos using high-confidence active XG-Posture pseudo labels. Replace/validate with true posture labels when AI-Hub 61/62/71461 or HITL posture labels are available.',
+            'hitl_posture_intake_counts': hitl_posture_intake.get('counts', {}),
+            'hitl_posture_intake_clip_counts': hitl_posture_intake.get('clip_counts', {}),
+            'hitl_posture_intake_root': hitl_posture_intake.get('intake_root', ''),
+            'hitl_posture_intake_used_files': hitl_posture_intake.get('used_files', []),
+            'hitl_posture_intake_skipped': hitl_posture_intake.get('skipped', []),
         },
         'diagnosis': {
             'previous_issue': 'single-frame training rows made temporal behavior features constant zero',
@@ -2025,10 +3267,20 @@ def main():
         'model_path': model_path,
         'best': best,
         'class_distribution': class_dist,
+        'loaded_class_distribution': loaded_class_dist,
+        'full_class_distribution': full_class_dist,
+        'active_classes': list(active_classes),
+        'dropped_classes': list(dropped_classes),
         'group_distribution': {k: int(v) for k, v in group_counts.items()},
         'source_distribution': {str(k): int(v) for k, v in source_counts.items()},
         'trials': trials,
         'occlusion_auxiliary': occlusion_aux_summary,
+        'hitl_posture_intake': {
+            'counts': hitl_posture_intake.get('counts', {}),
+            'clip_counts': hitl_posture_intake.get('clip_counts', {}),
+            'used_files': hitl_posture_intake.get('used_files', []),
+            'skipped': hitl_posture_intake.get('skipped', []),
+        },
     }
     REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     log(f"complete best={best_name}/{best['feature_set']} grouped_macro_f1={best['f1_macro']} report={REPORT_PATH}")

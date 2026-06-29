@@ -24,6 +24,11 @@ nav(class="flex flex-1 flex-col overflow-y-auto")
                         svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                             path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 6.75h16.5M3.75 12h10.5m-10.5 5.25h16.5")
                         span(class="truncate") AI 파이프라인
+                li
+                    a(routerLink="/models", [class]="activeClass('/models')")
+                        svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                            path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 6.75A2.25 2.25 0 0 1 6 4.5h12a2.25 2.25 0 0 1 2.25 2.25v10.5A2.25 2.25 0 0 1 18 19.5H6a2.25 2.25 0 0 1-2.25-2.25V6.75Zm4.5 2.25h7.5m-7.5 3h7.5m-7.5 3h4.5")
+                        span(class="truncate") 모델 관리
 
         li(*ngIf="isAdmin()")
             div(class="text-[11px] font-semibold uppercase tracking-wider text-gray-400 px-2") Admin
@@ -51,4 +56,4 @@ nav(class="flex flex-1 flex-col overflow-y-auto")
                     a(routerLink="/presentation", [class]="activeClass('/presentation')")
                         svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                             path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 3.75h16.5M3.75 8.25h16.5m-16.5 4.5h7.5m-7.5 4.5h7.5")
-                        span(class="truncate") 표정·가림 발표자료
+                        span(class="truncate") 포트폴리오/PDF

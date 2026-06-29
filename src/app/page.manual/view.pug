@@ -1,18 +1,18 @@
 div(class="h-full overflow-hidden bg-slate-50")
     //- 데스크톱 헤더
-    div(class="sticky top-0 z-20 flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-3")
+    div(class="sticky top-0 z-20 flex h-[56px] items-center justify-between gap-4 border-b border-zinc-200 bg-white px-4 sm:px-6")
         div(class="flex items-center gap-3")
             span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
                 img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
             div
                 h1(class="text-lg font-semibold text-zinc-950") 운영 설명서
                 p(class="text-xs text-zinc-400") FallAI · RF-Dual 운영 기준 안내
-        div(class="flex items-center gap-2")
-            a(routerLink="/", class="hidden lg:inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 메인
-            a(routerLink="/pipeline", class="hidden lg:inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 파이프라인
-            a(routerLink="/manual", class="hidden lg:inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-[13px] font-semibold text-sky-700") 설명서
-            a(routerLink="/presentation", class="hidden lg:inline-flex items-center rounded-xl border border-violet-200 bg-violet-50 px-3 py-1.5 text-[13px] font-medium text-violet-700 hover:bg-violet-100") 발표자료
-            a(*ngIf="isAdminUser()", routerLink="/admin/analysis", class="hidden lg:inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 관리자
+        div(class="flex min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap")
+            a(routerLink="/", class="hidden h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50 lg:inline-flex") 메인
+            a(routerLink="/pipeline", class="hidden h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50 lg:inline-flex") 파이프라인
+            a(routerLink="/models", class="hidden h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50 lg:inline-flex") 모델 관리
+            a(routerLink="/manual", class="hidden h-9 min-w-[88px] items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 text-[13px] font-semibold text-sky-700 lg:inline-flex") 설명서
+            a(*ngIf="isAdminUser()", routerLink="/admin/analysis", class="hidden h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50 lg:inline-flex") 관리자
             button(type="button", class="rounded-lg border border-zinc-300 p-2 text-zinc-600 lg:hidden", (click)="toggleSidebar()")
                 svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-5")
                     path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5")
@@ -58,6 +58,15 @@ div(class="h-full overflow-hidden bg-slate-50")
                             div(class="rounded-xl border border-slate-200 bg-slate-50 p-4")
                                 p(class="text-sm font-semibold text-slate-900") 위험 알림 전송
                                 p(class="mt-1 text-xs text-slate-500") 낙상 감지 시 보호자 알림/응급 안내 워크플로를 확인할 수 있습니다.
+                        div(class="mt-4 grid gap-3 md:grid-cols-4", *ngIf="modelTrainingStats().length > 0")
+                            div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                                p(class="text-[11px] font-semibold text-emerald-700") 전체 학습 자료
+                                p(class="mt-1 text-xl font-bold text-emerald-950") {{totalTrainingSamples()}}건
+                                p(class="mt-1 text-xs text-emerald-700") 현재 운영/보조 모델 합산
+                            div(class="rounded-xl border border-slate-200 bg-slate-50 p-4", *ngFor="let item of modelTrainingStats().slice(0, 3)")
+                                p(class="text-[11px] font-semibold text-slate-500") {{item.label}}
+                                p(class="mt-1 text-lg font-bold text-slate-950") {{item.sample_count || 0}}건
+                                p(class="mt-1 text-xs text-slate-500") {{modelMetricText(item)}}
 
                         h3(class="mt-8 text-lg font-semibold text-slate-900") 주요 페이지 안내
                         div(class="mt-4 overflow-x-auto")
@@ -76,6 +85,10 @@ div(class="h-full overflow-hidden bg-slate-50")
                                         td(class="py-2 pr-4 text-slate-900") AI 파이프라인
                                         td(class="py-2 pr-4 font-mono text-sky-600") /pipeline
                                         td(class="py-2 text-slate-600") 분석 모델 구조, 학습 데이터, 검증 리포트
+                                    tr(class="border-b border-slate-100")
+                                        td(class="py-2 pr-4 text-slate-900") 모델 관리
+                                        td(class="py-2 pr-4 font-mono text-sky-600") /models
+                                        td(class="py-2 text-slate-600") 모델 업로드, 성능 비교, 커스텀 최종 모델 생성, 삭제 예약
                                     tr(class="border-b border-slate-100")
                                         td(class="py-2 pr-4 text-slate-900") 관리자 설정
                                         td(class="py-2 pr-4 font-mono text-sky-600") /admin/analysis
@@ -153,6 +166,15 @@ div(class="h-full overflow-hidden bg-slate-50")
                             div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
                                 p(class="text-[13px] font-semibold text-emerald-800") 실시간 모드
                                 p(class="mt-1 text-xs text-emerald-600") 웹캠을 연결하여 4초 연속 청크를 녹화·분석합니다. 큐는 청크를 버리지 않고 순차 전송합니다.
+                        h3(class="text-[15px] font-semibold text-slate-900") 업로드 작업 전환
+                        p(class="text-[13px] leading-7 text-slate-600") 업로드 모드 안에서는 오른쪽 패널의 분석 모드/학습 모드 토글로 즉시 분석과 학습 데이터 등록을 전환합니다.
+                        div(class="grid gap-3 md:grid-cols-2")
+                            div(class="rounded-xl border border-blue-200 bg-blue-50 p-4")
+                                p(class="text-[13px] font-semibold text-blue-800") 분석 모드
+                                p(class="mt-1 text-xs text-blue-700") 선택한 첫 번째 영상으로 RF-Dual 업로드 분석을 실행하고 서버 처리 시간, LLM 설명 시간, 분할 로그를 확인합니다.
+                            div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                                p(class="text-[13px] font-semibold text-emerald-800") 학습 모드
+                                p(class="mt-1 text-xs text-emerald-700") 여러 영상, 폴더, zip/tar 압축 파일을 intake에 저장하고 어떤 모델 학습 자료인지 target metadata를 함께 남깁니다.
 
                         h3(class="text-[15px] font-semibold text-slate-900") 분석 설정
                         div(class="space-y-3")
@@ -178,6 +200,10 @@ div(class="h-full overflow-hidden bg-slate-50")
                                 li 분석할 영상 파일을 드래그 앤 드롭하거나,
                                     strong  파일 선택
                                     |  버튼을 클릭하여 파일을 고릅니다.
+                                li 학습 자료를 한꺼번에 등록할 때는 파일 여러 개, 폴더 선택, zip/tar 압축 파일을 사용할 수 있습니다.
+                                li 선택 목록에서 개별 파일의
+                                    strong  취소
+                                    |  버튼이나 폴더 취소 버튼으로 잘못 선택한 항목만 제거할 수 있습니다.
                                 li 지원 형식: MP4, MOV, AVI, MKV, WEBM
                                 li 영상이 미리보기 영역에 표시되고 파일 정보(크기, 길이, 해상도)가 나타납니다.
                                 li 원하는 분석 프로파일과 모델을 선택합니다.
@@ -185,15 +211,193 @@ div(class="h-full overflow-hidden bg-slate-50")
                                     strong 즉시 분석
                                     |  버튼을 클릭합니다.
                                 li 업로드 진행률 바가 표시되고, 서버 분석이 완료되면 전체 결과와 청크별 분할 로그가 아래에 나타납니다.
+                        div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                            p(class="text-[13px] font-semibold text-emerald-800") 학습 데이터 등록 절차
+                            ol(class="mt-2 ml-4 list-decimal space-y-2 text-[13px] text-emerald-700")
+                                li 오른쪽 패널에서
+                                    strong  학습 모드
+                                    | 로 전환합니다.
+                                li 학습 대상 모델을 RF-Dual 통합, RF-Fall v2, XG-Posture, AI-Hub 82 표정, AI-Hub 173 상태 중에서 선택합니다.
+                                li 낙상 라벨 Y/N과 필요한 경우 행동 라벨 stand/walk/run/sit/lie/fall을 선택합니다.
+                                li
+                                    strong 데이터 등록만
+                                    | 은 intake 저장만 수행하고,
+                                    strong  등록 후 백그라운드 학습
+                                    | 은 대시보드 HITL job까지 요청합니다.
+                                li AI-Hub 82/173 보조 모델은 대시보드 HITL job이 아니라 전용/연속 학습 파이프라인 상태를 추적합니다.
                         div(class="rounded-xl border border-amber-200 bg-amber-50 p-4")
                             p(class="text-[13px] font-semibold text-amber-800") 주의 사항
                             ul(class="mt-2 ml-4 list-disc space-y-1 text-[13px] text-amber-700")
                                 li 영상 파일 크기가 클수록 업로드와 분석에 시간이 더 걸립니다.
                                 li 분석 중에는 다른 영상을 업로드할 수 없습니다.
-                                li 업로드는 단일 패스로 분석하고, 실시간 모드에서만 4초 연속 청크 로그를 생성합니다.
+                                li 업로드 분석도 운영 정책에 맞춰 4초 기준 분할 로그를 생성하므로, 긴 영상은 추론 시간과 분할 로그 생성 시간이 함께 늘어날 수 있습니다.
                                 li
                                     strong 초기화
                                     |  버튼으로 현재 선택된 파일과 결과를 모두 지울 수 있습니다.
+
+                //- ========== 업로드 파일/라벨 가이드 ==========
+                section#section-upload-guide(class="mb-16")
+                    h2(class="text-2xl font-bold text-slate-950 mb-6") 업로드 파일/라벨 가이드
+                    div(class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm space-y-6")
+                        div(class="rounded-xl border border-sky-200 bg-sky-50 p-4")
+                            p(class="text-[13px] font-semibold text-sky-800") 모델 업로드 기본 원칙
+                            p(class="mt-2 text-[13px] leading-7 text-sky-700") 모델 관리는 /models 페이지에서 수행합니다. 파일이 하나면 파일 선택, 모델 파일과 설정/요약 파일이 여러 개면 폴더 선택을 사용합니다. 선택한 모델 종류와 실제 모델 파일의 용도가 서로 맞아야 비교와 적용이 정상 동작합니다.
+                            ul(class="mt-3 ml-4 list-disc space-y-1 text-[13px] text-sky-700")
+                                li 지원 확장자: .pkl, .joblib, .pt, .pth, .onnx, .json, .zip, .tar, .tgz, .gz
+                                li 성능 비교까지 보려면 모델 파일과 training_summary.json을 같은 폴더에 넣습니다.
+                                li summary가 없으면 모델 등록은 가능하지만 성능 그래프에는 수치 없음으로 표시될 수 있습니다.
+                                li 압축 파일은 압축을 풀었을 때 최상위 폴더 안에 모델 파일과 summary가 함께 있어야 합니다.
+                        div(class="grid gap-4 md:grid-cols-2")
+                            div(class="rounded-xl border border-slate-200 p-4")
+                                p(class="text-[13px] font-semibold text-slate-900") 권장 모델 폴더 구조
+                                pre(class="mt-2 overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs leading-6 text-slate-100")
+                                    code.
+                                        rf-fall-v16/
+                                          rf_fall_v2_model.pkl
+                                          training_summary.json
+
+                                        xg-posture-v3/
+                                          xg_posture_model.pkl
+                                          training_summary.json
+
+                                        occlusion-aux-v2/
+                                          xg_posture_occlusion_aux_model.pkl
+                                          training_summary.json
+
+                                        facial-aihub82-v8/
+                                          facial_emotion_model.pt
+                                          training_summary.json
+
+                                        driver-aihub173-v5/
+                                          driver_state_model.pt
+                                          training_summary.json
+                            div(class="rounded-xl border border-slate-200 p-4")
+                                p(class="text-[13px] font-semibold text-slate-900") training_summary.json 예시
+                                pre(class="mt-2 overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs leading-6 text-slate-100")
+                                    code.
+                                        &#123;
+                                          "model_version": "v16",
+                                          "algorithm": "extra_trees_balanced",
+                                          "training_samples": 2500,
+                                          "feature_count": 105,
+                                          "validation": &#123;
+                                            "f1": 0.931,
+                                            "accuracy": 0.928,
+                                            "precision": 0.920,
+                                            "recall": 0.944
+                                          &#125;,
+                                          "thresholds": &#123;
+                                            "confirm": &#123;"threshold": 0.62&#125;,
+                                            "suspect": &#123;"threshold": 0.50&#125;
+                                          &#125;,
+                                          "created_at": "2026-06-16T05:00:00Z"
+                                        &#125;
+                        div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                            p(class="text-[13px] font-semibold text-emerald-800") 모델 관리에서 할 수 있는 작업
+                            div(class="mt-3 grid gap-3 md:grid-cols-3")
+                                div(class="rounded-xl border border-emerald-200 bg-white p-4")
+                                    p(class="text-[13px] font-semibold text-emerald-950") 커스텀 최종 모델
+                                    p(class="mt-1 text-xs leading-6 text-emerald-700") /models 왼쪽의 커스텀 최종 모델 생성 카드에서 RF-Fall, XG-Posture, 가림 보조, 표정, 상태 모델을 각각 선택한 뒤 최종 모델 생성을 누릅니다. 생성한 조합은 사용 버튼으로 운영에 적용합니다.
+                                div(class="rounded-xl border border-rose-200 bg-white p-4")
+                                    p(class="text-[13px] font-semibold text-rose-950") 모델 삭제
+                                    p(class="mt-1 text-xs leading-6 text-rose-700") /models 오른쪽 모델 목록에서 삭제 가능만을 누르면 지울 수 있는 후보만 보입니다. 24시간 삭제 예약을 누르면 즉시 삭제하지 않고 유예 기간 동안 삭제 예정 목록에 보관합니다. 운영 모델과 현재 최종 조합에 들어간 모델은 삭제 불가입니다.
+                                div(class="rounded-xl border border-amber-200 bg-white p-4")
+                                    p(class="text-[13px] font-semibold text-amber-950") 낙상 감도
+                                    p(class="mt-1 text-xs leading-6 text-amber-700") /models 왼쪽의 낙상 감도 조절에서 보수/균형/민감 수준을 저장합니다. 이 값은 실시간 분석과 업로드 분석의 낙상 threshold에 함께 반영됩니다.
+                        div(class="rounded-xl border border-indigo-200 bg-indigo-50 p-4")
+                            p(class="text-[13px] font-semibold text-indigo-800") 학습 데이터 업로드 기본 원칙
+                            p(class="mt-2 text-[13px] leading-7 text-indigo-700") 학습 데이터는 영상이나 이미지 자체만으로는 부족합니다. 파일마다 어떤 모델에 쓸 자료인지, 정답 라벨이 무엇인지, 같은 원본에서 나온 파일끼리 어떤 그룹인지가 함께 있어야 재학습 검증이 가능합니다.
+                            ul(class="mt-3 ml-4 list-disc space-y-1 text-[13px] text-indigo-700")
+                                li 영상 파일: MP4, MOV, AVI, MKV, WEBM
+                                li 이미지 파일: JPG, JPEG, PNG, WEBP
+                                li 여러 파일 등록: 폴더 선택 또는 zip/tar 압축 업로드
+                                li 라벨 파일 이름은 labels.csv를 권장합니다.
+                                li 원본 영상과 전처리/가림 증강본은 같은 group_id를 사용해야 검증 데이터 누수를 막을 수 있습니다.
+                        div(class="rounded-xl border border-slate-200 p-4")
+                            p(class="text-[13px] font-semibold text-slate-900") labels.csv 권장 컬럼
+                            div(class="mt-3 overflow-x-auto")
+                                table(class="w-full min-w-[820px] text-left text-[12px]")
+                                    thead
+                                        tr(class="border-b border-slate-200 text-slate-500")
+                                            th(class="py-2 pr-3 font-semibold") 컬럼
+                                            th(class="py-2 pr-3 font-semibold") 필수 여부
+                                            th(class="py-2 font-semibold") 작성 방법
+                                    tbody
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") file
+                                            td(class="py-2 pr-3 text-slate-700") 필수
+                                            td(class="py-2 text-slate-600") 업로드 폴더 안의 실제 파일명 또는 상대 경로입니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") model_target
+                                            td(class="py-2 pr-3 text-slate-700") 필수
+                                            td(class="py-2 text-slate-600") rf-fall-v2, xg-posture, xg-posture-occlusion-aux, facial-aihub82, driver-aihub173 중 하나를 적습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") fall_label
+                                            td(class="py-2 pr-3 text-slate-700") 낙상 모델 필수
+                                            td(class="py-2 text-slate-600") 실제 낙상이면 Y, 낙상이 아니면 N입니다. 위험 점수나 예측값을 적는 칸이 아닙니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") behavior_label
+                                            td(class="py-2 pr-3 text-slate-700") 자세 모델 필수
+                                            td(class="py-2 text-slate-600") stand, walk, run, sit, lie, fall 중 실제 행동을 적습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") group_id
+                                            td(class="py-2 pr-3 text-slate-700") 권장
+                                            td(class="py-2 text-slate-600") 같은 사람, 같은 원본 영상, 같은 촬영 세트는 같은 group_id로 묶습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") start_sec / end_sec
+                                            td(class="py-2 pr-3 text-slate-700") 구간 자료 권장
+                                            td(class="py-2 text-slate-600") 긴 영상에서 학습에 사용할 시작/종료 시간을 초 단위로 적습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") occlusion_type
+                                            td(class="py-2 pr-3 text-slate-700") 가림 보조 권장
+                                            td(class="py-2 text-slate-600") none, lower_body, left, right, full, unknown 중 하나를 적습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") occlusion_ratio
+                                            td(class="py-2 pr-3 text-slate-700") 가림 보조 권장
+                                            td(class="py-2 text-slate-600") 0.0은 가림 없음, 1.0은 거의 전부 가림입니다. 모르면 비워두고 memo에 적습니다.
+                                        tr(class="border-b border-slate-100")
+                                            td(class="py-2 pr-3 font-mono text-sky-700") emotion_label
+                                            td(class="py-2 pr-3 text-slate-700") 표정 모델 필수
+                                            td(class="py-2 text-slate-600") neutral, happy, surprise, anger, anxiety, hurt, sad 중 하나를 적습니다. 한국어 라벨은 중립, 기쁨, 당황, 분노, 불안, 상처, 슬픔으로 매핑합니다.
+                                        tr
+                                            td(class="py-2 pr-3 font-mono text-sky-700") state_label
+                                            td(class="py-2 pr-3 text-slate-700") 상태 모델 필수
+                                            td(class="py-2 text-slate-600") normal, drowsy, yawn, phone, smoking, distraction처럼 실제 상태를 적습니다.
+                        div(class="rounded-xl border border-slate-200 p-4")
+                            p(class="text-[13px] font-semibold text-slate-900") labels.csv 예시
+                            pre(class="mt-2 overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs leading-6 text-slate-100")
+                                code.
+                                    file,fall_label,behavior_label,model_target,group_id,start_sec,end_sec,occlusion_type,occlusion_ratio,emotion_label,state_label,memo
+                                    fall_001.mp4,Y,fall,rf-fall-v2,roomA_001,0,4,none,0.0,,,실제 낙상
+                                    sit_001.mp4,N,sit,xg-posture,roomA_002,0,4,none,0.0,,,일반 앉기
+                                    occ_lie_001.mp4,N,lie,xg-posture-occlusion-aux,roomA_003,0,4,lower_body,0.55,,,침대 하체 가림
+                                    face_001.jpg,N,,facial-aihub82,face_001,,,,,neutral,,정면 얼굴
+                                    driver_001.mp4,N,,driver-aihub173,driver_001,,,,,,drowsy,눈 감김
+                        div(class="grid gap-4 md:grid-cols-2")
+                            div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                                p(class="text-[13px] font-semibold text-emerald-800") 모델별로 꼭 필요한 라벨
+                                ul(class="mt-2 ml-4 list-disc space-y-1 text-[13px] text-emerald-700")
+                                    li RF-Fall/RF-Dual: fall_label Y/N, 가능하면 behavior_label과 group_id
+                                    li XG-Posture: behavior_label, group_id, start_sec/end_sec
+                                    li 가림 보조: behavior_label, occlusion_type, occlusion_ratio, 원본과 증강본의 같은 group_id
+                                    li AI-Hub 82 표정: emotion_label, 얼굴이 보이는 이미지/프레임
+                                    li AI-Hub 173 상태: state_label, 운전자 얼굴 또는 상반신이 보이는 자료
+                            div(class="rounded-xl border border-amber-200 bg-amber-50 p-4")
+                                p(class="text-[13px] font-semibold text-amber-800") 교수님께 요청해야 하는 데이터
+                                ul(class="mt-2 ml-4 list-disc space-y-1 text-[13px] text-amber-700")
+                                    li 실제 자세 라벨이 있는 하체 가림, 좌측 가림, 우측 가림 영상
+                                    li sit/lie/fall 경계가 헷갈리는 near-miss 사례
+                                    li 평온/중립 표정이 충분히 포함된 정상 상황 자료
+                                    li 통증, 놀람, 불안 표정이 실제 상황에 가깝게 나온 자료
+                                    li 같은 사람/장소를 반복 촬영한 경우 group_id를 구분할 수 있는 촬영 메모
+                        div(class="rounded-xl border border-rose-200 bg-rose-50 p-4")
+                            p(class="text-[13px] font-semibold text-rose-800") 자주 나는 업로드 실수
+                            ul(class="mt-2 ml-4 list-disc space-y-1 text-[13px] text-rose-700")
+                                li 모델 파일 없이 summary만 올리면 실제 적용할 모델이 없어 등록이 실패하거나 비교 전용 항목이 됩니다.
+                                li RF-Fall로 선택했는데 표정 모델 파일을 올리면 추론 시 feature 구조가 맞지 않습니다.
+                                li labels.csv의 file 값과 실제 파일명이 하나라도 다르면 해당 자료는 학습에서 제외됩니다.
+                                li 같은 원본에서 나온 가림 증강본을 다른 group_id로 넣으면 검증 성능이 실제보다 높게 나올 수 있습니다.
+                                li 애매한 라벨은 억지로 Y/N을 붙이지 말고 memo에 uncertain을 적어 제외 후보로 남깁니다.
 
                 //- ========== 실시간 웹캠 분석 ==========
                 section#section-webcam(class="mb-16")
@@ -262,6 +466,9 @@ div(class="h-full overflow-hidden bg-slate-50")
                             div(class="rounded-xl border border-slate-200 p-4")
                                 p(class="text-[13px] font-semibold text-slate-900") 한 줄 로그 설명
                                 p(class="mt-1 text-xs text-slate-500") 각 로그에는 구간, 위험도, 자세, 판정 상태를 한 줄로 요약한 설명이 추가됩니다.
+                            div(class="rounded-xl border border-slate-200 p-4")
+                                p(class="text-[13px] font-semibold text-slate-900") 처리 시간 상세
+                                p(class="mt-1 text-xs text-slate-500") 파일 저장, 모델 로드, RF-Dual 추론, 분할 로그/결과 구성, LLM 설명 시간을 분리해 표시합니다. 기본 LLM 설명은 local_fast라 OpenAI 동기 호출 지연이 없습니다.
 
                 //- ========== 피드백 / 재학습 ==========
                 section#section-feedback(class="mb-16")
@@ -287,6 +494,9 @@ div(class="h-full overflow-hidden bg-slate-50")
                         div(class="rounded-xl border border-indigo-200 bg-indigo-50 p-4")
                             p(class="text-[13px] font-semibold text-indigo-800") HITL(Human-In-The-Loop) 재학습이란?
                             p(class="mt-2 text-[13px] text-indigo-700") 사용자의 피드백 데이터를 모델 학습에 반영하여 점진적으로 정확도를 개선하는 방식입니다. 피드백이 누적될수록 AI 모델이 해당 환경에 더 적합하게 학습됩니다.
+                        div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
+                            p(class="text-[13px] font-semibold text-emerald-800") 현재 학습 대상 선택
+                            p(class="mt-2 text-[13px] text-emerald-700") 업로드 학습 모드에서는 target_model metadata로 RF-Dual, RF-Fall v2, XG-Posture, AI-Hub 82, AI-Hub 173 중 어떤 모델 자료인지 구분합니다. XG-Posture 자료는 행동 라벨을 함께 저장하면 재학습에 바로 쓰기 좋습니다.
 
                 //- ========== 위험 알림 ==========
                 section#section-alert(class="mb-16")
@@ -357,19 +567,19 @@ div(class="h-full overflow-hidden bg-slate-50")
                                         strong 로그 설명 강화
                                         |  — posture label, decision_state, explain을 붙여 사용자에게 왜 그렇게 봤는지 한 줄로 설명할 수 있습니다.
 
-                        h3(class="text-[15px] font-semibold text-slate-900 mt-6") RF, XGBoost, SHAP 학습/해석 과정
+                        h3(class="text-[15px] font-semibold text-slate-900 mt-6") RF, XG-Posture, SHAP 학습/해석 과정
                         div(class="mt-3 grid gap-3 md:grid-cols-3")
                             div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-4")
                                 p(class="text-[13px] font-semibold text-emerald-800") Random Forest 낙상 모델
                                 p(class="mt-2 text-xs leading-6 text-emerald-700") AI-Hub 71641과 intake 영상을 fall/non-fall group split으로 나누고, YOLOv8n-pose bbox/keypoint에서 65개 feature를 생성해 RF-Fall v2를 학습했습니다.
-                                p(class="mt-2 text-xs leading-6 text-emerald-700") 현재 1,592 samples, best-F1 0.9337, confirm threshold 0.455 기준 F1 0.9302입니다.
+                                p(class="mt-2 text-xs leading-6 text-emerald-700") 현재 {{modelTrainingStat('rf-fall-v2')?.sample_count || 0}} samples, 65 features, {{modelMetricText(modelTrainingStat('rf-fall-v2'))}}입니다.
                             div(class="rounded-xl border border-sky-200 bg-sky-50 p-4")
-                                p(class="text-[13px] font-semibold text-sky-800") XGBoost 행동분류 모델
-                                p(class="mt-2 text-xs leading-6 text-sky-700") 71461/61 행동 데이터를 stand, walk, run, sit, lie 5-class feature row로 변환하고 StratifiedGroupKFold로 xgb_regularized/shallow/conservative 후보를 비교했습니다.
-                                p(class="mt-2 text-xs leading-6 text-sky-700") 현재 active는 xgb_regularized이며 2,466 rows, 105 features, grouped macro F1 0.6513입니다.
+                                p(class="text-[13px] font-semibold text-sky-800") XG-Posture 행동분류 모델
+                                p(class="mt-2 text-xs leading-6 text-sky-700") 71461/61 행동 데이터를 stand, walk, run, sit, lie 5-class feature row로 변환하고 XGBoost/ExtraTrees 후보를 sequence/group split으로 비교했습니다.
+                                p(class="mt-2 text-xs leading-6 text-sky-700") 현재 active는 {{modelTrainingStat('xg-posture')?.algorithm || 'tree_model'}}이며 {{modelTrainingStat('xg-posture')?.sample_count || 0}} windows, 105 features, {{modelMetricText(modelTrainingStat('xg-posture'))}}입니다.
                             div(class="rounded-xl border border-violet-200 bg-violet-50 p-4")
                                 p(class="text-[13px] font-semibold text-violet-800") SHAP 해석 계획
-                                p(class="mt-2 text-xs leading-6 text-violet-700") SHAP는 별도 학습 모델이 아니라 RF/XGBoost 예측을 feature별 기여도로 설명하는 후처리입니다.
+                                p(class="mt-2 text-xs leading-6 text-violet-700") SHAP는 별도 학습 모델이 아니라 RF/트리 기반 행동분류 예측을 feature별 기여도로 설명하는 후처리입니다.
                                 p(class="mt-2 text-xs leading-6 text-violet-700") 실시간 RTT를 늘리지 않도록 먼저 false positive/false negative batch report에 적용하고, 이후 LLM 판단 근거에 Top feature를 전달합니다.
 
                         h3(class="text-[15px] font-semibold text-slate-900 mt-6") 분석 결과 카드 해석
@@ -391,9 +601,9 @@ div(class="h-full overflow-hidden bg-slate-50")
                                 p(class="text-[13px] font-semibold text-slate-900") 종횡비 변동
                                 p(class="mt-1 text-xs text-slate-500") 사람의 체형이 세로에서 가로로 변한 정도입니다. 큰 변동은 넘어짐을 의미합니다.
 
-                //- ========== RF/XGBoost/SHAP 재현 ==========
+                //- ========== RF/XG-Posture/SHAP 재현 ==========
                 section#section-model-training(class="mb-16")
-                    h2(class="text-2xl font-bold text-slate-950 mb-6") RF/XGBoost/SHAP 학습·해석 재현
+                    h2(class="text-2xl font-bold text-slate-950 mb-6") RF/XG-Posture/SHAP 학습·해석 재현
                     div(class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm space-y-5")
                         p(class="text-[13px] leading-7 text-slate-600") 이 섹션은 처음 보는 사람이 현재 모델 학습 방식을 따라갈 수 있도록 입력 데이터, feature 생성, group split, 모델 학습, 검증, SHAP 해석 순서를 정리합니다. 실제 재현용 상세 명령과 체크리스트는 프로젝트 루트의 manual.md 9장을 기준으로 합니다.
 
@@ -407,18 +617,18 @@ div(class="h-full overflow-hidden bg-slate-50")
                                     li 검증: group split + threshold sweep
                                     li 결과: best F1 0.9337, confirm F1 0.9302
                             div(class="rounded-xl border border-sky-200 bg-sky-50 p-4")
-                                p(class="text-[13px] font-semibold text-sky-800") 2. XGBoost 행동분류
+                                p(class="text-[13px] font-semibold text-sky-800") 2. XG-Posture 행동분류
                                 ul(class="mt-2 ml-4 list-disc space-y-1 text-xs leading-6 text-sky-700")
                                     li 입력: AI-Hub 71461 + AI-Hub 61 행동 데이터
                                     li 클래스: stand, walk, run, sit, lie
                                     li feature: bbox/motion/pose/하체가림/temporal 105개
                                     li 검증: StratifiedGroupKFold
-                                    li 결과: active macro F1 0.6513
+                                    li 결과: {{modelMetricText(modelTrainingStat('xg-posture'))}}
                             div(class="rounded-xl border border-violet-200 bg-violet-50 p-4")
                                 p(class="text-[13px] font-semibold text-violet-800") 3. SHAP 해석
                                 ul(class="mt-2 ml-4 list-disc space-y-1 text-xs leading-6 text-violet-700")
                                     li SHAP는 학습 모델이 아니라 예측 설명 도구
-                                    li RF/XGBoost feature row와 학습된 tree model을 사용
+                                    li RF/XG-Posture feature row와 학습된 tree model을 사용
                                     li global SHAP로 중요 feature 확인
                                     li local SHAP로 FP/FN 오분류 원인 확인
                                     li 실시간은 무거우므로 batch report부터 적용
@@ -448,7 +658,7 @@ div(class="h-full overflow-hidden bg-slate-50")
                                     python3 scripts/retrain_xg_posture_grouped.py
                                     python3 scripts/generate_facial_focus_presentation.py
 
-                        p(class="text-xs leading-6 text-slate-500") SHAP는 별도 학습 명령이 아니라 학습 완료된 RF/XGBoost 모델과 feature row를 읽어 후처리로 계산합니다. 운영 실시간에는 바로 붙이지 않고 FP/FN batch 분석부터 적용합니다.
+                        p(class="text-xs leading-6 text-slate-500") SHAP는 별도 학습 명령이 아니라 학습 완료된 RF/XG-Posture 모델과 feature row를 읽어 후처리로 계산합니다. 운영 실시간에는 바로 붙이지 않고 FP/FN batch 분석부터 적용합니다.
 
                 //- ========== 관리자 설정 ==========
                 section#section-admin(class="mb-16")

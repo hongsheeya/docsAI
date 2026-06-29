@@ -17,7 +17,7 @@
 6. [백엔드 API 명세](#6-백엔드-api-명세)
 7. [데이터 모델](#7-데이터-모델)
 8. [AI 분석 파이프라인](#8-ai-분석-파이프라인)
-9. [RF/XGBoost/SHAP 학습·해석 재현 가이드](#9-rfxgboostshap-학습해석-재현-가이드)
+9. [RF/XG-Posture/SHAP 학습·해석 재현 가이드](#9-rfxg-postureshap-학습해석-재현-가이드)
 10. [인증/권한 체계](#10-인증권한-체계)
 11. [프론트엔드 구조](#11-프론트엔드-구조)
 12. [알림 게이트웨이](#12-알림-게이트웨이)
@@ -51,7 +51,7 @@ FallAI는 영상을 업로드하거나 웹캠을 연결하여 AI가 낙상 여�
 | Framework | WIZ Framework (Python + Angular) |
 | Frontend | Angular 19, TypeScript, Tailwind CSS, Pug 템플릿 |
 | Backend | Python (WIZ exec 환경), Peewee ORM |
-| AI/ML | YOLOv8n-pose (bbox/keypoint), RandomForest RF-Fall v2, XGBoost XG-Posture, ExtraTrees occlusion auxiliary, MobileNetV3 facial-state auxiliary |
+| AI/ML | YOLOv8n-pose (bbox/keypoint), RandomForest RF-Fall v2, tree-based XG-Posture, ExtraTrees occlusion auxiliary, MobileNetV3 facial-state auxiliary |
 | ML Libraries | scikit-learn, numpy, pandas, scipy (my_libs/ 로컬 설치) |
 | DB | SQLite (기본), MySQL 전환 가능 |
 | 패키지 | portal/season (인증·ORM·UI), portal/post (게시판) |
@@ -301,7 +301,7 @@ struct.py (Composite Struct, Singleton)
 
 ```
 영상 업로드 / 실시간 WebM 청크
-  → 4초 청크 기준 프레임 샘플링
+  → 4초 창 / 2초 stride 중첩 청크 기준 프레임 샘플링
   → YOLOv8n-pose bbox + COCO-17 keypoint 추출
   → bbox / skeleton / temporal feature 생성
   → RF-Fall v2가 fall / non-fall을 먼저 판단
@@ -346,21 +346,23 @@ struct.py (Composite Struct, Singleton)
 
 RF-Fall v2가 중요한 이유는 낙상 탐지에서 recall을 지키면서도 단순 흔들림/천천히 앉기/하체 가림으로 생기는 오경보를 줄이는 1차 안전장치이기 때문이다.
 
-### 8.3 XGBoost 행동분류 모델 학습
+### 8.3 XG-Posture 행동분류 모델 학습
 
 | 항목 | 현재 값 |
 |------|---------|
 | 모델 | XG-Posture 5-class |
 | 파일 | `/opt/app/storage/training/fall-detection/xg-posture/xg_posture_model.pkl` |
 | 학습 스크립트 | `scripts/retrain_xg_posture_grouped.py` |
-| active algorithm | `xgb_regularized` |
-| 학습 샘플 | 2,466 |
+| active algorithm | `extra_trees_balanced` |
+| 학습 샘플 | 8,181 |
 | feature 수 | 105 |
-| 검증 | StratifiedGroupKFold 5-fold |
-| Group CV accuracy | 0.6602 |
-| Group CV macro F1 | 0.6513 |
+| 검증 | sequence/group split CV |
+| sequence CV accuracy | 0.9432 |
+| sequence CV macro F1 | 0.9431 |
 
 클래스는 `stand`, `walk`, `run`, `sit`, `lie` 다섯 가지다. feature는 기존 bbox/pose 기반 64~82개 feature에서 하체 가림과 상체 기반 구분 feature를 추가해 105개까지 확장했다.
+
+클래스 분포는 stand 725, walk 1,664, run 1,664, sit 2,244, lie 1,884다.
 
 주요 feature 축:
 
@@ -374,7 +376,7 @@ RF-Fall v2가 중요한 이유는 낙상 탐지에서 recall을 지키면서도 
 | Temporal feature | speed_std, oscillation_count, step_period_est | 걷기/뛰기 주기성 |
 | Guard feature | lie_stand_separation_score, support_stability_score | stand/lie, sit/lie 오분류 억제 |
 
-후보 모델은 `xgb_regularized`, `xgb_shallow`, `xgb_conservative`, `extra_trees`를 비교했다. 현재 active는 macro F1이 가장 높았던 `xgb_regularized`다. 다만 0.6513은 운영 행동분류 모델로 충분히 높지 않으므로, 실제 설치 각도와 하체 가림 hard-case 데이터로 재학습이 필요하다.
+후보 모델은 `xgb_regularized`, `xgb_shallow`, `xgb_conservative`, `extra_trees_balanced`를 비교했다. 현재 active는 sequence CV 기준 macro F1 0.9431인 `extra_trees_balanced`다. 다만 실제 설치 각도, 침대/의자 전이, 하체 가림 hard-case는 계속 들어오므로 intake 라벨과 group split 기준을 유지해 재학습한다.
 
 ### 8.4 하체 가림 보조 모델
 
@@ -402,7 +404,7 @@ RF-Fall v2가 중요한 이유는 낙상 탐지에서 recall을 지키면서도 
 
 ### 8.6 SHAP 해석 과정
 
-SHAP는 모델을 새로 학습하는 방식이 아니라, 이미 학습된 Random Forest/XGBoost 모델의 예측을 feature 단위로 설명하는 방법이다.
+SHAP는 모델을 새로 학습하는 방식이 아니라, 이미 학습된 Random Forest/XG-Posture tree 모델의 예측을 feature 단위로 설명하는 방법이다.
 
 권장 적용 방식:
 
@@ -437,14 +439,14 @@ SHAP는 모델을 새로 학습하는 방식이 아니라, 이미 학습된 Rand
   → _appdata/data/storage/training/ 또는 intake manifest에 저장
   → 동일 feature extractor로 feature row 생성
   → 기존 데이터 + 피드백 데이터 병합
-  → group split으로 RF/XGBoost 후보 재학습
+  → group split으로 RF/XG-Posture 후보 재학습
   → validation metric, confusion matrix, threshold sweep 비교
   → 기존 운영 모델보다 개선된 후보만 승격
 ```
 
 ---
 
-## 9. RF/XGBoost/SHAP 학습·해석 재현 가이드
+## 9. RF/XG-Posture/SHAP 학습·해석 재현 가이드
 
 이 절은 프로젝트를 처음 보는 사람이 현재 학습 방식을 다시 실행하거나 검증할 수 있도록 정리한 재현 가이드다. 실제 데이터는 `/opt/app/datasets` 아래에 두고, 프로젝트 코드는 `/opt/app/project/main`에서만 수정한다. 모델 산출물은 `/opt/app/storage/training/fall-detection`에 저장한다.
 
@@ -550,7 +552,7 @@ RF 학습 흐름:
    - recall이 너무 높고 precision이 낮으면 오경보가 많다.
    - precision만 높이면 낙상 miss가 늘 수 있으므로 confirm threshold와 suspect threshold를 분리해 운영한다.
 
-### 9.3 XGBoost 행동분류 모델 재현 절차
+### 9.3 XG-Posture 행동분류 모델 재현 절차
 
 목표는 비낙상 또는 경계 상황에서 사람의 상태를 `stand`, `walk`, `run`, `sit`, `lie`로 설명하는 것이다. 이 모델은 낙상 최종 판정을 대체하지 않고, UI 설명과 오탐 억제를 돕는다.
 
@@ -568,11 +570,11 @@ python3 scripts/retrain_xg_posture_grouped.py
 | AI-Hub 61 사람동작 2020 | walk/run/sit/lie sequence 보강 |
 | 기존 런타임 feature | 실시간 청크와 같은 feature schema 유지 |
 
-XGBoost 학습 흐름:
+XG-Posture 학습 흐름:
 
 1. **feature window 구성**
    - 영상 또는 pose/image 라벨에서 4초 단위 window feature row를 만든다.
-   - 현재 active 모델은 2,466 rows, 105 features를 사용한다.
+   - 현재 active 모델은 8,181 windows, 105 features를 사용한다.
 
 2. **라벨 정규화**
    - 원천 데이터 라벨을 `stand`, `walk`, `run`, `sit`, `lie` 다섯 클래스로 통일한다.
@@ -592,18 +594,18 @@ XGBoost 학습 흐름:
    - guard feature: `lie_stand_separation_score`, `support_stability_score`, `upright_geometry_score`.
 
 5. **후보 모델 비교**
-   - `xgb_regularized`: 현재 active. 과적합을 줄인 regularized XGBoost.
+   - `xgb_regularized`: 과적합을 줄인 regularized XGBoost 후보.
    - `xgb_shallow`: 더 얕은 트리로 일반화 확인.
    - `xgb_conservative`: 더 보수적인 파라미터로 오분류 억제 확인.
-   - `extra_trees`: 트리 기반 비교 후보.
+   - `extra_trees_balanced`: 현재 active. sequence/group CV에서 가장 좋은 운영 후보.
 
 6. **평가**
    - 현재 active 결과:
 
 | 항목 | 값 |
 |------|---:|
-| Group CV accuracy | 0.6602 |
-| Group CV macro F1 | 0.6513 |
+| sequence CV accuracy | 0.9432 |
+| sequence CV macro F1 | 0.9431 |
 | stand recall | 0.8157 |
 | walk recall | 0.5349 |
 | run recall | 0.7365 |
@@ -676,7 +678,7 @@ values = explainer.shap_values(X.sample(min(len(X), 500), random_state=42))
 2. `model_path` 파일이 실제 존재하는지 확인한다.
 3. feature_count가 런타임 feature schema와 같은지 확인한다.
 4. class_distribution이 비정상적으로 한쪽으로 몰리지 않았는지 확인한다.
-5. Group CV 또는 threshold sweep 수치가 이전 active보다 나은지 확인한다.
+5. sequence/group CV 또는 threshold sweep 수치가 이전 active보다 나은지 확인한다.
 6. `/pipeline` 화면에서 sample count, feature count, threshold가 최신으로 표시되는지 확인한다.
 7. 업로드 모드와 실시간 WebM 청크를 같은 4초 기준으로 비교한다.
 8. fall/non-fall 판정이 먼저 나오고, 비낙상/경계에서 행동분류와 표정 evidence가 보조로 붙는지 확인한다.
@@ -795,7 +797,7 @@ Realtime : [0s----4s] [4s----8s] [8s---12s] [12s---16s]
             └─ 같은 4초 단위 청크를 업로드/실시간 모두에 적용 ─┘
 ```
 
-- 업로드 분석과 실시간 분석 모두 4초 단위 기준으로 feature를 생성한다.
+- 업로드 분석과 실시간 분석 모두 4초 창을 2초 stride로 중첩해 feature를 생성한다. 경계 시점에 낙상 전환이 걸려도 앞/뒤 맥락이 같은 청크 안에 들어오도록 하기 위한 정책이다.
 - 브라우저 큐는 청크 누락을 막기 위해 순차 전송을 기본으로 하고, 서버 응답 지연 시 RTT를 별도 표시한다.
 - 서버 AI 추론은 4fps 기준 샘플링을 사용하고, 화면 오버레이 FPS와 분리해 체감 실시간성을 확보한다.
 - 중복 낙상 알림: 짧은 시간 내 deduplication 적용

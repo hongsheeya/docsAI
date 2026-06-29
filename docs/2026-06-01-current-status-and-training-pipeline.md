@@ -1,11 +1,11 @@
 # FallAI 현재 개발 현황 및 학습 파이프라인
 
-> 기준일: 2026-06-01  
-> 코드 루트: `/opt/app/project/main`  
-> 데이터 루트: `/opt/app/datasets`  
+> 기준일: 2026-06-02
+> 코드 루트: `/opt/app/project/main`
+> 데이터 루트: `/opt/app/datasets`
 > 운영 모델 루트: `/opt/app/storage/training/fall-detection`
 
-이 문서는 2026-06-01 기준으로 실제 적용된 모델, 학습 산출물, 남은 후보/보류 항목을 분리해 정리한다. 발표자료와 `/pipeline`, `/manual` 설명의 기준 문서로 사용한다.
+이 문서는 2026-06-02 기준으로 실제 적용된 모델, 학습 산출물, 남은 후보/보류 항목을 분리해 정리한다. 발표자료와 `/pipeline`, `/manual` 설명의 기준 문서로 사용한다.
 
 ---
 
@@ -14,15 +14,15 @@
 | 영역 | 현재 상태 | 적용 여부 | 핵심 수치/근거 |
 |---|---|---|---|
 | 낙상 최종 판정 | RF-Fall v2 occlusion-aware | 적용 완료 | 1,592 samples, 65 features, best-F1 0.9337, confirm F1 0.9302 |
-| 행동/자세 분류 | XG-Posture 5-class | 적용 완료, 추가 개선 필요 | 2,466 samples, 105 features, Group CV macro F1 0.6513 |
+| 행동/자세 분류 | XG-Posture 5-class | 적용 완료 | 8,181 windows, 105 features, sequence CV macro F1 0.9431 |
 | 하체 가림 보조 | XG-Posture occlusion auxiliary | 보조 모델 적용 | ExtraTrees balanced, 105 features, Group CV macro F1 0.8657 |
 | 표정/상태 보조 | AI-Hub 82 + 173 MobileNetV3 | 보조 근거 적용 | AI-Hub 82 macro F1 0.6198, AI-Hub 173 macro F1 0.9054 |
-| 실시간 청크 | 4초 청크 + 무삭제 큐 | 적용 완료 | 청크 누락 방지, RTT 증가 시 큐 적체 표시 |
+| 실시간 청크 | 4초 창 + 2초 stride 중첩 큐 | 적용 완료 | 경계 이벤트 누락 방지, RTT 증가 시 큐 적체 표시 |
 | 프라이버시 표시 | skeleton/raw 전환 | 적용 완료 | 기본 skeleton, 관리자 raw 전환 가능 |
 | YOLO 최신화 | YOLOv8n 유지, YOLO11 shadow 후보 | 보류/검증 지속 | YOLOv8n KP 93.06%, YOLO11n KP 91.67% |
-| SHAP | 설명/감사 도구 | 운영 UI에는 미적용 | RF/XGBoost feature attribution 산출 계획 |
+| SHAP | 설명/감사 도구 | 운영 UI에는 미적용 | RF/XG-Posture feature attribution 산출 계획 |
 
-주말 학습 큐는 완료됐다. `/opt/app/project/main/outputs/weekend_training/weekend_training_status.json` 기준 `stage=completed`이며, AI-Hub 173 v4는 macro F1 0.8982에서 0.9054로 개선되어 승격됐다. AI-Hub 82 v10은 0.6176으로 active 0.6198보다 낮아 승격하지 않았다.
+AI-Hub 82 연속 학습 감독기는 2026-06-02 현재 백그라운드에서 진행 중이며, active macro F1 0.6198보다 개선된 후보가 나올 때만 승격한다. AI-Hub 173 v4는 macro F1 0.8982에서 0.9054로 개선되어 승격됐다.
 
 ---
 
@@ -31,8 +31,8 @@
 ```text
 영상 업로드 / 실시간 WebM 청크
   -> 프레임 샘플링
-     - 실시간: 4초 x 4fps 기준 최대 16프레임
-     - 업로드: 같은 청크 정책으로 분할 로그 생성
+     - 실시간: 4초 창을 2초 간격으로 중첩, 4fps 기준 최대 16프레임
+     - 업로드: 같은 4초/2초 중첩 정책으로 분할 로그 생성
   -> YOLOv8n-pose
      - 사람 bbox
      - COCO-17 keypoint
@@ -140,7 +140,7 @@ RF-Fall v2는 65개 feature를 사용한다. 핵심 축은 다음과 같다.
 
 ---
 
-## 5. XGBoost 행동/자세 모델 학습 과정
+## 5. XG-Posture 행동/자세 모델 학습 과정
 
 운영 행동 모델은 `/opt/app/storage/training/fall-detection/xg-posture/xg_posture_model.pkl`이다. 학습 스크립트는 `/opt/app/project/main/scripts/retrain_xg_posture_grouped.py`와 feature 최적화 스크립트 `/opt/app/project/main/scripts/optimize_xg_posture_features.py` 계열을 사용했다.
 
@@ -156,15 +156,15 @@ XG-Posture는 `stand`, `walk`, `run`, `sit`, `lie` 5개 행동/자세를 분류�
 
 현재 active summary 기준:
 
-- 학습 샘플: 2,466
+- 학습 샘플: 8,181
 - feature 수: 105
 - 클래스 분포:
-  - stand 445
-  - walk 387
-  - run 334
-  - sit 650
-  - lie 650
-- 검증: StratifiedGroupKFold 5-fold
+  - stand 725
+  - walk 1,664
+  - run 1,664
+  - sit 2,244
+  - lie 1,884
+- 검증: sequence/group split CV
 
 ### 5.3 Feature 구성
 
@@ -189,40 +189,18 @@ XG-Posture는 `stand`, `walk`, `run`, `sit`, `lie` 5개 행동/자세를 분류�
    - `xgb_regularized`
    - `xgb_shallow`
    - `xgb_conservative`
-   - `extra_trees`
+   - `extra_trees_balanced`
 5. macro F1, class별 recall, confusion matrix를 비교한다.
-6. 현재 active는 `xgb_regularized`다.
+6. 현재 active는 `extra_trees_balanced`다.
 
 현재 active 검증 결과:
 
 | 지표 | 값 |
 |---|---:|
-| accuracy | 0.6602 |
-| macro F1 | 0.6513 |
-| stand recall | 0.8157 |
-| walk recall | 0.5349 |
-| run recall | 0.7365 |
-| sit recall | 0.5569 |
-| lie recall | 0.6923 |
+| sequence CV accuracy | 0.9432 |
+| sequence CV macro F1 | 0.9431 |
 
-혼동 행렬:
-
-| actual/pred | stand | walk | run | sit | lie |
-|---|---:|---:|---:|---:|---:|
-| stand | 363 | 10 | 9 | 30 | 33 |
-| walk | 19 | 207 | 110 | 6 | 45 |
-| run | 2 | 79 | 246 | 4 | 3 |
-| sit | 35 | 55 | 130 | 362 | 68 |
-| lie | 60 | 46 | 21 | 73 | 450 |
-
-이 수치는 솔직히 “좋다”고 말하기 어렵다. 원인은 모델 자체보다 데이터 도메인 차이가 크다.
-
-- AI-Hub 61/71461 데이터의 촬영 각도와 실제 실시간 WebM 환경이 다르다.
-- 하체가 가려지는 실환경에서 stand/sit/lie 구분이 약해진다.
-- walk/run은 이동량과 주기성이 필요한데, 일부 샘플은 실제 이동보다 pose annotation 기반 정지 이미지에 가깝다.
-- sit/lie/stand 경계는 의자/침대/바닥 환경 라벨이 더 필요하다.
-
-그래서 현재는 XG-Posture를 “최종 판정기”가 아니라 “설명/보조 레이어”로 쓰는 것이 맞다.
+현재 XG-Posture는 운영 설명 레이어로 충분히 개선됐지만, 낙상 최종 판정을 대체하지 않는다. 실제 설치 각도, 침대/의자 전이, 하체 가림 hard-case는 계속 들어오므로 target_model=`xg-posture`와 행동 라벨을 함께 저장해 재학습 자료를 축적한다.
 
 ---
 
@@ -262,7 +240,7 @@ XG-Posture는 `stand`, `walk`, `run`, `sit`, `lie` 5개 행동/자세를 분류�
 
 ## 8. SHAP 적용 계획과 의미
 
-SHAP는 학습하는 모델이 아니라, 학습된 Random Forest/XGBoost 모델의 예측을 설명하는 해석 방법이다. 그래서 “SHAP를 학습한다”기보다 “학습된 모델에 대해 SHAP 값을 계산한다”가 정확하다.
+SHAP는 학습하는 모델이 아니라, 학습된 Random Forest/XG-Posture tree 모델의 예측을 설명하는 해석 방법이다. 그래서 “SHAP를 학습한다”기보다 “학습된 모델에 대해 SHAP 값을 계산한다”가 정확하다.
 
 ### 8.1 왜 필요한가
 
@@ -324,7 +302,7 @@ SHAP를 붙이면 다음이 가능하다.
 | 우선순위 | 과제 | 이유 |
 |---|---|---|
 | 1 | 실제 환경 hard-case 수집 | 현재 성능 병목은 도메인 차이와 가림이다. |
-| 2 | 행동분류 Group split 재학습 | active macro F1 0.6513은 운영 설명용으로는 부족하다. |
+| 2 | 행동분류 sequence/group split 재학습 | 실제 설치 각도와 하체 가림 hard-case가 들어올 때 active 0.9431을 기준으로 개선 여부를 비교한다. |
 | 3 | SHAP batch report | 어디서 오분류되는지 feature 단위로 보여줘야 다음 개선이 빨라진다. |
 | 4 | YOLO11 shadow test 확대 | confidence는 좋아졌지만 검출률이 아직 낮아 바로 교체하면 위험하다. |
 | 5 | 표정 모델 역할 축소/정교화 | AI-Hub 82 감정은 낙상 특화가 아니므로 보조 근거 이상으로 쓰면 안 된다. |

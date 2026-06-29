@@ -5,25 +5,30 @@ WIZ 프레임워크 기반 FallAI 운영 프로젝트입니다.
 
 ---
 
-## 현재 모델 상태 (2026-04-27)
+## 현재 모델 상태 (2026-06-02)
 
 - 기본 업로드/실시간 운영 축: `rf-dual`
-- 청크 정책: `0~2 / 0~4 / 0~5` Dense Bootstrap 뒤 `2~7 / 4~9 / 6~11` 형태의 2초 간격 5초 슬라이딩 윈도우
-- RF 운영 모델: Validation 1100영상 기반 재학습본
-    - Train `899`, Validation `200`
-    - Accuracy `89.5%`
-    - Precision `84.96%`
-    - Recall `96.0%`
-    - F1 `90.14%`
-    - 운영 threshold `0.35`
-- XG-Posture: 6-class 재학습 완료, CV accuracy `93.7%`
-- 운영 행동분류 노출: **5-class (`stand/walk/run/sit/lie`)**
-- raw 6-class `fall` 확률은 **진단용(`posture_raw_*`)으로만 유지**
-- `sit ↔ lie` 경계: 상체가 직립에 가깝고 무릎 굽힘이 보이는 경우 `upright_sit_guard`로 `lie` rescue를 억제
-- XG-Posture 학습 검증: **clip-grouped CV** 기준으로 누수 방지 적용
-- 기존 업로드 재평가: FP `0`, FN `0`
+- 청크 정책: 업로드/실시간 모두 4초 창을 2초 stride로 중첩 분석, 실시간은 무삭제 큐로 순차 전송
+- RF 운영 모델: `RF-Fall v2 occlusion-aware`
+    - 학습 샘플 `1,592`
+    - Feature `65`
+    - Precision `90.8%`
+    - Recall `95.4%`
+    - F1 `93.0%`
+    - 운영 confirm threshold `0.455`
+- XG-Posture: **5-class (`stand/walk/run/sit/lie`)**
+    - 학습 windows `8,181`
+    - Feature `105`
+    - sequence CV accuracy `94.3%`
+    - sequence CV macro F1 `94.3%`
+- 표정/상태 보조 모델:
+    - AI-Hub 82 표정: `60,319` samples, macro F1 `61.98%`
+    - AI-Hub 173 상태: `47,144` samples, macro F1 `90.54%`
+- LLM 설명: 기본 응답은 `local_fast` 근거 요약이며, OpenAI 동기 호출은 별도 설정(`sync_interpretation` 또는 `LLM_INTERPRETATION_SYNC`)을 켤 때만 수행
 
-상세 운영 문서는 [docs/prototype/fall-detection/README.md](docs/prototype/fall-detection/README.md), 전체 개요는 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)를 참고합니다. [docs/xg-dual-architecture.md](docs/xg-dual-architecture.md)는 **레거시 설계 문서**이며, 현재 운영 기준은 RF-Dual입니다.
+상세 운영 문서는 [docs/2026-06-01-current-status-and-training-pipeline.md](docs/2026-06-01-current-status-and-training-pipeline.md), 전체 개요는 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)를 참고합니다. [docs/xg-dual-architecture.md](docs/xg-dual-architecture.md)는 **레거시 설계 문서**이며, 현재 운영 기준은 RF-Dual입니다.
+
+교수님/검토자에게 코드 구조를 설명할 때는 [docs/professor-code-overview-20260629.md](docs/professor-code-overview-20260629.md)를 먼저 공유하면 됩니다. 다른 서버에서 프로젝트를 복구해야 할 때는 [docs/server-restore-guide-20260629.md](docs/server-restore-guide-20260629.md)를 따릅니다.
 
 ---
 

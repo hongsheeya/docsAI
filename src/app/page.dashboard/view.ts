@@ -21,6 +21,7 @@ const COCO_KP_COLORS: Record<number, string> = {
     5: '#67e8f9', 6: '#67e8f9', 7: '#67e8f9', 8: '#67e8f9', 9: '#67e8f9', 10: '#67e8f9',
     11: '#86efac', 12: '#86efac', 13: '#86efac', 14: '#86efac', 15: '#86efac', 16: '#86efac',
 };
+const COCO_HAND_KEYPOINTS = new Set<number>([9, 10]);
 
 // ── MediaPipe 33-landmark skeleton ──
 const MP_POSE_CONNECTIONS: [number, number][] = [
@@ -42,8 +43,17 @@ const MP_LANDMARK_COLORS: Record<number, string> = (() => {
     for (let i = 23; i <= 32; i++) c[i] = '#86efac';
     return c;
 })();
+const MP_WRIST_LANDMARKS = new Set<number>([15, 16]);
+const MP_HAND_DETAIL_LANDMARKS = new Set<number>([17, 18, 19, 20, 21, 22]);
 
 const MP_FRAME_INTERVAL_MS = 66; // ~15fps throttle
+const MP_MAX_POSES = 20;
+const MP_PERSON_COLORS = [
+    '#67e8f9', '#f0abfc', '#86efac', '#fbbf24', '#a78bfa',
+    '#fb7185', '#38bdf8', '#34d399', '#f97316', '#c084fc',
+    '#2dd4bf', '#facc15', '#60a5fa', '#f472b6', '#4ade80',
+    '#e879f9', '#22d3ee', '#a3e635', '#fdba74', '#93c5fd',
+];
 
 // ── Kalman 1D Filter (constant-velocity model) for occluded landmark prediction ──
 class Kalman1D {
@@ -102,6 +112,9 @@ class Kalman1D {
     get position(): number { return this._pos; }
 }
 
+type MpLandmarkFilters = { x: Kalman1D; y: Kalman1D; missCount: number }[];
+type MpPoseTrack = { id: number; centerX: number; centerY: number; lastSeenMs: number; missed: number };
+
 export class Component implements OnInit, OnDestroy {
     public prototypeInfo: any = null;
     public inputMode: string = 'webcam';
@@ -114,12 +127,15 @@ export class Component implements OnInit, OnDestroy {
     public selectedFiles: File[] = [];
     public selectedVideoUrl: string = '';
     public uploadWorkflowMode: 'analyze' | 'train' = 'analyze';
+    public trainingTargetModel: string = 'rf-dual';
     public videoMeta: any = { duration: 0, width: 0, height: 0, fps: 0 };
     public analysisSavedName: string = '';
     public dragover: boolean = false;
     public analyzing: boolean = false;
     public uploadProgress: number = 0;
     public analysisResult: any = null;
+    public rootAnalysisResult: any = null;
+    public selectedPersonAnalysisId: string = 'overall';
     public errorMessage: string = '';
     public uploadLogEntries: any[] = [];
     public uploadChunkSummary: any = null;
@@ -149,10 +165,20 @@ export class Component implements OnInit, OnDestroy {
     public trainingUploadMessageType: string = 'info';
     public trainingJob: any = null;
     public continuousTrainingStatus: any = null;
+    public continuousTrainingItems: any[] = [];
+    public continuousTrainingResuming: Record<string, boolean> = {};
     public trainingJobStarting: boolean = false;
     public trainingJobApplying: boolean = false;
     private trainingJobPollHandle: any = null;
     private continuousTrainingPollHandle: any = null;
+
+    public fallbackTrainingTargetOptions = [
+        { key: 'rf-dual', label: 'RF-Dual 통합', job_type: 'full', description: '낙상 Y/N과 행동 라벨을 함께 반영합니다.' },
+        { key: 'rf-fall-v2', label: 'RF-Fall v2', job_type: 'rf', description: '낙상/비낙상 이진 분류 보강 자료입니다.' },
+        { key: 'xg-posture', label: 'XG-Posture', job_type: 'posture', description: 'stand/walk/run/sit/lie 행동 분류 보강 자료입니다.' },
+        { key: 'facial-aihub82', label: 'AI-Hub 82 표정', job_type: 'aihub82', description: '표정 보조 모델 자료로 표시하고 연속 학습 상태를 추적합니다.' },
+        { key: 'driver-aihub173', label: 'AI-Hub 173 상태', job_type: 'aihub173', description: '졸림/하품/통화/흡연 보조 모델 자료로 표시합니다.' },
+    ];
 
     public postureClasses = [
         { code: 'stand', label: '서기', icon: '🧍' },
@@ -178,11 +204,18 @@ export class Component implements OnInit, OnDestroy {
     public mpFpsTimer: any = null;
     public mpResizeObserver: any = null;
     public mpLastFrameTime: number = 0;
+    public mpDetectedPoseCount: number = 0;
     public kalmanFilters: { x: Kalman1D; y: Kalman1D; missCount: number }[] = [];
+    private mpPoseKalmanFilters: { x: Kalman1D; y: Kalman1D; missCount: number }[][] = [];
+    private mpPoseTrackFilters: Record<number, MpLandmarkFilters> = {};
+    private mpPoseTracks: MpPoseTrack[] = [];
+    private mpNextPoseTrackId: number = 1;
     private readonly KF_MAX_MISS: number = 15;
     private readonly KF_VIS_THRESHOLD: number = 0.15;
+    private readonly KF_HAND_VIS_THRESHOLD: number = 0.55;
 
     public realtimeActive: boolean = false;
+    public realtimeStarting: boolean = false;
     public realtimeChunkCount: number = 0;
     public postureTimeline: { time: string; posture: string; label: string; score: number; chunkId: number }[] = [];
     public postureTransitions: { time: string; from: string; to: string; fromLabel: string; toLabel: string }[] = [];
@@ -202,6 +235,8 @@ export class Component implements OnInit, OnDestroy {
     private realtimeSessionStartedAt: number = 0;
     private dispatchQueue: { blob: Blob; chunkId: number; durationSec: number; chunkWindow: any; attempt?: number }[] = [];
     private dispatchWorkerRunning: boolean = false;
+    private realtimeWindowKeys: Set<string> = new Set();
+    private uploadAnalysisRequestKey: string = '';
     public dispatchQueueSize: number = 0;
     public dispatchMaxQueue: number = 6;
     public realtimeDispatching: boolean = false;
@@ -278,15 +313,15 @@ export class Component implements OnInit, OnDestroy {
 
     private getChunkConfig(): { version: string; chunkSec: number; spawnMs: number; maxSlots: number; maxQueue: number; bootstrapDurations: number[]; strideSec: number } {
         const backend = this.prototypeInfo?.chunk_policy?.realtime || {};
-        if (backend?.version === 'dense-bootstrap-v2') {
+        if (backend?.enabled === true || backend?.steady_sec || backend?.stride_sec) {
             return {
-                version: 'dense-bootstrap-v2',
+                version: String(backend?.version || 'overlap-4s-stride2-v3'),
                 chunkSec: Number(backend?.steady_sec || 4),
-                spawnMs: Number(backend?.spawn_ms || 4000),
+                spawnMs: Number(backend?.spawn_ms || 2000),
                 maxSlots: Number(backend?.max_slots || 2),
                 maxQueue: Number(backend?.max_queue || 120),
                 bootstrapDurations: Array.isArray(backend?.dense_intro) ? backend.dense_intro.map((v: any) => Number(v || 0)).filter((v: number) => v > 0) : [],
-                strideSec: Number(backend?.stride_sec || 4),
+                strideSec: Number(backend?.stride_sec || 2),
             };
         }
         const key = this.selectedModelType || '';
@@ -308,13 +343,160 @@ export class Component implements OnInit, OnDestroy {
 
     private async readJsonResponse(res: Response): Promise<any> {
         const text = await res.text();
-        try {
-            return JSON.parse(text);
-        } catch (e) {
-            const normalized = text.replace(/([:\[,]\s*)(?:NaN|-?Infinity)(?=\s*[,}\]])/g, (_match, prefix) => `${prefix}0`);
-            if (normalized !== text) return JSON.parse(normalized);
-            throw e;
+        const trimmed = String(text || '').trim();
+        if (!trimmed) {
+            throw new Error(`서버 응답이 비어 있습니다. HTTP ${res.status || 'unknown'}`);
         }
+        const contentType = String(res.headers?.get('content-type') || '').toLowerCase();
+        if (contentType.includes('text/html') || /^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed)) {
+            const titleMatch = trimmed.match(/<title[^>]*>(.*?)<\/title>/i);
+            const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : '';
+            const detail = title ? ` · ${title}` : '';
+            throw new Error(`서버가 JSON 대신 HTML 오류 페이지를 반환했습니다. HTTP ${res.status || 'unknown'}${detail}. 화면을 새로고침한 뒤 다시 시도하고, 계속 반복되면 파일 수를 줄여 나눠 등록하거나 학습 현황/서버 로그를 확인하세요.`);
+        }
+        try {
+            return JSON.parse(trimmed);
+        } catch (e) {
+            const normalized = trimmed.replace(/([:\[,]\s*)(?:NaN|-?Infinity)(?=\s*[,}\]])/g, (_match, prefix) => `${prefix}0`);
+            if (normalized !== trimmed) {
+                try {
+                    return JSON.parse(normalized);
+                } catch (_normalizedError) { }
+            }
+            const snippet = trimmed.replace(/\s+/g, ' ').slice(0, 180);
+            if (/^upstream\b/i.test(snippet) || snippet.includes('upstream connect error')) {
+                throw new Error(`서버 업스트림 연결이 끊겼습니다. 요청은 일부 처리됐을 수 있으니 학습 현황을 새로고침해 확인하세요. (${snippet})`);
+            }
+            throw new Error(`서버가 JSON이 아닌 응답을 반환했습니다. HTTP ${res.status || 'unknown'} · ${snippet}`);
+        }
+    }
+
+    private requestErrorMessage(error: any, context: string = '요청'): string {
+        const raw = String(error?.message || error || '').trim();
+        if (raw.includes('JSON 대신 HTML') || raw.includes('<!DOCTYPE') || raw.includes('Unexpected token')) {
+            return `${context} 오류: 서버가 정상 JSON 대신 오류 화면을 반환했습니다. 먼저 페이지를 새로고침하고 다시 시도하세요. 계속 반복되면 선택한 파일을 100개 이하로 나눠 등록하고, 학습 현황 카드에서 저장 여부를 확인하세요. 상세: ${raw}`;
+        }
+        if (raw.includes('upstream connect error') || raw.includes('업스트림')) {
+            return `${context} 오류: 서버 연결이 중간에 끊겼습니다. 일부 파일은 저장됐을 수 있으니 학습 현황을 새로고침한 뒤, 실패한 파일만 다시 등록하세요. 상세: ${raw}`;
+        }
+        return `${context} 오류: ${raw || '알 수 없는 오류'}`;
+    }
+
+    private currentRootAnalysisResult(): any {
+        return this.rootAnalysisResult || this.analysisResult || null;
+    }
+
+    private findPersonAnalysisItem(personId: string, root?: any): any {
+        const target = String(personId || '');
+        const people = (root || this.currentRootAnalysisResult())?.multi_person?.people || [];
+        if (!Array.isArray(people) || !target) return null;
+        return people.find((item: any) => String(item?.id || '') === target || String(item?.track_id || '') === target || String(item?.person_label || '') === target) || null;
+    }
+
+    private applyAnalysisRoot(result: any, preserveSelection: boolean = true) {
+        this.rootAnalysisResult = result || null;
+        const previousId = preserveSelection ? String(this.selectedPersonAnalysisId || 'overall') : 'overall';
+        const selectedItem = previousId !== 'overall' ? this.findPersonAnalysisItem(previousId, result) : null;
+        if (selectedItem?.result) {
+            this.selectedPersonAnalysisId = String(selectedItem.id || previousId);
+            this.analysisResult = selectedItem.result;
+        } else {
+            this.selectedPersonAnalysisId = 'overall';
+            this.analysisResult = result || null;
+        }
+        this.detectionReplayIndex = 0;
+        if (this.detectionReplayPlaying) this.stopDetectionReplay();
+    }
+
+    private clearAnalysisState() {
+        this.rootAnalysisResult = null;
+        this.analysisResult = null;
+        this.selectedPersonAnalysisId = 'overall';
+        this.detectionReplayIndex = 0;
+        if (this.detectionReplayPlaying) this.stopDetectionReplay();
+    }
+
+    public selectPersonAnalysis(personId: string) {
+        const root = this.currentRootAnalysisResult();
+        if (!root) return;
+        const nextId = String(personId || 'overall');
+        if (nextId === 'overall' || nextId === String(this.selectedPersonAnalysisId || 'overall')) {
+            this.selectedPersonAnalysisId = 'overall';
+            this.analysisResult = root;
+        } else {
+            const item = this.findPersonAnalysisItem(nextId, root);
+            if (!item?.result) return;
+            this.selectedPersonAnalysisId = String(item.id || nextId);
+            this.analysisResult = item.result;
+        }
+        this.detectionReplayIndex = 0;
+        if (this.detectionReplayPlaying) this.stopDetectionReplay();
+        this.updateRealtimeOverlay();
+        this.service.render();
+    }
+
+    public multiPersonPeople(): any[] {
+        const people = this.currentRootAnalysisResult()?.multi_person?.people || [];
+        return Array.isArray(people) ? people : [];
+    }
+
+    public hasMultiPersonCards(): boolean {
+        return this.multiPersonPeople().length > 0;
+    }
+
+    public multiPersonSummaryLine(): string {
+        const root = this.currentRootAnalysisResult() || {};
+        return root?.multi_person?.summary_line || `${this.multiPersonPeople().length}명 사람별 행동 분석`;
+    }
+
+    public multiPersonCardItems(): any[] {
+        return this.multiPersonPeople();
+    }
+
+    public isPersonAnalysisSelected(): boolean {
+        return this.selectedPersonAnalysisId !== 'overall' && Boolean(this.analysisResult?.person_id || this.analysisResult?.runtime_inference?.person_track);
+    }
+
+    public selectedPersonDetailsVisible(): boolean {
+        return !this.hasMultiPersonCards() || this.isPersonAnalysisSelected();
+    }
+
+    public realtimeDetailOverlayTop(): string {
+        return this.hasMultiPersonCards() ? '244px' : '12px';
+    }
+
+    public personCardClass(item: any): string {
+        const selected = String(item?.id || '') === String(this.selectedPersonAnalysisId || 'overall');
+        const level = item?.risk_level || 'low';
+        const base = selected ? 'ring-2 ring-sky-400 border-sky-300 ' : 'border-zinc-200 ';
+        if (level === 'high') return base + 'bg-rose-50 text-rose-950';
+        if (level === 'medium') return base + 'bg-amber-50 text-amber-950';
+        return base + 'bg-white text-zinc-900';
+    }
+
+    public personCardDotClass(item: any): string {
+        const level = item?.risk_level || 'low';
+        if (level === 'high') return 'bg-rose-500';
+        if (level === 'medium') return 'bg-amber-500';
+        return 'bg-emerald-500';
+    }
+
+    public personCardRiskText(item: any): string {
+        const pct = Math.round(Number(item?.risk_score || 0) * 100);
+        const label = String(item?.risk_label || '').trim();
+        return `${pct}%${label ? ' · ' + label : ''}`;
+    }
+
+    public personCardMetaText(item: any): string {
+        const frames = Number(item?.frame_count || 0);
+        const conf = Math.round(Number(item?.avg_conf || 0) * 100);
+        return `${frames}프레임 · 포즈 ${conf}%`;
+    }
+
+    public selectedPersonHeaderText(): string {
+        if (this.selectedPersonAnalysisId === 'overall') return '인원 선택';
+        const item = this.findPersonAnalysisItem(this.selectedPersonAnalysisId);
+        return item?.person_label ? `${item.person_label} 분석` : '선택 인원 분석';
     }
 
     private async warmupRealtimeModels() {
@@ -397,7 +579,10 @@ export class Component implements OnInit, OnDestroy {
             blobUrl: options.blobUrl || '',
             result: { ...result },
             score: result?.risk_score || 0,
-            level: result?.risk_level || 'low',
+            rawLevel: result?.raw_risk_level || result?.risk_level || 'low',
+            level: result?.display_risk_level || result?.risk_level || 'low',
+            displayRiskLabel: result?.display_risk_label || '',
+            overlapContext: result?.overlap_context || null,
             label: logLabel,
             posture: postureRaw,
             postureLabel: postureDisplayLabel,
@@ -449,7 +634,7 @@ export class Component implements OnInit, OnDestroy {
     public chunkBarWidth(entry: any, totalSec: number): string { return this.chunkBarStyle(entry, totalSec).width; }
 
     public async ngOnInit() {
-        await this.service.init();
+        await this.service.init(this);
         this.restorePrivacyViewMode();
         await this.loadPrototypeInfo();
         await this.loadContinuousTrainingStatus();
@@ -458,9 +643,10 @@ export class Component implements OnInit, OnDestroy {
         try {
             const saved = localStorage.getItem(LAST_ANALYSIS_STORAGE_KEY);
             if (saved && this.inputMode === 'upload') {
-                this.analysisResult = JSON.parse(saved);
-                this.analysisSavedName = this.analysisResult?.saved_name || '';
-                this.alertWorkflow = this.analysisResult?.alert_workflow || null;
+                const restored = JSON.parse(saved);
+                this.applyAnalysisRoot(restored, false);
+                this.analysisSavedName = restored?.saved_name || '';
+                this.alertWorkflow = restored?.alert_workflow || null;
             }
         } catch (e) { }
         await this.service.render();
@@ -494,6 +680,7 @@ export class Component implements OnInit, OnDestroy {
     public async setPrivacyViewMode(mode: 'skeleton' | 'raw') {
         this.privacyViewMode = mode === 'raw' ? 'raw' : 'skeleton';
         try { localStorage.setItem(PRIVACY_VIEW_STORAGE_KEY, this.privacyViewMode); } catch (e) { }
+        if (this.isSkeletonPrivacyMode()) this.clearRealtimeServerDetectionOverlay();
         await this.service.render();
     }
 
@@ -516,12 +703,21 @@ export class Component implements OnInit, OnDestroy {
         await this.service.render();
         try {
             const { code, data }: any = await wiz.call('prototype_info');
-            if (code === 200) this.prototypeInfo = data;
+            if (code === 200) {
+                this.prototypeInfo = data;
+                const optionKeys = this.analysisModelOptionsForView().map((item: any) => String(item?.key || ''));
+                if (optionKeys.length > 0 && !optionKeys.includes(this.selectedModelType)) {
+                    this.selectedModelType = String(this.prototypeInfo?.model_options?.default || optionKeys[0] || 'rf-dual');
+                }
+            }
             else this.errorMessage = data?.message || '프로토타입 정보를 불러오지 못했습니다.';
         } catch (e: any) {
             this.errorMessage = e?.message || '프로토타입 정보를 불러오지 못했습니다.';
         }
         this.continuousTrainingStatus = this.prototypeInfo?.continuous_training?.aihub82 || this.continuousTrainingStatus;
+        this.continuousTrainingItems = this.normalizeContinuousTrainingItems(
+            this.prototypeInfo?.continuous_training_items || this.prototypeInfo?.continuous_training
+        );
         this.loadingInfo = false;
         await this.service.render();
     }
@@ -539,7 +735,7 @@ export class Component implements OnInit, OnDestroy {
         if (this.inputMode === mode) return;
         this.inputMode = mode;
         this.errorMessage = '';
-        this.analysisResult = null;
+        this.clearAnalysisState();
         this.feedbackStatus = '';
         this.feedbackMessage = '';
         if (mode === 'webcam') await this.ensureWebcamReady();
@@ -600,7 +796,7 @@ export class Component implements OnInit, OnDestroy {
             this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
                 baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task', delegate: 'GPU' },
                 runningMode: 'VIDEO',
-                numPoses: 1,
+                numPoses: MP_MAX_POSES,
             });
             this.mpReady = true;
             this.startPoseLoop();
@@ -617,6 +813,7 @@ export class Component implements OnInit, OnDestroy {
         this.mpRunning = true;
         this.mpFrameCount = 0;
         this.mpLastFrameTime = 0;
+        this.resetMediaPipeTracks();
         this.initKalmanFilters();
         this.mpFpsTimer = setInterval(() => { this.mpFps = this.mpFrameCount; this.mpFrameCount = 0; }, 1000);
         const canvasEl = this._mpPoseCanvasEl?.nativeElement || document.querySelector('[data-mp-pose-canvas]') as HTMLCanvasElement;
@@ -646,11 +843,92 @@ export class Component implements OnInit, OnDestroy {
         if (this.mpFpsTimer) { clearInterval(this.mpFpsTimer); this.mpFpsTimer = null; }
         if (this.mpResizeObserver) { this.mpResizeObserver.disconnect(); this.mpResizeObserver = null; }
         this.kalmanFilters = [];
+        this.mpPoseKalmanFilters = [];
+        this.resetMediaPipeTracks();
+        this.mpDetectedPoseCount = 0;
     }
 
-    private initKalmanFilters() {
-        this.kalmanFilters = [];
-        for (let i = 0; i < 33; i++) this.kalmanFilters.push({ x: new Kalman1D(), y: new Kalman1D(), missCount: 0 });
+    private createLandmarkFilters() {
+        const filters: { x: Kalman1D; y: Kalman1D; missCount: number }[] = [];
+        for (let i = 0; i < 33; i++) filters.push({ x: new Kalman1D(), y: new Kalman1D(), missCount: 0 });
+        return filters;
+    }
+
+    private initKalmanFilters(maxPoses: number = MP_MAX_POSES) {
+        this.mpPoseKalmanFilters = [];
+        for (let i = 0; i < maxPoses; i++) this.mpPoseKalmanFilters.push(this.createLandmarkFilters());
+        this.kalmanFilters = this.mpPoseKalmanFilters[0] || [];
+    }
+
+    private getPoseKalmanFilters(poseIndex: number) {
+        while (this.mpPoseKalmanFilters.length <= poseIndex) this.mpPoseKalmanFilters.push(this.createLandmarkFilters());
+        this.kalmanFilters = this.mpPoseKalmanFilters[0] || [];
+        return this.mpPoseKalmanFilters[poseIndex];
+    }
+
+    private resetMediaPipeTracks() {
+        this.mpPoseTracks = [];
+        this.mpPoseTrackFilters = {};
+        this.mpNextPoseTrackId = 1;
+    }
+
+    private getPoseKalmanFiltersForTrack(trackId: number): MpLandmarkFilters {
+        const key = Math.max(1, Math.round(Number(trackId || 1)));
+        if (!this.mpPoseTrackFilters[key]) this.mpPoseTrackFilters[key] = this.createLandmarkFilters();
+        this.kalmanFilters = this.mpPoseTrackFilters[1] || this.mpPoseTrackFilters[key] || [];
+        return this.mpPoseTrackFilters[key];
+    }
+
+    private mediaPipePoseCenter(landmarks: any[]): { x: number; y: number; visible: number } | null {
+        let sx = 0, sy = 0, n = 0;
+        for (const lm of landmarks || []) {
+            if ((lm?.visibility ?? 0) < this.KF_VIS_THRESHOLD) continue;
+            const p = this.normalizeMediaPipePoint(lm);
+            sx += p.x;
+            sy += p.y;
+            n++;
+        }
+        if (n <= 0) return null;
+        return { x: sx / n, y: sy / n, visible: n };
+    }
+
+    private assignMediaPipeTracks(candidates: { landmarks: any[]; sourceIndex: number; center: { x: number; y: number; visible: number } }[], nowMs: number) {
+        const usedTrackIds = new Set<number>();
+        this.mpPoseTracks = this.mpPoseTracks.filter(track => {
+            const alive = nowMs - Number(track.lastSeenMs || 0) <= 1800 && Number(track.missed || 0) <= 25;
+            if (!alive) delete this.mpPoseTrackFilters[track.id];
+            return alive;
+        });
+        const assigned: { landmarks: any[]; sourceIndex: number; trackId: number }[] = [];
+        for (const candidate of candidates) {
+            let best: MpPoseTrack | null = null;
+            let bestScore = Number.POSITIVE_INFINITY;
+            for (const track of this.mpPoseTracks) {
+                if (usedTrackIds.has(track.id)) continue;
+                const stalePenalty = Math.min(0.12, Math.max(0, nowMs - Number(track.lastSeenMs || nowMs)) / 1000 * 0.04);
+                const distance = Math.hypot(candidate.center.x - track.centerX, candidate.center.y - track.centerY) + stalePenalty;
+                if (distance < bestScore) {
+                    bestScore = distance;
+                    best = track;
+                }
+            }
+            const threshold = candidate.center.visible >= 12 ? 0.22 : 0.16;
+            if (!best || bestScore > threshold) {
+                best = { id: this.mpNextPoseTrackId++, centerX: candidate.center.x, centerY: candidate.center.y, lastSeenMs: nowMs, missed: 0 };
+                this.mpPoseTracks.push(best);
+            } else {
+                best.centerX = candidate.center.x;
+                best.centerY = candidate.center.y;
+                best.lastSeenMs = nowMs;
+                best.missed = 0;
+            }
+            usedTrackIds.add(best.id);
+            assigned.push({ landmarks: candidate.landmarks, sourceIndex: candidate.sourceIndex, trackId: best.id });
+        }
+        for (const track of this.mpPoseTracks) {
+            if (!usedTrackIds.has(track.id)) track.missed = Number(track.missed || 0) + 1;
+        }
+        return assigned;
     }
 
     private getMediaPipeInputSource(videoEl: HTMLVideoElement): any {
@@ -689,6 +967,21 @@ export class Component implements OnInit, OnDestroy {
         return { x: Math.max(0, Math.min(1, x)), y: Math.max(0, Math.min(1, y)) };
     }
 
+    private mediaPipeLandmarkVisible(lm: any, index: number): boolean {
+        if (MP_HAND_DETAIL_LANDMARKS.has(index)) return false;
+        const visibility = Number(lm?.visibility ?? 0);
+        const presenceRaw = lm?.presence;
+        const presence = presenceRaw == null ? 1 : Number(presenceRaw || 0);
+        const threshold = MP_WRIST_LANDMARKS.has(index) ? this.KF_HAND_VIS_THRESHOLD : this.KF_VIS_THRESHOLD;
+        return visibility >= threshold && presence >= threshold;
+    }
+
+    private cocoKeypointVisible(kp: any, index: number): boolean {
+        if (!kp) return false;
+        const conf = Number(kp[2] || 0);
+        return conf >= (COCO_HAND_KEYPOINTS.has(index) ? this.KF_HAND_VIS_THRESHOLD : 0.30);
+    }
+
     private drawMpPose() {
         if (this.mpProcessing || !this.poseLandmarker) return;
         const videoEl = this.webcamVideoRef?.nativeElement;
@@ -698,55 +991,89 @@ export class Component implements OnInit, OnDestroy {
         if (!canvasEl) return;
         const ctx = canvasEl.getContext('2d');
         if (!ctx) return;
-        if (canvasEl.width === 0 || canvasEl.height === 0) {
-            canvasEl.width = videoEl.videoWidth || videoEl.clientWidth;
-            canvasEl.height = videoEl.videoHeight || videoEl.clientHeight;
+        const canvasRect = canvasEl.getBoundingClientRect();
+        const targetW = Math.max(1, Math.round(canvasRect.width || videoEl.clientWidth || videoEl.videoWidth || 1));
+        const targetH = Math.max(1, Math.round(canvasRect.height || videoEl.clientHeight || videoEl.videoHeight || 1));
+        if (canvasEl.width !== targetW || canvasEl.height !== targetH) {
+            canvasEl.width = targetW;
+            canvasEl.height = targetH;
         }
         this.mpProcessing = true;
         try {
             const mpInput = this.getMediaPipeInputSource(videoEl);
-            const result = this.poseLandmarker.detectForVideo(mpInput, performance.now());
+            const detectTs = performance.now();
+            const result = this.poseLandmarker.detectForVideo(mpInput, detectTs);
             ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
             if (result.landmarks && result.landmarks.length > 0) {
-                const landmarks = result.landmarks[0];
+                const poses = result.landmarks.slice(0, MP_MAX_POSES);
                 const displayRect = this.getVideoContentRect(videoEl);
                 const offX = displayRect.x; const offY = displayRect.y;
                 const w = displayRect.w; const h = displayRect.h;
-                if (this.kalmanFilters.length === 0) this.initKalmanFilters();
-                const pts: { x: number; y: number; predicted: boolean; valid: boolean }[] = [];
-                for (let k = 0; k < landmarks.length; k++) {
-                    const lm = landmarks[k];
-                    const vis = (lm.visibility ?? 0) >= this.KF_VIS_THRESHOLD;
-                    const kf = this.kalmanFilters[k];
-                    const p = this.normalizeMediaPipePoint(lm);
-                    if (!kf) { pts.push({ x: p.x, y: p.y, predicted: false, valid: vis }); continue; }
-                    kf.x.predict(); kf.y.predict();
-                    if (vis) {
-                        const fx = kf.x.update(p.x); const fy = kf.y.update(p.y); kf.missCount = 0; pts.push({ x: fx, y: fy, predicted: false, valid: true });
-                    } else {
-                        kf.missCount++;
-                        if (kf.x.initialized && kf.missCount < this.KF_MAX_MISS) pts.push({ x: kf.x.position, y: kf.y.position, predicted: true, valid: true });
-                        else pts.push({ x: 0, y: 0, predicted: false, valid: false });
+                if (this.mpPoseKalmanFilters.length === 0) this.initKalmanFilters(MP_MAX_POSES);
+                const poseCandidates = poses
+                    .map((landmarks: any[], sourceIndex: number) => ({ landmarks: landmarks || [], sourceIndex, center: this.mediaPipePoseCenter(landmarks || []) }))
+                    .filter((item: any) => !!item.center);
+                const trackedPoses = this.assignMediaPipeTracks(poseCandidates as any, detectTs);
+                this.mpDetectedPoseCount = trackedPoses.length;
+                for (let poseIndex = 0; poseIndex < trackedPoses.length; poseIndex++) {
+                    const trackedPose = trackedPoses[poseIndex];
+                    const landmarks = trackedPose.landmarks || [];
+                    const filters = this.getPoseKalmanFiltersForTrack(trackedPose.trackId);
+                    const personColor = MP_PERSON_COLORS[(trackedPose.trackId - 1) % MP_PERSON_COLORS.length];
+                    const pts: { x: number; y: number; predicted: boolean; valid: boolean }[] = [];
+                    for (let k = 0; k < landmarks.length; k++) {
+                        const lm = landmarks[k];
+                        const vis = this.mediaPipeLandmarkVisible(lm, k);
+                        const kf = filters[k];
+                        const p = this.normalizeMediaPipePoint(lm);
+                        if (!kf) { pts.push({ x: p.x, y: p.y, predicted: false, valid: vis }); continue; }
+                        kf.x.predict(); kf.y.predict();
+                        if (vis) {
+                            const fx = kf.x.update(p.x); const fy = kf.y.update(p.y); kf.missCount = 0; pts.push({ x: fx, y: fy, predicted: false, valid: true });
+                        } else {
+                            kf.missCount++;
+                            if (!MP_WRIST_LANDMARKS.has(k) && !MP_HAND_DETAIL_LANDMARKS.has(k) && kf.x.initialized && kf.missCount < this.KF_MAX_MISS) pts.push({ x: kf.x.position, y: kf.y.position, predicted: true, valid: true });
+                            else pts.push({ x: 0, y: 0, predicted: false, valid: false });
+                        }
+                    }
+                    for (const [i, j] of MP_POSE_CONNECTIONS) {
+                        if (MP_HAND_DETAIL_LANDMARKS.has(i) || MP_HAND_DETAIL_LANDMARKS.has(j)) continue;
+                        const a = pts[i], b = pts[j];
+                        if (!a?.valid || !b?.valid) continue;
+                        const pred = a.predicted || b.predicted;
+                        ctx.beginPath(); ctx.moveTo(offX + a.x * w, offY + a.y * h); ctx.lineTo(offX + b.x * w, offY + b.y * h);
+                        ctx.strokeStyle = this.colorWithAlpha(pred ? (MP_LANDMARK_COLORS[i] || personColor) : personColor, pred ? 0.28 : 0.86);
+                        ctx.lineWidth = pred ? 1 : (trackedPose.trackId === 1 ? 2 : 1.5); ctx.setLineDash(pred ? [4, 4] : []); ctx.stroke();
+                    }
+                    ctx.setLineDash([]);
+                    let minX = 1, minY = 1, hasPoint = false;
+                    for (let k = 0; k < pts.length; k++) {
+                        if (MP_HAND_DETAIL_LANDMARKS.has(k)) continue;
+                        const pt = pts[k];
+                        if (!pt.valid) continue;
+                        minX = Math.min(minX, pt.x);
+                        minY = Math.min(minY, pt.y);
+                        hasPoint = true;
+                        ctx.beginPath(); ctx.arc(offX + pt.x * w, offY + pt.y * h, pt.predicted ? 2 : 3, 0, 2 * Math.PI);
+                        if (pt.predicted) { ctx.strokeStyle = this.colorWithAlpha(personColor, 0.45); ctx.lineWidth = 1; ctx.stroke(); }
+                        else { ctx.fillStyle = personColor; ctx.fill(); }
+                    }
+                    if (hasPoint) {
+                        const labelX = Math.max(offX + 2, Math.min(offX + minX * w, offX + w - 24));
+                        const labelY = Math.max(offY + 14, Math.min(offY + minY * h - 4, offY + h - 4));
+                        ctx.font = '11px sans-serif';
+                        ctx.fillStyle = this.colorWithAlpha(personColor, 0.88);
+                        ctx.fillText(`P${trackedPose.trackId}`, labelX, labelY);
                     }
                 }
-                for (const [i, j] of MP_POSE_CONNECTIONS) {
-                    const a = pts[i], b = pts[j];
-                    if (!a?.valid || !b?.valid) continue;
-                    const pred = a.predicted || b.predicted;
-                    ctx.beginPath(); ctx.moveTo(offX + a.x * w, offY + a.y * h); ctx.lineTo(offX + b.x * w, offY + b.y * h);
-                    ctx.strokeStyle = this.colorWithAlpha(MP_LANDMARK_COLORS[i] || '#67e8f9', pred ? 0.3 : 0.9);
-                    ctx.lineWidth = pred ? 1 : 2; ctx.setLineDash(pred ? [4, 4] : []); ctx.stroke();
-                }
-                ctx.setLineDash([]);
-                for (let k = 0; k < pts.length; k++) {
-                    const pt = pts[k];
-                    if (!pt.valid) continue;
-                    ctx.beginPath(); ctx.arc(offX + pt.x * w, offY + pt.y * h, pt.predicted ? 2 : 3, 0, 2 * Math.PI);
-                    if (pt.predicted) { ctx.strokeStyle = this.colorWithAlpha(MP_LANDMARK_COLORS[k] || '#67e8f9', 0.5); ctx.lineWidth = 1; ctx.stroke(); }
-                    else { ctx.fillStyle = MP_LANDMARK_COLORS[k] || '#67e8f9'; ctx.fill(); }
-                }
             } else if (this.kalmanFilters.length > 0) {
-                for (const kf of this.kalmanFilters) { kf.x.predict(); kf.y.predict(); kf.missCount++; }
+                this.mpDetectedPoseCount = 0;
+                for (const filters of this.mpPoseKalmanFilters) {
+                    for (const kf of filters) { kf.x.predict(); kf.y.predict(); kf.missCount++; }
+                }
+                for (const filters of Object.values(this.mpPoseTrackFilters)) {
+                    for (const kf of filters) { kf.x.predict(); kf.y.predict(); kf.missCount++; }
+                }
             }
             this.mpFrameCount++;
         } catch (e) { }
@@ -759,26 +1086,35 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public async startRealtimeAnalysis() {
-        if (this.realtimeActive || !this.webcamStream) return;
+        if (this.realtimeStarting || this.realtimeActive || !this.webcamStream) return;
+        this.realtimeStarting = true;
         this.realtimePerfStats = { avgRtt: 0, avgServer: 0, currentInterval: 0, discarded: 0, queued: 0, retrying: 0, failed: 0 };
-        await this.warmupRealtimeModels();
-        this.realtimeActive = true;
-        this.realtimeSessionId = `rt-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        this.realtimeSessionStartedAt = Date.now();
-        this.realtimeChunkCount = 0;
-        this.realtimeScoreHistory = [];
-        this.realtimeCumulativeScore = 0;
-        this.realtimeLogEntries = [];
-        this.realtimeLastElapsed = 0;
-        this.postureTimeline = []; this.postureTransitions = []; this.currentPosture = ''; this.currentPostureLabel = ''; this.postureTransitionText = '';
-        this.realtimeOverlayScore = 0; this.realtimeOverlayLevel = 'low'; this.realtimeOverlayLabel = '대기'; this.realtimeOverlayBasis = ''; this.lastNonEmptyOverlayBasis = '';
-        this.realtimeRoundTripHistory = []; this.realtimeServerTimeHistory = [];
-        this.dispatchQueue = []; this.dispatchQueueSize = 0; this.dispatchWorkerRunning = false; this.nextSlotId = 0; this.recorderSlots = []; this.errorMessage = '';
+        this.errorMessage = '';
         await this.service.render();
-        const chunkCfg = this.getChunkConfig();
-        if (chunkCfg.bootstrapDurations.length > 0) for (const durationSec of chunkCfg.bootstrapDurations) this.spawnRecorderSlot(durationSec);
-        else this.spawnRecorderSlot(chunkCfg.chunkSec);
-        this.recorderSpawnTimer = setInterval(() => { if (!this.realtimeActive) return; this.spawnRecorderSlot(chunkCfg.chunkSec); }, chunkCfg.spawnMs);
+        try {
+            await this.warmupRealtimeModels();
+            if (!this.webcamStream) return;
+            this.realtimeActive = true;
+            this.realtimeSessionId = `rt-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+            this.realtimeSessionStartedAt = Date.now();
+            this.realtimeChunkCount = 0;
+            this.realtimeScoreHistory = [];
+            this.realtimeCumulativeScore = 0;
+            this.realtimeLogEntries = [];
+            this.realtimeLastElapsed = 0;
+            this.postureTimeline = []; this.postureTransitions = []; this.currentPosture = ''; this.currentPostureLabel = ''; this.postureTransitionText = '';
+            this.realtimeOverlayScore = 0; this.realtimeOverlayLevel = 'low'; this.realtimeOverlayLabel = '대기'; this.realtimeOverlayBasis = ''; this.lastNonEmptyOverlayBasis = '';
+            this.realtimeRoundTripHistory = []; this.realtimeServerTimeHistory = [];
+            this.dispatchQueue = []; this.dispatchQueueSize = 0; this.dispatchWorkerRunning = false; this.nextSlotId = 0; this.recorderSlots = []; this.realtimeWindowKeys.clear(); this.errorMessage = '';
+            await this.service.render();
+            const chunkCfg = this.getChunkConfig();
+            if (chunkCfg.bootstrapDurations.length > 0) for (const durationSec of chunkCfg.bootstrapDurations) this.spawnRecorderSlot(durationSec);
+            else this.spawnRecorderSlot(chunkCfg.chunkSec);
+            this.recorderSpawnTimer = setInterval(() => { if (!this.realtimeActive) return; this.spawnRecorderSlot(chunkCfg.chunkSec); }, chunkCfg.spawnMs);
+        } finally {
+            this.realtimeStarting = false;
+            await this.service.render();
+        }
     }
 
     private spawnRecorderSlot(durationSec?: number) {
@@ -813,7 +1149,19 @@ export class Component implements OnInit, OnDestroy {
         }
     }
 
+    private realtimeWindowKey(chunkWindow: any): string {
+        const start = Math.round(Number(chunkWindow?.start_sec ?? chunkWindow?.startSec ?? 0));
+        const end = Math.round(Number(chunkWindow?.end_sec ?? chunkWindow?.endSec ?? start));
+        return `${start}-${end}`;
+    }
+
     private enqueueChunk(blob: Blob, chunkId: number, durationSec: number, chunkWindow: any) {
+        const key = this.realtimeWindowKey(chunkWindow);
+        if (this.realtimeWindowKeys.has(key)) {
+            this.realtimePerfStats.discarded = (this.realtimePerfStats.discarded || 0) + 1;
+            return;
+        }
+        this.realtimeWindowKeys.add(key);
         this.dispatchQueue.push({ blob, chunkId, durationSec, chunkWindow, attempt: 0 });
         this.dispatchQueueSize = this.dispatchQueue.length;
         this.realtimePerfStats.queued = this.dispatchQueueSize;
@@ -828,7 +1176,7 @@ export class Component implements OnInit, OnDestroy {
             this.dispatchQueueSize = this.dispatchQueue.length;
             this.realtimePerfStats.queued = this.dispatchQueueSize;
             const ok = await this.dispatchRealtimeChunk(item.blob, item.chunkId, item.durationSec, item.chunkWindow);
-            if (!ok && this.realtimeActive) {
+            if (!ok && this.realtimeActive && Number(item.attempt || 0) < 2) {
                 item.attempt = Number(item.attempt || 0) + 1;
                 this.realtimePerfStats.retrying = item.attempt;
                 this.dispatchQueue.push(item);
@@ -843,13 +1191,13 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public async stopRealtimeAnalysis() {
-        this.realtimeActive = false; this.realtimeSessionId = ''; this.realtimeSessionStartedAt = 0;
+        this.realtimeStarting = false; this.realtimeActive = false; this.realtimeSessionId = ''; this.realtimeSessionStartedAt = 0;
         if (this.recorderSpawnTimer) { clearInterval(this.recorderSpawnTimer); this.recorderSpawnTimer = null; }
         for (const slot of this.recorderSlots) {
             if (slot.timer) clearTimeout(slot.timer);
             if (slot.recorder.state === 'recording') { try { slot.recorder.stop(); } catch (e) { } }
         }
-        this.recorderSlots = []; this.dispatchQueue = []; this.dispatchQueueSize = 0;
+        this.recorderSlots = []; this.dispatchQueue = []; this.dispatchQueueSize = 0; this.realtimeWindowKeys.clear();
         await this.service.render();
     }
 
@@ -864,7 +1212,7 @@ export class Component implements OnInit, OnDestroy {
             const json = await this.readJsonResponse(res);
             if (json.code === 200 && json.data) {
                 const result = json.data;
-                this.analysisResult = result;
+                this.applyAnalysisRoot(result, true);
                 this.analysisSavedName = result.saved_name || '';
                 this.realtimeLastElapsed = result.server_timing?.total_server_sec || 0;
                 const score = result.risk_score || 0;
@@ -876,6 +1224,7 @@ export class Component implements OnInit, OnDestroy {
                 for (let i = 0; i < n; i++) { const w = weights[weights.length - n + i] || 1; wSum += this.realtimeScoreHistory[i] * w; wTotal += w; }
                 this.realtimeCumulativeScore = wSum / wTotal;
                 this.updateRealtimeOverlay();
+                this.drawRealtimeServerDetectionOverlay(result);
                 this.pushRealtimeLog(blob, chunkId, chunkWindow);
                 const rtt = performance.now() - startTime;
                 this.realtimeRoundTripHistory.push(rtt);
@@ -902,7 +1251,8 @@ export class Component implements OnInit, OnDestroy {
 
     private updateRealtimeOverlay() {
         if (!this.analysisResult) return;
-        this.realtimeOverlayScore = Math.round(this.realtimeCumulativeScore * 100);
+        const displayScore = this.isPersonAnalysisSelected() ? Number(this.analysisResult?.risk_score || 0) : this.realtimeCumulativeScore;
+        this.realtimeOverlayScore = Math.round(displayScore * 100);
         const level = this.analysisResult?.risk_level || 'low';
         this.realtimeOverlayLevel = level;
         this.realtimeOverlayLabel = this.realtimePendingConfirmation ? '확인 대기' : this.analysisResult?.fall_detected ? '낙상 감지' : this.nonFallRealtimeLabel(this.analysisResult);
@@ -977,15 +1327,53 @@ export class Component implements OnInit, OnDestroy {
         this.selectedVideoUrl = '';
     }
 
-    private async setSelectedUploadFiles(files: File[]) {
-        const cleanFiles = (files || []).filter(Boolean);
-        if (cleanFiles.length === 0) return;
+    private fileIdentity(file: File): string {
+        const anyFile: any = file as any;
+        return [
+            anyFile.webkitRelativePath || file.name || '',
+            file.size || 0,
+            file.lastModified || 0,
+        ].join('|');
+    }
+
+    private dedupeUploadFiles(files: File[]): File[] {
+        const seen = new Set<string>();
+        const out: File[] = [];
+        for (const file of files || []) {
+            if (!file) continue;
+            const key = this.fileIdentity(file);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(file);
+        }
+        return out;
+    }
+
+    private uploadFolderKey(file: File): string {
+        const rel = String((file as any)?.webkitRelativePath || '');
+        if (!rel || !rel.includes('/')) return '';
+        return rel.split('/').slice(0, -1).join('/');
+    }
+
+    private uploadDisplayName(file: File): string {
+        const rel = String((file as any)?.webkitRelativePath || '');
+        return rel || file.name || '파일';
+    }
+
+    private async syncSelectedUploadPreview(files: File[]) {
+        const cleanFiles = this.dedupeUploadFiles(files);
         this.revokeSelectedVideoUrl();
         this.selectedFiles = cleanFiles;
         const firstVideo = cleanFiles.find(file => this.isUploadVideoFile(file)) || null;
         this.selectedFile = firstVideo;
         this.selectedVideoUrl = firstVideo ? URL.createObjectURL(firstVideo) : '';
-        this.analysisResult = null;
+    }
+
+    private async setSelectedUploadFiles(files: File[]) {
+        const cleanFiles = (files || []).filter(Boolean);
+        if (cleanFiles.length === 0) return;
+        await this.syncSelectedUploadPreview(cleanFiles);
+        this.clearAnalysisState();
         this.feedbackStatus = '';
         this.feedbackMessage = '';
         this.trainingUploadMessage = '';
@@ -1000,6 +1388,12 @@ export class Component implements OnInit, OnDestroy {
     public async onFileSelected(event: any) {
         const files = Array.from(event?.target?.files || []) as File[];
         await this.setSelectedUploadFiles(files);
+        if (event?.target) event.target.value = '';
+    }
+    public async onFolderSelected(event: any) {
+        const files = Array.from(event?.target?.files || []) as File[];
+        await this.setSelectedUploadFiles(files);
+        if (event?.target) event.target.value = '';
     }
     public async onDrop(event: DragEvent) {
         event.preventDefault();
@@ -1028,6 +1422,73 @@ export class Component implements OnInit, OnDestroy {
         return `${count}개 선택 · ${firstNames}${extra}`;
     }
 
+    public selectedUploadItems(): any[] {
+        return this.selectedFiles.slice(0, 12).map((file, index) => ({
+            index,
+            name: this.uploadDisplayName(file),
+            folder: this.uploadFolderKey(file),
+            size_mb: file.size ? (file.size / (1024 * 1024)).toFixed(1) : '0.0',
+            type: this.isUploadVideoFile(file) ? '영상' : (this._isArchiveName(file.name) ? '압축' : '파일'),
+        }));
+    }
+
+    public selectedUploadHiddenCount(): number {
+        return Math.max(0, this.selectedFiles.length - 12);
+    }
+
+    public selectedUploadFolderGroups(): any[] {
+        const groups: Record<string, number> = {};
+        for (const file of this.selectedFiles) {
+            const folder = this.uploadFolderKey(file);
+            if (!folder) continue;
+            groups[folder] = (groups[folder] || 0) + 1;
+        }
+        return Object.keys(groups).sort().map(key => ({ key, label: key.split('/')[0] || key, count: groups[key] }));
+    }
+
+    private _isArchiveName(name: string): boolean {
+        return /\.(zip|tar|tar\.gz|tgz)$/i.test(String(name || ''));
+    }
+
+    public async removeSelectedUploadFile(index: number, event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (index < 0 || index >= this.selectedFiles.length) return;
+        const next = this.selectedFiles.filter((_, i) => i !== index);
+        await this.syncSelectedUploadPreview(next);
+        if (next.length === 0) this.clearSelectedFile();
+        else {
+            this.clearAnalysisState();
+            this.uploadLogEntries = [];
+            this.uploadChunkSummary = null;
+            this.trainingUploadMessage = '';
+            this.errorMessage = '';
+        }
+        await this.service.render();
+    }
+
+    public async removeSelectedUploadFolder(folder: string, event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        const key = String(folder || '');
+        if (!key) return;
+        const next = this.selectedFiles.filter(file => this.uploadFolderKey(file) !== key);
+        await this.syncSelectedUploadPreview(next);
+        if (next.length === 0) this.clearSelectedFile();
+        else {
+            this.clearAnalysisState();
+            this.uploadLogEntries = [];
+            this.uploadChunkSummary = null;
+            this.trainingUploadMessage = '';
+            this.errorMessage = '';
+        }
+        await this.service.render();
+    }
+
     public selectedUploadTrainingHint(): string {
         if (this.selectedUploadCount() === 0) return '영상 여러 개 또는 zip/tar 압축 파일을 한 번에 선택할 수 있습니다.';
         if (!this.selectedFile) return '압축 파일은 학습 등록만 가능하고, 분석 미리보기는 영상 파일에서만 동작합니다.';
@@ -1035,13 +1496,72 @@ export class Component implements OnInit, OnDestroy {
         return '선택한 영상을 분석하거나 학습 데이터로 등록할 수 있습니다.';
     }
 
+    public trainingTargetOptionsForView(): any[] {
+        const options = this.prototypeInfo?.training_target_options;
+        return Array.isArray(options) && options.length > 0 ? options : this.fallbackTrainingTargetOptions;
+    }
+
+    public trainingTargetOption(key?: string): any {
+        const target = String(key || this.trainingTargetModel || 'rf-dual');
+        return this.trainingTargetOptionsForView().find((item: any) => item.key === target) || this.trainingTargetOptionsForView()[0] || {};
+    }
+
+    public trainingTargetLabel(): string {
+        return this.trainingTargetOption().label || this.trainingTargetModel || '모델';
+    }
+
+    public trainingTargetDescription(): string {
+        return this.trainingTargetOption().description || '선택한 모델 학습 자료로 metadata를 저장합니다.';
+    }
+
+    public uploadSettingsTitle(): string {
+        return this.uploadWorkflowMode === 'train' ? '등록 기준' : '분석 설정';
+    }
+
+    public uploadSelectionModeText(): string {
+        if (this.uploadWorkflowMode === 'train') return `${this.trainingTargetLabel()} 학습 자료`;
+        return this.selectedFile ? 'RF-Dual 업로드 분석' : '분석할 영상 대기';
+    }
+
+    public llmModeHint(): string {
+        const settings = this.prototypeInfo?.llm_settings || {};
+        if (!settings.enabled) return 'LLM 설명 꺼짐';
+        return '기본 local_fast 요약 · 동기 OpenAI 호출 없음';
+    }
+
+    public trainingTargetJobType(): string {
+        return String(this.trainingTargetOption().job_type || 'full');
+    }
+
+    public trainingTargetSupportsDashboardJob(): boolean {
+        return ['full', 'rf', 'posture'].includes(this.trainingTargetJobType());
+    }
+
+    public async onTrainingTargetModelChanged() {
+        if (this.trainingTargetModel === 'xg-posture' && !this.trainingUploadPostureClass) {
+            this.trainingUploadMessage = 'XG-Posture 자료는 행동 라벨을 같이 선택해야 학습에 바로 쓰기 좋습니다.';
+            this.trainingUploadMessageType = 'info';
+        } else if (!this.trainingTargetSupportsDashboardJob()) {
+            await this.loadContinuousTrainingStatus(false);
+            const status = this.selectedContinuousTrainingStatus();
+            this.trainingUploadMessage = `${this.trainingTargetLabel()}은 전용/연속 학습 파이프라인으로 관리됩니다. ${this.continuousTrainingStageText(status)}`;
+            this.trainingUploadMessageType = 'info';
+        } else {
+            this.trainingUploadMessage = '';
+        }
+        await this.service.render();
+    }
+
     public async analyze() {
         if (!this.selectedFile || this.analyzing) {
             if (!this.selectedFile && this.selectedUploadCount() > 0) this.errorMessage = '분석은 영상 파일 하나가 필요합니다. 압축 파일은 학습 데이터 등록으로 처리해주세요.';
             return;
         }
+        const requestKey = `${this.selectedFile.name}:${this.selectedFile.size}:${this.selectedFile.lastModified}:${this.analysisProfile}:${this.selectedModelType}`;
+        if (this.uploadAnalysisRequestKey === requestKey) return;
+        this.uploadAnalysisRequestKey = requestKey;
         this.analyzing = true;
-        this.analysisResult = null;
+        this.clearAnalysisState();
         this.errorMessage = '';
         this.feedbackStatus = '';
         this.feedbackMessage = '';
@@ -1056,18 +1576,21 @@ export class Component implements OnInit, OnDestroy {
             const res = await fetch(`/wiz/api/page.dashboard/analyze_upload`, { method: 'POST', body: fd });
             const json = await this.readJsonResponse(res);
             if (json.code === 200 && json.data) {
-                this.analysisResult = json.data;
+                this.applyAnalysisRoot(json.data, false);
                 this.analysisSavedName = json.data.saved_name || '';
                 this.alertWorkflow = json.data.alert_workflow || null;
                 this.syncUploadChunkLogs(json.data);
-                localStorage.setItem(LAST_ANALYSIS_STORAGE_KEY, JSON.stringify(json.data));
+                try {
+                    localStorage.setItem(LAST_ANALYSIS_STORAGE_KEY, JSON.stringify(json.data));
+                } catch (e) { }
             } else {
                 this.errorMessage = json.data?.message || '분석 실패';
             }
         } catch (e: any) {
-            this.errorMessage = '요청 오류: ' + (e.message || e);
+            this.errorMessage = this.requestErrorMessage(e, '분석 요청');
         }
         this.analyzing = false;
+        this.uploadAnalysisRequestKey = '';
         await this.service.render();
     }
 
@@ -1089,6 +1612,9 @@ export class Component implements OnInit, OnDestroy {
                     input_source: 'upload-mode-bulk-training-registration',
                     analysis_profile: this.analysisProfile,
                     model_type: this.selectedModelType,
+                    target_model: this.trainingTargetModel,
+                    training_target_model: this.trainingTargetModel,
+                    training_target_label: this.trainingTargetLabel(),
                     posture_class: this.trainingUploadPostureClass || '',
                     bulk_index: i + 1,
                     bulk_total: files.length,
@@ -1112,7 +1638,7 @@ export class Component implements OnInit, OnDestroy {
             }
             if (errors.length === 0) {
                 const postureSaved = this.trainingUploadPostureClass ? ` / 행동 ${this.trainingUploadPostureClass}` : '';
-                this.trainingUploadMessage = `학습 데이터 등록 완료: 파일 ${files.length}개, 영상 ${savedTotal}건 · 라벨 ${this.trainingUploadLabel || 'N'}${postureSaved}`;
+                this.trainingUploadMessage = `학습 데이터 등록 완료: ${this.trainingTargetLabel()} · 파일 ${files.length}개, 영상 ${savedTotal}건 · 라벨 ${this.trainingUploadLabel || 'N'}${postureSaved}`;
                 this.trainingUploadMessageType = 'success';
                 this.trainingUploadNote = '';
             } else {
@@ -1120,7 +1646,7 @@ export class Component implements OnInit, OnDestroy {
                 this.trainingUploadMessageType = savedTotal > 0 ? 'success' : 'error';
             }
         } catch (e: any) {
-            this.trainingUploadMessage = '요청 오류: ' + (e.message || e);
+            this.trainingUploadMessage = this.requestErrorMessage(e, '학습 데이터 등록');
             this.trainingUploadMessageType = 'error';
         }
         this.trainingUploading = false;
@@ -1156,48 +1682,124 @@ export class Component implements OnInit, OnDestroy {
 
     private startContinuousTrainingPolling() {
         this.stopContinuousTrainingPolling();
-        this.continuousTrainingPollHandle = setInterval(() => { this.loadContinuousTrainingStatus(false); }, 600000);
+        this.continuousTrainingPollHandle = setInterval(() => { this.loadContinuousTrainingStatus(false); }, 20000);
     }
 
     public async loadContinuousTrainingStatus(render: boolean = true) {
         try {
-            const res = await fetch('/wiz/api/page.dashboard/continuous_training_status?name=aihub82');
+            const res = await fetch('/wiz/api/page.dashboard/continuous_training_status?name=all');
             const json = await this.readJsonResponse(res);
             if (json.code === 200 && json.data) {
-                this.continuousTrainingStatus = json.data;
+                const items = this.normalizeContinuousTrainingItems(json.data.items || json.data);
+                this.continuousTrainingItems = items;
+                this.continuousTrainingStatus = this.selectedContinuousTrainingStatus() || json.data;
                 if (this.prototypeInfo) {
                     this.prototypeInfo.continuous_training = this.prototypeInfo.continuous_training || {};
-                    this.prototypeInfo.continuous_training.aihub82 = json.data;
+                    for (const item of items) {
+                        const name = String(item?.name || '').trim();
+                        if (name) this.prototypeInfo.continuous_training[name] = item;
+                    }
+                    this.prototypeInfo.continuous_training_items = items;
                 }
             }
         } catch (e) { }
         if (render) await this.service.render();
     }
 
+    private continuousTrainingResumeTarget(status: any): string {
+        const name = String(status?.name || '').trim();
+        if (name.startsWith('dashboard-')) return this.trainingTargetModel || 'all';
+        if (name === 'rf-fall-v2') return 'rf-fall-v2';
+        if (name === 'xg-posture') return 'xg-posture';
+        if (name === 'xg-posture-occlusion-aux') return 'xg-posture-occlusion-aux';
+        if (name === 'aihub82') return 'aihub82';
+        if (name === 'aihub173') return 'aihub173';
+        return name || this.trainingTargetContinuousStatusName() || 'all';
+    }
+
+    public isContinuousTrainingResuming(status: any): boolean {
+        return !!this.continuousTrainingResuming[this.continuousTrainingResumeTarget(status)];
+    }
+
+    public continuousTrainingResumeButtonText(status: any): string {
+        if (this.isContinuousTrainingResuming(status)) return '요청 중';
+        const stage = this.continuousTrainingStageValue(status);
+        if (stage === 'running') return '점검';
+        if (stage === 'blocked' || stage === 'stale' || stage === 'failed') return '재개';
+        if (stage === 'queued' || stage === 'preparing') return '점검';
+        return '재개';
+    }
+
+    public async resumeContinuousTraining(status?: any) {
+        const target = this.continuousTrainingResumeTarget(status || {});
+        if (this.continuousTrainingResuming[target]) return;
+        this.continuousTrainingResuming[target] = true;
+        this.trainingUploadMessage = `${this.continuousTrainingCardTitle(status || {})} 재개/점검 요청 중입니다.`;
+        this.trainingUploadMessageType = 'info';
+        await this.service.render();
+        try {
+            const params = new URLSearchParams();
+            params.set('target', target);
+            const res = await fetch(`/wiz/api/page.dashboard/resume_continuous_training?${params.toString()}`, { method: 'POST' });
+            const json = await this.readJsonResponse(res);
+            if (json.code === 200 && json.data?.ok !== false) {
+                const items = this.normalizeContinuousTrainingItems(json.data?.status?.items || json.data?.status || []);
+                if (items.length > 0) {
+                    this.continuousTrainingItems = items;
+                    this.continuousTrainingStatus = this.selectedContinuousTrainingStatus() || json.data.status;
+                }
+                this.trainingUploadMessage = json.data?.message || '학습 재개/점검 요청을 보냈습니다.';
+                this.trainingUploadMessageType = 'success';
+            } else {
+                this.trainingUploadMessage = json.data?.message || '학습 재개 요청 실패';
+                this.trainingUploadMessageType = 'error';
+            }
+        } catch (e: any) {
+            this.trainingUploadMessage = this.requestErrorMessage(e, '학습 재개');
+            this.trainingUploadMessageType = 'error';
+        }
+        this.continuousTrainingResuming[target] = false;
+        await this.loadContinuousTrainingStatus(false);
+        await this.service.render();
+    }
+
     public async startBackgroundTraining(jobType: string = 'full') {
         if (this.trainingJobStarting) return;
+        const resolvedJobType = jobType === 'full' ? this.trainingTargetJobType() : jobType;
+        if (!['full', 'rf', 'posture'].includes(resolvedJobType)) {
+            await this.loadContinuousTrainingStatus(false);
+            const status = this.selectedContinuousTrainingStatus();
+            const eta = this.continuousTrainingEtaText(status);
+            this.trainingUploadMessage = `${this.trainingTargetLabel()}은 대시보드 HITL job 대신 별도 연속 학습/전용 학습 파이프라인으로 관리됩니다. ${this.continuousTrainingStageText(status)}${eta && eta !== '-' ? ` · ETA ${eta}` : ''}`;
+            this.trainingUploadMessageType = 'info';
+            await this.service.render();
+            return;
+        }
         this.trainingJobStarting = true;
         this.trainingUploadMessage = '백그라운드 학습 job을 시작합니다.';
         this.trainingUploadMessageType = 'info';
         await this.service.render();
         try {
             const params = new URLSearchParams();
-            params.set('job_type', jobType || 'full');
+            params.set('job_type', resolvedJobType || 'full');
             params.set('apply_mode', 'manual');
             params.set('note', this.trainingUploadNote || '');
+            params.set('target_model', this.trainingTargetModel || 'rf-dual');
             const res = await fetch(`/wiz/api/page.dashboard/start_training_job?${params.toString()}`, { method: 'POST' });
             const json = await this.readJsonResponse(res);
-            if (json.code === 200 && json.data) {
+            const stage = String(json?.data?.stage || json?.data?.status || '').trim();
+            if (json.code === 200 && json.data && json.data.ok !== false && stage !== 'blocked' && stage !== 'failed') {
                 this.trainingJob = json.data;
                 this.trainingUploadMessage = `학습 job 시작: ${json.data.job_id || ''}`;
                 this.trainingUploadMessageType = 'success';
                 this.startTrainingJobPolling();
             } else {
+                if (json.data) this.trainingJob = json.data;
                 this.trainingUploadMessage = json.data?.message || '학습 job 시작 실패';
                 this.trainingUploadMessageType = 'error';
             }
         } catch (e: any) {
-            this.trainingUploadMessage = '학습 job 요청 오류: ' + (e.message || e);
+            this.trainingUploadMessage = this.requestErrorMessage(e, '학습 job 요청');
             this.trainingUploadMessageType = 'error';
         }
         this.trainingJobStarting = false;
@@ -1212,7 +1814,21 @@ export class Component implements OnInit, OnDestroy {
             if (json.code === 200 && json.data) {
                 this.trainingJob = json.data;
                 const status = String(this.trainingJob?.status || '');
-                if (!['queued', 'running'].includes(status)) this.stopTrainingJobPolling();
+                if (!['queued', 'running'].includes(status)) {
+                    this.stopTrainingJobPolling();
+                    const metric = this.trainingJobCandidateMetricText();
+                    const sample = this.trainingJobTrainingSampleText();
+                    if (status === 'completed_pending_apply' || status === 'completed') {
+                        this.trainingUploadMessage = `학습 완료: ${metric} · 샘플 ${sample}`;
+                        this.trainingUploadMessageType = 'success';
+                    } else if (status === 'applied') {
+                        this.trainingUploadMessage = `학습 결과 적용 완료: ${metric}`;
+                        this.trainingUploadMessageType = 'success';
+                    } else if (status === 'blocked' || status === 'failed') {
+                        this.trainingUploadMessage = this.trainingJob?.message || this.trainingJobStatusText();
+                        this.trainingUploadMessageType = 'error';
+                    }
+                }
                 await this.service.render();
             }
         } catch (e) { }
@@ -1233,7 +1849,7 @@ export class Component implements OnInit, OnDestroy {
                 this.trainingUploadMessageType = 'error';
             }
         } catch (e: any) {
-            this.trainingUploadMessage = '학습 적용 오류: ' + (e.message || e);
+            this.trainingUploadMessage = this.requestErrorMessage(e, '학습 적용');
             this.trainingUploadMessageType = 'error';
         }
         this.trainingJobApplying = false;
@@ -1249,12 +1865,18 @@ export class Component implements OnInit, OnDestroy {
         if (status === 'queued') return '대기 중';
         if (status === 'running') return '학습 중';
         if (status === 'completed_pending_apply') return '학습 완료';
+        if (status === 'completed') return '학습 완료';
         if (status === 'applied') return '적용 완료';
+        if (status === 'blocked') return '데이터 필요';
         if (status === 'failed') return '실패';
         return status || '상태 없음';
     }
 
     public trainingJobEtaText(): string {
+        const status = String(this.trainingJob?.status || '');
+        if (status === 'completed_pending_apply' || status === 'completed' || status === 'applied') return '완료';
+        if (status === 'blocked') return '데이터 필요';
+        if (status === 'failed') return '실패';
         const eta = Number(this.trainingJob?.eta_sec);
         if (!Number.isFinite(eta) || eta <= 0) return '계산 중';
         if (eta < 60) return `${Math.round(eta)}초`;
@@ -1263,37 +1885,518 @@ export class Component implements OnInit, OnDestroy {
         return `${min}분 ${sec}초`;
     }
 
+    public trainingJobVersionText(): string {
+        const jobId = String(this.trainingJob?.job_id || '').trim();
+        if (!jobId) return '-';
+        const version = String(this.trainingJob?.training_run_label || this.trainingJob?.version_badge || '').trim();
+        const target = this.trainingJob?.target_model ? String(this.trainingJob.target_model) : '';
+        const shortId = jobId.length > 13 ? jobId.slice(0, 12) : jobId;
+        if (version) return target ? `${version} · ${target} · ${shortId}` : `${version} · ${shortId}`;
+        return target ? `${target} · ${shortId}` : shortId;
+    }
+
     public trainingJobCanApply(): boolean {
         return this.trainingJob?.status === 'completed_pending_apply';
     }
 
-    public continuousTrainingStageText(): string {
-        const status = this.continuousTrainingStatus || {};
-        const stage = String(status.stage || status.status || '');
-        if (stage === 'running') return '82번 표정 모델 학습 중';
-        if (stage === 'completed') return status.promoted ? '성능 개선 적용 완료' : '후보 검증 완료';
-        if (stage === 'failed') return '후보 학습 실패';
+    private jobNumber(value: any): number {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    private jobPct(value: any, digits: number = 1): string {
+        const n = this.jobNumber(value);
+        return n > 0 ? `${(n * 100).toFixed(digits)}%` : '';
+    }
+
+    private dashboardJobRfSummary(jobArg?: any): any {
+        const job = jobArg || this.trainingJob || {};
+        const result = job.result || {};
+        if (result.rf_pipeline_training && typeof result.rf_pipeline_training === 'object') return result.rf_pipeline_training;
+        const steps = Array.isArray(job.steps) ? job.steps : [];
+        const rfStep = steps.find((step: any) => String(step?.name || '') === 'rf_pipeline');
+        const summary = rfStep?.result?.summary;
+        return summary && typeof summary === 'object' ? summary : {};
+    }
+
+    private dashboardJobCvMetrics(jobArg?: any): any {
+        const job = jobArg || this.trainingJob || {};
+        const rf = this.dashboardJobRfSummary(job);
+        if (rf.cv && typeof rf.cv === 'object') return rf.cv;
+        const model = job?.result?.model_comparison?.models?.['rf-pipeline'] || {};
+        return {
+            f1: model?.f1?.cv ?? job?.candidate_f1,
+            accuracy: model?.accuracy?.cv ?? job?.candidate_accuracy,
+            precision: model?.precision?.cv ?? job?.candidate_precision,
+            recall: model?.recall?.cv ?? job?.candidate_recall,
+            roc_auc: model?.roc_auc?.cv ?? job?.candidate_roc_auc,
+        };
+    }
+
+    public trainingJobTrainingSampleText(jobArg?: any): string {
+        const job = jobArg || this.trainingJob || {};
+        const rf = this.dashboardJobRfSummary(job);
+        const samples = this.jobNumber(rf.training_samples ?? job?.training_samples ?? job?.intake_summary?.total ?? job?.processed);
+        return samples > 0 ? samples.toLocaleString() : '-';
+    }
+
+    public trainingJobCandidateMetricText(jobArg?: any): string {
+        const cv = this.dashboardJobCvMetrics(jobArg);
+        const bits = [];
+        const f1 = this.jobPct(cv.f1);
+        const acc = this.jobPct(cv.accuracy);
+        const recall = this.jobPct(cv.recall);
+        if (f1) bits.push(`CV F1 ${f1}`);
+        if (acc) bits.push(`Acc ${acc}`);
+        if (recall) bits.push(`Recall ${recall}`);
+        return bits.join(' · ') || '-';
+    }
+
+    public trainingJobClassBalanceText(jobArg?: any): string {
+        const job = jobArg || this.trainingJob || {};
+        const rf = this.dashboardJobRfSummary(job);
+        const dist = rf.class_distribution || job.intake_summary || {};
+        const y = this.jobNumber(dist.Y);
+        const n = this.jobNumber(dist.N);
+        if (y > 0 || n > 0) return `Y ${y.toLocaleString()} / N ${n.toLocaleString()}`;
+        return '-';
+    }
+
+    public normalizeContinuousTrainingItems(raw: any): any[] {
+        if (Array.isArray(raw)) return raw.filter(Boolean);
+        if (raw?.items && Array.isArray(raw.items)) return raw.items.filter(Boolean);
+        if (raw && typeof raw === 'object') {
+            if (raw.aihub82 || raw.aihub173 || raw['xg-posture-occlusion-aux']) {
+                return Object.keys(raw).map(key => ({ name: key, ...(raw[key] || {}) })).filter(Boolean);
+            }
+            return [raw];
+        }
+        return [];
+    }
+
+    private trainingTargetContinuousStatusName(): string {
+        const option = this.trainingTargetOption();
+        const key = String(option?.key || this.trainingTargetModel || '').trim();
+        const jobType = String(option?.job_type || '').trim();
+        if (jobType === 'aihub82' || key.includes('aihub82')) return 'aihub82';
+        if (jobType === 'aihub173' || key.includes('aihub173') || key.includes('driver')) return 'aihub173';
+        if (key === 'rf-fall-v2') return 'rf-fall-v2';
+        if (key === 'xg-posture') return 'xg-posture';
+        if (key.includes('occlusion')) return 'xg-posture-occlusion-aux';
+        return '';
+    }
+
+    public selectedContinuousTrainingStatus(): any {
+        const selectedName = this.trainingTargetContinuousStatusName();
+        const items = this.normalizeContinuousTrainingItems(this.continuousTrainingItems);
+        if (selectedName) {
+            const selected = items.find((item: any) => String(item?.name || '') === selectedName);
+            if (selected) return selected;
+        }
+        const running = items.find((item: any) => ['queued', 'running'].includes(this.continuousTrainingStageValue(item)));
+        return running || items.find((item: any) => String(item?.name || '') === 'aihub82') || this.continuousTrainingStatus || {};
+    }
+
+    private continuousTrainingStatusValues(): any[] {
+        const byName: Record<string, any> = {};
+        const items = this.normalizeContinuousTrainingItems(this.continuousTrainingItems);
+        for (let index = 0; index < items.length; index += 1) {
+            const item = items[index];
+            const key = String(item?.name || item?.label || item?.job_id || `item-${index}`);
+            byName[key] = item;
+        }
+        if (this.continuousTrainingStatus && Object.keys(byName).length === 0) {
+            byName['aihub82'] = { name: 'aihub82', label: 'AI-Hub 82 표정', ...this.continuousTrainingStatus };
+        }
+        if (this.trainingJob?.status) {
+            const jobKey = 'dashboard-' + String(this.trainingJob.job_id || 'latest');
+            if (!byName[jobKey]) {
+                byName[jobKey] = {
+                    name: jobKey,
+                    label: this.trainingTargetLabel() || '대시보드 학습',
+                    model_family: 'dashboard-job',
+                    ...this.trainingJob,
+                };
+            }
+        }
+        return Object.values(byName);
+    }
+
+    private isMainContinuousTrainingStage(stage: string): boolean {
+        return ['queued', 'running', 'blocked', 'failed', 'stale', 'preparing', 'completed_pending_apply'].includes(stage);
+    }
+
+    private isCompletedContinuousTrainingStage(stage: string): boolean {
+        return stage === 'completed' || stage === 'applied';
+    }
+
+    public continuousTrainingCards(): any[] {
+        const selectedName = this.trainingTargetContinuousStatusName();
+        const values = this.continuousTrainingStatusValues().filter((item: any) => {
+            const stage = this.continuousTrainingStageValue(item);
+            if (!stage || stage === 'missing' || stage === 'not-started') return false;
+            if (stage === 'queued' || stage === 'running') return true;
+            if (this.uploadWorkflowMode !== 'train') return false;
+            return this.isMainContinuousTrainingStage(stage);
+        });
+        values.sort((a: any, b: any) => {
+            const rank = (item: any) => {
+                const stage = this.continuousTrainingStageValue(item);
+                if (stage === 'running') return 0;
+                if (stage === 'queued') return 1;
+                if (String(item?.name || '') === selectedName) return 2;
+                if (stage === 'stale' || stage === 'failed' || stage === 'blocked') return 3;
+                if (stage === 'preparing') return 4;
+                return 5;
+            };
+            const rankDiff = rank(a) - rank(b);
+            if (rankDiff !== 0) return rankDiff;
+            return String(b?.updated_at || b?.created_at || '').localeCompare(String(a?.updated_at || a?.created_at || ''));
+        });
+        return values.slice(0, 6);
+    }
+
+    public completedTrainingLogCards(): any[] {
+        const values = this.continuousTrainingStatusValues().filter((item: any) => {
+            const stage = this.continuousTrainingStageValue(item);
+            return this.isCompletedContinuousTrainingStage(stage);
+        });
+        values.sort((a: any, b: any) => {
+            return String(b?.updated_at || b?.created_at || '').localeCompare(String(a?.updated_at || a?.created_at || ''));
+        });
+        return values.slice(0, 6);
+    }
+
+    public completedTrainingLogCount(): number {
+        return this.continuousTrainingStatusValues().filter((item: any) => {
+            return this.isCompletedContinuousTrainingStage(this.continuousTrainingStageValue(item));
+        }).length;
+    }
+
+    public trainingStatusMainCountText(): string {
+        const count = this.continuousTrainingCards().length;
+        return count > 0 ? `${count}개 진행/조치 상태 표시` : '진행/조치 상태 없음';
+    }
+
+    public isTrainingJobActive(): boolean {
+        const status = String(this.trainingJob?.status || '');
+        return status === 'queued' || status === 'running';
+    }
+
+    public continuousTrainingGridClass(): string {
+        const count = this.continuousTrainingCards().length;
+        if (count >= 2) return 'xl:grid-cols-2';
+        return 'xl:grid-cols-1';
+    }
+
+    public continuousTrainingCardTitle(status: any): string {
+        return String(status?.label || status?.title || status?.name || '학습 상태');
+    }
+
+    public continuousTrainingStageBadgeText(status: any): string {
+        const stage = this.continuousTrainingStageValue(status);
+        if (stage === 'running' && this.isSourceRecoveryTrainingStatus(status)) return '재수신 중';
+        if (stage === 'running') return '학습 중';
+        if (stage === 'queued') return '대기';
+        if (stage === 'blocked') return '데이터 대기';
+        if (stage === 'preparing') return '준비 필요';
+        if (stage === 'stale') return '중단';
+        if (stage === 'completed_pending_apply') return '적용 대기';
+        if (stage === 'applied') return '적용 완료';
+        if (stage === 'completed') return '완료';
+        if (stage === 'failed') return '실패';
+        return stage || '-';
+    }
+
+    private continuousTrainingStageValue(status: any): string {
+        const rawStage = String(status?.stage || '').trim();
+        const rawStatus = String(status?.status || '').trim();
+        if (rawStage === 'finished' && rawStatus) return rawStatus;
+        if (rawStage === 'blocked' || rawStatus === 'blocked') return 'blocked';
+        if (rawStage === 'stale' || rawStatus === 'stale') return 'stale';
+        return rawStage || rawStatus;
+    }
+
+    public continuousTrainingCardClass(status: any): string {
+        const stage = this.continuousTrainingStageValue(status);
+        if (stage === 'failed') return 'border-rose-200 bg-rose-50';
+        if (stage === 'stale' || stage === 'blocked') return 'border-amber-200 bg-amber-50';
+        if (stage === 'preparing') return 'border-zinc-200 bg-zinc-50';
+        if (stage === 'queued' || stage === 'running') return 'border-emerald-200 bg-emerald-50';
+        if (stage === 'completed' || stage === 'completed_pending_apply' || stage === 'applied') return 'border-blue-200 bg-blue-50';
+        return 'border-zinc-200 bg-white';
+    }
+
+    public continuousTrainingStageText(statusArg?: any): string {
+        const status = statusArg || this.continuousTrainingStatus || {};
+        const stage = this.continuousTrainingStageValue(status);
+        const version = String(status.candidate_version_text || status.training_version_text || '').trim()
+            || this.compactExperimentVersion(String(status.experiment || '').trim());
+        const suffix = version && version !== '-' ? ` · ${version}` : '';
+        const label = this.continuousTrainingCardTitle(status);
+        if (stage === 'running' && this.isSourceRecoveryTrainingStatus(status)) return `${label} 데이터 재수신 중${suffix}`;
+        if (stage === 'running') return `${label} 학습 중${suffix}`;
+        if (stage === 'queued') return `${label} 대기 중${suffix}`;
+        if (stage === 'blocked') return `${label} 데이터 대기${suffix}`;
+        if (stage === 'preparing') return `${label} 준비 필요${suffix}`;
+        if (stage === 'completed_pending_apply') return `${label} 학습 완료 · 적용 대기`;
+        if (stage === 'applied') return `${label} 학습 결과 적용 완료`;
+        if (stage === 'completed') return status.promoted ? `${label} 운영 성능 충족` : `${label} 학습 완료`;
+        if (stage === 'failed') return `${label} 학습 실패`;
+        if (stage === 'stale') return `${label} 중단됨 · 상태 확인 필요`;
         if (stage === 'already-running') return '이미 실행 중';
         if (stage === 'not-started' || stage === 'missing') return '대기 중';
         return stage || '상태 확인 중';
     }
 
-    public continuousTrainingMetricText(): string {
-        const active = Number(this.continuousTrainingStatus?.active_macro_f1 || 0);
-        const candidate = Number(this.continuousTrainingStatus?.candidate_macro_f1 || 0);
-        const activeText = active > 0 ? `active macro F1 ${(active * 100).toFixed(1)}%` : 'active F1 확인 중';
-        return candidate > 0 ? `${activeText} · candidate ${(candidate * 100).toFixed(1)}%` : activeText;
+    public continuousTrainingMetricText(statusArg?: any): string {
+        const status = statusArg || this.continuousTrainingStatus || {};
+        if (status?.model_family === 'dashboard-job') {
+            const stage = this.continuousTrainingStageValue(status);
+            const metric = this.trainingJobCandidateMetricText(status);
+            const samples = this.trainingJobTrainingSampleText(status);
+            const balance = this.trainingJobClassBalanceText(status);
+            if (metric !== '-') {
+                const bits = [metric];
+                if (samples !== '-') bits.push(`샘플 ${samples}`);
+                if (balance !== '-') bits.push(balance);
+                return bits.join(' · ');
+            }
+            if (stage === 'blocked') return status?.message || '학습 차단 · 데이터 필요';
+            if (stage === 'failed') return status?.message || '학습 실패';
+            const progress = Math.round(Number(status.progress || 0) * 100);
+            const processed = Number(status.processed || 0);
+            const total = Number(status.total || 0);
+            return total > 0 ? `진행 ${progress}% · 처리 ${processed}/${total}` : `진행 ${progress}%`;
+        }
+        const candidateSeqF1 = Number(status?.candidate_sequence_macro_f1 || 0);
+        const candidateF1 = Number(status?.candidate_macro_f1 || 0);
+        if (candidateSeqF1 > 0 || candidateF1 > 0) {
+            const activeSeqF1 = Number(status?.sequence_macro_f1 || 0);
+            const activeF1 = Number(status?.active_macro_f1 || status?.macro_f1 || 0);
+            const bits = [];
+            if (activeSeqF1 > 0) bits.push(`active sequence F1 ${(activeSeqF1 * 100).toFixed(1)}%`);
+            else if (activeF1 > 0) bits.push(`active F1 ${(activeF1 * 100).toFixed(1)}%`);
+            if (candidateSeqF1 > 0) bits.push(`후보 sequence F1 ${(candidateSeqF1 * 100).toFixed(1)}%`);
+            else if (candidateF1 > 0) bits.push(`후보 F1 ${(candidateF1 * 100).toFixed(1)}%`);
+            if (status?.candidate_saved === false) bits.push('미승격');
+            const target = Number(status?.target_macro_f1 || 0.95);
+            bits.push(`목표 ${(target * 100).toFixed(0)}%`);
+            return bits.join(' · ');
+        }
+        const seqF1 = Number(status?.sequence_macro_f1 || 0);
+        const seqAcc = Number(status?.sequence_accuracy || 0);
+        if (seqF1 > 0 || seqAcc > 0) {
+            const group = Number(status?.active_macro_f1 || status?.macro_f1 || 0);
+            const bits = [];
+            if (seqF1 > 0) bits.push(`sequence F1 ${(seqF1 * 100).toFixed(1)}%`);
+            if (seqAcc > 0) bits.push(`sequence Acc ${(seqAcc * 100).toFixed(1)}%`);
+            if (group > 0) bits.push(`window F1 ${(group * 100).toFixed(1)}%`);
+            return bits.join(' · ');
+        }
+        const active = Number(status?.active_macro_f1 || status?.macro_f1 || 0);
+        const candidate = Number(status?.candidate_macro_f1 || 0);
+        const target = Number(status?.target_macro_f1 || 0.9);
+        const stretch = Number(status?.stretch_macro_f1 || 0.95);
+        const activeVersion = String(status?.active_version_text || '').trim();
+        const activePrefix = activeVersion ? `active ${activeVersion} ` : 'active ';
+        const activeText = active > 0 ? `${activePrefix}macro F1 ${(active * 100).toFixed(1)}%` : `${activePrefix}F1 확인 중`;
+        const targetText = `목표 ${(target * 100).toFixed(0)}%→${(stretch * 100).toFixed(0)}%`;
+        return candidate > 0 ? `${activeText} · 학습 결과 ${(candidate * 100).toFixed(1)}% · ${targetText}` : `${activeText} · ${targetText}`;
+    }
+
+    private compactExperimentVersion(label: string): string {
+        const raw = String(label || '').trim();
+        const match = raw.match(/^(\d+)_([A-Za-z0-9_.-]+?)(?:_\d{8}_\d{6})?$/);
+        if (!match) return raw || '-';
+        return `#${match[1]} ${match[2].replace(/_/g, ' ')}`;
+    }
+
+    private isSourceRecoveryTrainingStatus(status: any): boolean {
+        const text = [
+            status?.latest_log,
+            status?.message,
+            status?.eta_text,
+        ].map((value: any) => String(value || '').toLowerCase()).join(' ');
+        return text.includes('[source]')
+            || text.includes('download')
+            || text.includes('다운로드')
+            || text.includes('재수신')
+            || text.includes('split zip')
+            || text.includes('assembly');
+    }
+
+    public continuousTrainingVersionText(statusArg?: any): string {
+        const status = statusArg || this.continuousTrainingStatus || {};
+        const readyText = String(status.training_version_text || '').trim();
+        if (readyText) return readyText;
+        const candidate = String(status.candidate_version_text || '').trim();
+        const active = String(status.active_version_text || '').trim();
+        const experiment = String(status.experiment || '').trim();
+        const bits = [];
+        if (candidate) bits.push(`진행 ${candidate}`);
+        else if (experiment) bits.push(`진행 ${this.compactExperimentVersion(experiment)}`);
+        if (active) bits.push(`active ${active}`);
+        const total = Number(status.total_candidate_versions || 0);
+        if (Number.isFinite(total) && total > 0) bits.push(`누적 후보 ${total}개`);
+        return bits.length > 0 ? bits.join(' · ') : '-';
     }
 
     public continuousTrainingUpdatedText(): string {
         return String(this.continuousTrainingStatus?.updated_at || '-');
     }
 
+    public continuousTrainingUpdatedTextFor(statusArg?: any): string {
+        const status = statusArg || {};
+        return String(status.updated_at || status.created_at || '-');
+    }
+
+    public continuousTrainingEtaText(statusArg?: any): string {
+        const status = statusArg || this.continuousTrainingStatus || {};
+        const text = String(status.eta_text || '').trim();
+        if (text) return text;
+        const eta = Number(status.eta_sec);
+        if (!Number.isFinite(eta) || eta <= 0) {
+            const stage = this.continuousTrainingStageValue(status);
+            if (stage === 'completed' || stage === 'completed_pending_apply' || stage === 'applied') return '완료';
+            if (stage === 'stale') return '중단';
+            if (stage === 'blocked') return '데이터 필요';
+            return '-';
+        }
+        if (eta < 60) return `${Math.round(eta)}초`;
+        const min = Math.floor(eta / 60);
+        const sec = Math.round(eta % 60);
+        if (min < 60) return `${min}분 ${sec}초`;
+        const hour = Math.floor(min / 60);
+        const remMin = min % 60;
+        return `${hour}시간 ${remMin}분`;
+    }
+
+    public continuousTrainingDataProgressText(statusArg?: any): string {
+        const status = statusArg || this.continuousTrainingStatus || {};
+        const completed = Number(status.completed_files);
+        const required = Number(status.required_files);
+        const current = Number(status.redownload_current);
+        const total = Number(status.redownload_total);
+        const progress = Number(status.redownload_current_progress);
+        const speed = Number(status.redownload_current_speed_mbps);
+        const bits: string[] = [];
+        if (Number.isFinite(completed) && Number.isFinite(required) && required > 0) {
+            bits.push(`확보 ${completed}/${required}`);
+        }
+        if (Number.isFinite(current) && Number.isFinite(total) && total > 0) {
+            bits.push(`현재 ${current}/${total}`);
+        }
+        if (Number.isFinite(progress) && progress > 0) {
+            bits.push(`파일 ${Math.round(Math.max(0, Math.min(1, progress)) * 100)}%`);
+        }
+        if (Number.isFinite(speed) && speed > 0) {
+            bits.push(`${speed.toFixed(1)}MB/s`);
+        }
+        if (bits.length > 0) return bits.join(' · ');
+        const purpose = String(status.data_purpose || '').trim();
+        if (purpose) return purpose;
+        return this.continuousTrainingUpdatedTextFor(status);
+    }
+
+    public continuousTrainingDownloadProgressPercent(statusArg?: any): number {
+        const progress = Number((statusArg || {}).redownload_current_progress);
+        if (!Number.isFinite(progress) || progress <= 0) return 0;
+        return Math.round(Math.max(0, Math.min(1, progress)) * 100);
+    }
+
+    public modelTrainingStatCards(): any[] {
+        const stats = this.prototypeInfo?.dataset_summary?.model_training_stats;
+        if (Array.isArray(stats) && stats.length > 0) return stats.slice(0, 6);
+        return [];
+    }
+
+    public analysisModelOptionsForView(): any[] {
+        const options = this.prototypeInfo?.model_options?.options;
+        if (Array.isArray(options) && options.length > 0) {
+            return options.filter((item: any) => item?.available !== false);
+        }
+        return [{ key: 'rf-dual', label: 'RF-Dual (Fall+Posture)', description: '현재 운영 모델' }];
+    }
+
+    public selectedAnalysisModelOption(): any {
+        return this.analysisModelOptionsForView().find((item: any) => item?.key === this.selectedModelType) || this.analysisModelOptionsForView()[0] || {};
+    }
+
+    public selectedAnalysisModelLabel(): string {
+        return this.selectedAnalysisModelOption()?.label || 'RF-Dual (Fall+Posture)';
+    }
+
+    public async onAnalysisModelChanged() {
+        this.uploadAnalysisRequestKey = '';
+        this.realtimePerfStats.warmupMs = 0;
+        if (this.realtimeActive) {
+            this.errorMessage = '모델 변경은 다음 청크부터 반영됩니다.';
+        }
+        await this.service.render();
+    }
+
+    public modelMetricText(item: any): string {
+        const bits = [];
+        if (item?.algorithm) bits.push(String(item.algorithm));
+        const f1 = Number(item?.macro_f1 ?? item?.f1 ?? 0);
+        const acc = Number(item?.accuracy ?? 0);
+        const recall = Number(item?.recall ?? 0);
+        if (Number.isFinite(f1) && f1 > 0) bits.push(`F1 ${(f1 * 100).toFixed(1)}%`);
+        if (Number.isFinite(acc) && acc > 0) bits.push(`Acc ${(acc * 100).toFixed(1)}%`);
+        if (Number.isFinite(recall) && recall > 0) bits.push(`Recall ${(recall * 100).toFixed(1)}%`);
+        return bits.join(' · ') || item?.metric_note || '-';
+    }
+
+    public modelVersionBadge(item: any): string {
+        const direct = String(item?.version_badge || '').trim();
+        if (direct) return direct;
+        const values = [
+            item?.training_run_label,
+            item?.version_text,
+            item?.active_version_text,
+            item?.model_version,
+            item?.version,
+        ];
+        for (const value of values) {
+            const text = String(value || '').trim();
+            if (!text) continue;
+            const longMatch = text.match(/(?:^|[^A-Za-z0-9])v\s*([0-9]{8,20})(?:[^A-Za-z0-9]|$)/i);
+            if (longMatch) return `v${longMatch[1]}`;
+            const match = text.match(/(?:^|[^A-Za-z0-9])v\s*([0-9]{1,4})(?:[^A-Za-z0-9]|$)/i);
+            if (match) return `v${Number(match[1])}`;
+            const cycle = text.match(/(?:^|[^A-Za-z0-9])cycle\s*0*([1-9][0-9]{0,5})(?:[^0-9]|$)/i);
+            if (cycle) return `v${Number(cycle[1])}`;
+        }
+        return '';
+    }
+
+    public modelVersionText(item: any): string {
+        const label = String(item?.training_run_label || '').trim();
+        const text = String(item?.version_text || '').trim();
+        if (label && text && text !== '-') return `${label} · ${text}`;
+        if (label) return label;
+        if (text && text !== '-') return `active 버전: ${text}`;
+        const source = String(item?.model_path || '').split('/').pop() || '';
+        return source ? `active 버전: ${source}` : 'active 버전: -';
+    }
+
+    public modelContinuousTrainingText(item: any): string {
+        const badge = String(item?.current_training_badge || '').trim();
+        const text = String(item?.continuous_training_version_text || '').trim();
+        if (badge && text && text !== '-') return `${badge} · ${text}`;
+        if (badge) return badge;
+        if (!text || text === '-') return '';
+        const stage = String(item?.continuous_training_stage || '').trim();
+        const prefix = stage === 'running' ? '연속 학습' : '연속 상태';
+        return `${prefix}: ${text}`;
+    }
+
     public clearSelectedFile() {
         this.revokeSelectedVideoUrl();
         this.selectedFile = null;
         this.selectedFiles = [];
-        this.analysisResult = null;
+        this.clearAnalysisState();
         this.feedbackStatus = '';
         this.trainingUploadMessage = '';
         this.trainingUploadDone = 0;
@@ -1312,20 +2415,30 @@ export class Component implements OnInit, OnDestroy {
     public formatRisk(score: number): string { return (score * 100).toFixed(0) + '%'; }
     public currentEngineLabel(): string {
         const key = this.analysisResult?.runtime_key || '';
+        const selectedVersion = this.analysisResult?.selected_model_version?.label || '';
+        if (selectedVersion) return selectedVersion;
+        const runtimeLabel = this.prototypeInfo?.analysis_engine_summary?.current_runtime?.label || '';
+        if (this.currentModelStatusLabel() === 'ready' && (!key || key === 'heuristic-fallback')) {
+            return runtimeLabel || 'RF-Dual (Fall+Posture)';
+        }
         if (key === 'person-feature-runtime') return 'XGBoost v2 (사람 추적)';
         if (key === 'rf-pipeline-runtime') return 'RF 보조 (RandomForest)';
         if (key === 'rf-dual') return 'RF-Dual (Fall+Posture)';
+        if (key === 'rf-dual-person') return 'RF-Dual 사람별 분석';
         if (key === 'heuristic-fallback') return '휴리스틱 Fallback';
-        const runtimeLabel = this.prototypeInfo?.analysis_engine_summary?.current_runtime?.label || '';
         if (runtimeLabel) return runtimeLabel;
         if (this.selectedModelType === 'rf-dual') {
             return this.prototypeInfo?.trained_model?.runtime_ready ? 'RF-Dual (Fall+Posture)' : '모델 없음 (Fallback)';
         }
-        return key || '알 수 없음';
+        return this.selectedAnalysisModelLabel() || key || '알 수 없음';
     }
     public currentModelStatusLabel(): string {
+        const trainedReady = this.prototypeInfo?.trained_model?.runtime_ready === true;
+        const runtimeReady = this.prototypeInfo?.analysis_engine_summary?.current_runtime?.key === 'rf-dual-runtime';
+        const baseReady = this.prototypeInfo?.baseline_model_ready === true && this.prototypeInfo?.behavior_model_ready === true;
+        if (trainedReady || runtimeReady || baseReady) return 'ready';
         if (this.analysisResult?.runtime_key === 'heuristic-fallback') return 'fallback';
-        return this.prototypeInfo?.trained_model?.runtime_ready ? 'ready' : 'missing';
+        return 'missing';
     }
     public currentModelStatusText(): string {
         const status = this.currentModelStatusLabel();
@@ -1344,6 +2457,7 @@ export class Component implements OnInit, OnDestroy {
     }
     public modelSpeedHint(): string {
         const key = this.selectedModelType || '';
+        if (key.startsWith('registry:')) return '선택한 모델 버전으로 RF-Dual 분석';
         if (this.inputMode === 'webcam') {
             if (key === 'person-feature') return '~8초/청크';
             if (key === 'rf-dual') return '4초 청크 / 누락 없는 순차 큐';
@@ -1357,7 +2471,7 @@ export class Component implements OnInit, OnDestroy {
         const key = this.analysisResult?.runtime_key || '';
         const guide = this.analysisResult?.risk_score_guide;
         if (guide?.formula) return guide.formula;
-        if (key === 'rf-dual') return 'RF predict_proba → motion guard → XG-Posture 5-class';
+        if (key === 'rf-dual' || key === 'rf-dual-person') return 'RF predict_proba → motion guard → XG-Posture 5-class';
         if (key === 'person-feature-runtime') return 'max(window_probs) × fall_ratio';
         return 'fall_probability × motion_factor';
     }
@@ -1385,13 +2499,15 @@ export class Component implements OnInit, OnDestroy {
         const emotionConsistency = Math.round(Number(face.emotion_consistency || 0) * 100);
         const qualityMap: Record<string, string> = { high: '높음', medium: '보통', low: '낮음', unavailable: '불가' };
         const quality = qualityMap[String(face.emotion_quality || 'unavailable')] || '낮음';
-        const distress = Math.round(Number(face.trusted_distress_score ?? face.distress_score ?? 0) * 100);
+        const rawDistress = Math.round(Number(face.distress_score ?? 0) * 100);
+        const trustedDistress = Math.round(Number(face.trusted_distress_score ?? face.distress_score ?? 0) * 100);
         const faceRatio = Math.round(Number(face.actual_face_ratio || 0) * 100);
         const driver = face.driver_state_top_label || this.facialDriverStateLabel(face.driver_state_top);
         const driverConfidence = Math.round(Number(face.driver_state_confidence || 0) * 100);
         const driverRisk = Math.round(Number(face.driver_state_risk || 0) * 100);
+        const modelMode = String(face.emotion_output_mode || '') === 'distress_signal' ? '불편신호 모델' : '표정분류 모델';
         const suffix = face.emotion_top && face.emotion_top !== 'unavailable'
-            ? `${emotion} · top ${emotionConfidence}% · margin ${emotionMargin}% · 일치 ${emotionConsistency}% · 신뢰 ${quality} · 보정불편 ${distress}% · 실제얼굴 ${faceRatio}%`
+            ? `${modelMode} · ${emotion} · 모델확신 ${emotionConfidence}% · margin ${emotionMargin}% · 일치 ${emotionConsistency}% · 신뢰 ${quality} · 불편 raw ${rawDistress}% / 신뢰보정 ${trustedDistress}% · 실제얼굴 ${faceRatio}%`
             : '';
         const driverSuffix = face.driver_state_top && face.driver_state_top !== 'unavailable'
             ? `상태 ${driver} ${driverConfidence}% · 주의저하 ${driverRisk}%${face.driver_state_reliable ? '' : ' · 저신뢰'}`
@@ -1410,6 +2526,8 @@ export class Component implements OnInit, OnDestroy {
             embarrassed: '당황',
             surprise: '놀람',
             anxiety: '불안',
+            distress: '불편/고통',
+            non_distress: '비불편',
             hurt: '상처',
             sadness: '슬픔',
             anger: '분노',
@@ -1482,6 +2600,8 @@ export class Component implements OnInit, OnDestroy {
             embarrassed: '#f59e0b',
             surprise: '#f59e0b',
             anxiety: '#a855f7',
+            distress: '#f43f5e',
+            non_distress: '#64748b',
             hurt: '#e11d48',
             sadness: '#6366f1',
             anger: '#ef4444',
@@ -1491,7 +2611,7 @@ export class Component implements OnInit, OnDestroy {
         };
         const probs = face.emotion_probs || {};
         const driverProbs = face.driver_state_probs || {};
-        const showEmotionCandidates = Boolean(face.emotion_reliable) || Number(face.actual_face_ratio || 0) >= 0.50;
+        const showEmotionCandidates = Boolean(face.emotion_reliable) || Number(face.support_score || 0) > 0;
         const emotionItems = (showEmotionCandidates ? Object.keys(probs) : [])
             .map((key: string) => ({
                 key,
@@ -1512,7 +2632,7 @@ export class Component implements OnInit, OnDestroy {
             });
             emotionItems.push({
                 key: 'distress',
-                label: '보정불편',
+                label: '신뢰보정 불편',
                 percent: pct(face.trusted_distress_score ?? face.distress_score),
                 active: Number(face.trusted_distress_score ?? face.distress_score ?? 0) >= 0.30,
                 color: '#f43f5e',
@@ -1537,7 +2657,8 @@ export class Component implements OnInit, OnDestroy {
         }
         const items: any[] = [
             { key: 'face', label: '얼굴', percent: face.face_detected ? pct(face.facial_confidence) : 0, active: Boolean(face.face_detected), color: '#22d3ee' },
-            { key: 'distress', label: '불편', percent: pct(face.support_score), active: Number(face.support_score || 0) > 0, color: '#f59e0b' },
+            { key: 'calm', label: '평온/차분', percent: Number(face.support_score || 0) > 0 ? 0 : 100, active: Number(face.support_score || 0) <= 0, color: '#14b8a6' },
+            { key: 'distress', label: '신뢰보정 불편', percent: pct(face.support_score), active: Number(face.support_score || 0) > 0, color: '#f59e0b' },
             { key: 'driver_state', label: `상태 ${face.driver_state_top_label || this.facialDriverStateLabel(face.driver_state_top)}`, percent: pct(face.driver_state_risk), active: Number(face.driver_state_risk || 0) >= 0.35, color: '#0ea5e9' },
             { key: 'eyes', label: '눈감김', percent: pct(face.eye_closed_ratio), active: Boolean(face.eye_closed), color: '#8b5cf6' },
             { key: 'mouth', label: '입/긴장', percent: Math.max(pct(face.mouth_open_ratio), pct(face.upper_tension_ratio)), active: Number(face.mouth_open_ratio || 0) > 0 || Number(face.upper_tension_ratio || 0) > 0, color: '#f43f5e' },
@@ -1553,7 +2674,7 @@ export class Component implements OnInit, OnDestroy {
         if (face?.available && Number(face?.support_score || 0) > 0) return 'border-sky-200 bg-sky-50 text-sky-800';
         return 'border-zinc-200 bg-zinc-50 text-zinc-600';
     }
-    public isDualModeResult(result?: any): boolean { const res = result || this.analysisResult || {}; return (res?.runtime_key || '') === 'rf-dual'; }
+    public isDualModeResult(result?: any): boolean { const res = result || this.analysisResult || {}; return ['rf-dual', 'rf-dual-person'].includes(res?.runtime_key || ''); }
     public rawPostureProbs(result?: any): Record<string, number> {
         const res = result || this.analysisResult || {};
         return res?.posture_candidate_probs || res?.runtime_inference?.posture_candidate_probs || res?.posture_raw_probs || res?.runtime_inference?.posture_raw_probs || res?.posture_probs || res?.runtime_inference?.posture_probs || {};
@@ -1667,12 +2788,37 @@ export class Component implements OnInit, OnDestroy {
     public llmInterpretationStatus(): string {
         const llm = this.analysisResult?.llm_interpretation || {};
         if (llm?.status === 'generated') return `${llm.model || 'LLM'} 판독`;
+        if (llm?.status === 'local_fast') return '로컬 빠른 근거 요약';
         if (llm?.status === 'queued') return 'LLM 판독 대기';
         if (llm?.status === 'cached') return `${llm.model || 'LLM'} 캐시 판독`;
         if (llm?.status === 'missing_api_key') return 'LLM API Key 필요';
         if (llm?.status === 'error') return `LLM 판독 실패: ${llm.error || '오류'}`;
         if (llm?.status === 'disabled') return 'LLM 판독 꺼짐';
         return '';
+    }
+
+    private numericTiming(value: any): number {
+        const num = Number(value || 0);
+        return Number.isFinite(num) ? num : 0;
+    }
+
+    public getUploadAnalysisSlowReason(): string {
+        const st = this.analysisResult?.server_timing || {};
+        if (!st) return '';
+        const inference = this.numericTiming(st.inference_sec);
+        const build = this.numericTiming(st.result_build_sec);
+        const llm = this.numericTiming(st.llm_sec);
+        const total = this.numericTiming(st.total_server_sec || st.response_ready_sec);
+        if (llm >= 1 && llm >= inference * 0.5 && llm >= build * 0.5) {
+            return `LLM 동기 판독이 ${llm.toFixed(2)}초 걸렸습니다. local_fast 또는 비동기 판독으로 낮출 수 있습니다.`;
+        }
+        if (inference >= build && inference >= 1) {
+            return `주요 지연은 RF-Dual 영상 추론입니다. 추론 ${inference.toFixed(2)}초 / 전체 ${total.toFixed(2)}초입니다.`;
+        }
+        if (build >= 1) {
+            return `주요 지연은 업로드 분할 로그와 결과 구성입니다. 결과 구성 ${build.toFixed(2)}초 / LLM ${llm.toFixed(2)}초입니다.`;
+        }
+        return `LLM ${llm.toFixed(2)}초, 전체 ${total.toFixed(2)}초로 병목은 크지 않습니다.`;
     }
 
     public getServerTimingDetail(): any[] {
@@ -1682,10 +2828,11 @@ export class Component implements OnInit, OnDestroy {
             { label: '파일 읽기', value: st.file_read_sec },
             { label: '파일 저장', value: st.file_save_sec },
             { label: '모델 로드', value: st.summary_load_sec },
-            { label: '추론', value: st.inference_sec },
-            { label: '결과 구성', value: st.result_build_sec },
+            { label: 'RF-Dual 추론', value: st.inference_sec },
+            { label: '분할 로그/결과', value: st.result_build_sec },
+            { label: 'LLM 설명', value: st.llm_sec },
             { label: '알림 디스패치', value: st.alert_dispatch_sec },
-            { label: '응답 준비', value: st.response_ready_sec },
+            { label: '전체 응답', value: st.response_ready_sec },
         ].filter(i => i.value != null);
     }
 
@@ -1728,6 +2875,9 @@ export class Component implements OnInit, OnDestroy {
     public toggleFeedbackFlag(flag: string) { if (flag === 'ambiguity') this.feedbackAmbiguityFlag = !this.feedbackAmbiguityFlag; if (flag === 'occlusion') this.feedbackOcclusionFlag = !this.feedbackOcclusionFlag; if (flag === 'short_clip') this.feedbackShortClipFlag = !this.feedbackShortClipFlag; }
 
     private pushRealtimeLog(blob: Blob, chunkId: number, chunkWindow: any) {
+        const key = this.realtimeWindowKey(chunkWindow);
+        const duplicate = this.realtimeLogEntries.find((entry: any) => this.realtimeWindowKey(entry?.chunkWindow || {}) === key);
+        if (duplicate) return;
         const blobUrl = URL.createObjectURL(blob);
         const postureRaw = this.analysisResult?.posture_label || this.analysisResult?.runtime_inference?.posture_label || '';
         const currentCode = postureRaw && postureRaw !== 'unknown' ? postureRaw : this.topNonFallPostureCode(this.analysisResult);
@@ -1842,6 +2992,12 @@ export class Component implements OnInit, OnDestroy {
     }
     public logRiskClass(level: string): string { if (level === 'high') return 'text-rose-500'; if (level === 'medium') return 'text-amber-500'; return 'text-emerald-500'; }
     public logRiskDotClass(level: string): string { if (level === 'high') return 'bg-rose-500'; if (level === 'medium') return 'bg-amber-500'; return 'bg-emerald-500'; }
+    public chunkRiskLabel(entry: any): string {
+        if (entry?.displayRiskLabel) return entry.displayRiskLabel;
+        if (entry?.level === 'high') return '고위험';
+        if (entry?.level === 'medium') return '주의';
+        return '안정';
+    }
     public async submitLogFeedback() {
         if (!this.logFeedbackStatus || !this.logDetailEntry) return;
         this.logFeedbackSubmitting = true;
@@ -1912,14 +3068,78 @@ export class Component implements OnInit, OnDestroy {
             if (kps && kps.length >= 17) {
                 for (const [i, j] of COCO_SKELETON_PAIRS) {
                     const a = kps[i], b = kps[j];
-                    if (!a || !b || a[2] < 0.3 || b[2] < 0.3) continue;
+                    if (!this.cocoKeypointVisible(a, i) || !this.cocoKeypointVisible(b, j)) continue;
                     ctx.beginPath(); ctx.moveTo(a[0] * scaleX + offX, a[1] * scaleY + offY); ctx.lineTo(b[0] * scaleX + offX, b[1] * scaleY + offY); ctx.strokeStyle = COCO_KP_COLORS[i] || '#67e8f9'; ctx.lineWidth = 1.5; ctx.stroke();
                 }
                 for (let k = 0; k < Math.min(kps.length, 17); k++) {
                     const kp = kps[k];
-                    if (!kp || kp[2] < 0.3) continue;
+                    if (!this.cocoKeypointVisible(kp, k)) continue;
                     ctx.beginPath(); ctx.arc(kp[0] * scaleX + offX, kp[1] * scaleY + offY, 3, 0, 2 * Math.PI); ctx.fillStyle = COCO_KP_COLORS[k] || '#67e8f9'; ctx.fill();
                 }
+            }
+        }
+    }
+    private clearRealtimeServerDetectionOverlay() {
+        const canvasEl = this.realtimeBboxCanvasRef?.nativeElement;
+        if (!canvasEl) return;
+        const ctx = canvasEl.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    }
+    private drawRealtimeServerDetectionOverlay(result: any) {
+        const frames = result?.model_runtime?.detection_frames || [];
+        const frame = frames.length > 0 ? frames[frames.length - 1] : null;
+        const canvasEl = this.realtimeBboxCanvasRef?.nativeElement;
+        if (!canvasEl) return;
+        const ctx = canvasEl.getContext('2d');
+        if (!ctx) return;
+        const rect = canvasEl.getBoundingClientRect();
+        const targetW = Math.max(1, Math.round(rect.width || canvasEl.clientWidth || 1));
+        const targetH = Math.max(1, Math.round(rect.height || canvasEl.clientHeight || 1));
+        if (canvasEl.width !== targetW || canvasEl.height !== targetH) {
+            canvasEl.width = targetW;
+            canvasEl.height = targetH;
+        }
+        ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+        if (this.isSkeletonPrivacyMode()) return;
+        if (!frame) return;
+        const vidW = Number(result?.video_meta?.width || this.webcamVideoRef?.nativeElement?.videoWidth || 1);
+        const vidH = Number(result?.video_meta?.height || this.webcamVideoRef?.nativeElement?.videoHeight || 1);
+        const videoEl = this.webcamVideoRef?.nativeElement;
+        let offX = 0, offY = 0, scaleX = canvasEl.width / Math.max(1, vidW), scaleY = canvasEl.height / Math.max(1, vidH);
+        if (videoEl && videoEl.videoWidth > 0) {
+            const cr = this.getVideoContentRect(videoEl);
+            offX = cr.x; offY = cr.y; scaleX = cr.w / Math.max(1, vidW); scaleY = cr.h / Math.max(1, vidH);
+        }
+        const detections = frame.detections || [];
+        for (const det of detections) {
+            const labelColor = det?.is_primary ? '#22c55e' : '#22d3ee';
+            const kps = det.keypoints;
+            if (!kps || kps.length < 17) continue;
+            for (const [i, j] of COCO_SKELETON_PAIRS) {
+                const a = kps[i], b = kps[j];
+                if (!this.cocoKeypointVisible(a, i) || !this.cocoKeypointVisible(b, j)) continue;
+                ctx.beginPath();
+                ctx.moveTo(Number(a[0] || 0) * scaleX + offX, Number(a[1] || 0) * scaleY + offY);
+                ctx.lineTo(Number(b[0] || 0) * scaleX + offX, Number(b[1] || 0) * scaleY + offY);
+                ctx.strokeStyle = det?.is_primary ? '#22c55e' : (COCO_KP_COLORS[i] || '#67e8f9');
+                ctx.lineWidth = det?.is_primary ? 2.25 : 1.75;
+                ctx.stroke();
+            }
+            for (let k = 0; k < Math.min(kps.length, 17); k++) {
+                const kp = kps[k];
+                if (!this.cocoKeypointVisible(kp, k)) continue;
+                ctx.beginPath();
+                ctx.arc(Number(kp[0] || 0) * scaleX + offX, Number(kp[1] || 0) * scaleY + offY, 3, 0, 2 * Math.PI);
+                ctx.fillStyle = COCO_KP_COLORS[k] || '#67e8f9';
+                ctx.fill();
+            }
+            if (det?.person_label) {
+                const x = Number(det.x1 || 0) * scaleX + offX + 3;
+                const y = Math.max(12, Number(det.y1 || 0) * scaleY + offY - 4);
+                ctx.font = '11px sans-serif';
+                ctx.fillStyle = labelColor;
+                ctx.fillText(String(det.person_label), x, y);
             }
         }
     }
@@ -1948,7 +3168,15 @@ export class Component implements OnInit, OnDestroy {
         const ctx = canvas.getContext('2d'); if (!ctx) return;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!this.bboxOverlayEnabled) return;
-        for (const det of detections) { ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 2; ctx.strokeRect(det.x1 * w, det.y1 * h, (det.x2 - det.x1) * w, (det.y2 - det.y1) * h); }
+        for (const det of detections) {
+            const color = det?.is_primary ? '#22c55e' : '#22d3ee';
+            ctx.strokeStyle = color; ctx.lineWidth = det?.is_primary ? 2.5 : 2;
+            ctx.strokeRect(det.x1 * w, det.y1 * h, (det.x2 - det.x1) * w, (det.y2 - det.y1) * h);
+            if (det?.person_label) {
+                ctx.fillStyle = color; ctx.font = '11px sans-serif';
+                ctx.fillText(String(det.person_label), det.x1 * w + 3, Math.max(12, det.y1 * h - 4));
+            }
+        }
     }
 
     public async openRiskAlertWorkflow() {

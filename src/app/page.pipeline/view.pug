@@ -1,28 +1,33 @@
 div(class="min-h-screen bg-slate-50")
-    nav(class="shrink-0 bg-white border-b border-zinc-200")
-        div(class="max-w-[1800px] mx-auto px-4 sm:px-6 h-[52px] flex items-center justify-between")
+    nav(class="shrink-0 border-b border-zinc-200 bg-white")
+        div(class="max-w-[1800px] mx-auto px-4 sm:px-6 h-[56px] flex items-center justify-between gap-4")
             div(class="flex items-center gap-3")
                 span(class="inline-flex size-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 via-blue-600 to-cyan-500 p-1 shadow-sm")
                     img(src="/assets/brand/fallai-mark.svg", alt="FallAI", class="size-6")
                 div
                     p(class="text-lg font-semibold text-zinc-950") AI 파이프라인 상세
                     p(class="text-xs text-zinc-400") FallAI · RF-Dual 운영 기준 · XG-Posture 설명 레이어
-            div(class="flex flex-wrap gap-2")
-                a(routerLink="/", class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 메인
-                a(routerLink="/pipeline", class="inline-flex items-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-[13px] font-semibold text-sky-700") 파이프라인
-                a(routerLink="/manual", class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
-                a(routerLink="/admin/analysis", class="inline-flex items-center rounded-xl border border-zinc-300 bg-white px-3 py-1.5 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50", *ngIf="isAdminUser()") 관리자
+            div(class="flex min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap")
+                a(routerLink="/", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 메인
+                a(routerLink="/pipeline", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-4 text-[13px] font-semibold text-sky-700") 파이프라인
+                a(routerLink="/models", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 모델 관리
+                a(routerLink="/manual", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
+                a(routerLink="/admin/analysis", class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50", *ngIf="isAdminUser()") 관리자
     div(class="mx-auto max-w-[1800px] px-4 sm:px-6 py-10")
         div(class="rounded-3xl border border-zinc-200 bg-white p-6 shadow-sm")
             p(class="text-xs font-semibold uppercase tracking-[0.2em] text-sky-600") Pipeline Detail
             h1(class="mt-2 text-lg font-semibold text-zinc-950") RF-Dual 운영 파이프라인
             p(class="mt-3 max-w-3xl text-[13px] leading-7 text-zinc-600") RF 낙상 확률과 XG-Posture 5-class 자세를 함께 사용해 왜 낙상으로 봤는지 설명 가능한 구조로 운영합니다.
 
-        div(class="mt-8 grid gap-4 md:grid-cols-4")
+        div(class="mt-8 grid gap-4 md:grid-cols-5")
             div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
                 p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 현재 런타임
                 p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.label}}
                 p(class="mt-2 text-xs text-slate-500") {{prototypeInfo?.analysis_engine_summary?.current_runtime?.note}}
+            div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
+                p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 전체 학습 자료
+                p(class="mt-2 text-[15px] font-semibold text-slate-900") {{totalTrainingSamples()}}건
+                p(class="mt-2 text-xs text-slate-500") RF-Fall, XG-Posture, AI-Hub 82/173 보조 모델 합산
             div(class="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm")
                 p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 낙상 학습 샘플
                 p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.dataset_summary?.fall_sample_count || 0}}건
@@ -37,6 +42,42 @@ div(class="min-h-screen bg-slate-50")
                 p(class="text-xs font-semibold uppercase tracking-wider text-slate-400") 실시간 청크
                 p(class="mt-2 text-[15px] font-semibold text-slate-900") {{prototypeInfo?.dataset_summary?.realtime_chunk_sec || 4}}초
                 p(class="mt-2 text-xs text-slate-500") 4초 연속 청크와 무삭제 큐 기반 운영
+
+        div(class="mt-4 grid gap-3 md:grid-cols-4", *ngIf="modelTrainingStatCards().length > 0")
+            div(*ngFor="let item of modelTrainingStatCards()", class="rounded-2xl border border-slate-200 bg-white px-4 py-4 shadow-sm")
+                div(class="flex items-center justify-between gap-2")
+                    p(class="truncate text-sm font-semibold text-slate-900") {{item.label}}
+                    span(class="shrink-0 rounded-full bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-500") {{item.sample_count || 0}}건
+                p(class="mt-2 text-xs text-slate-500") {{modelMetricText(item)}}
+                p(class="mt-1 truncate text-[10px] text-slate-400", *ngIf="item.updated_at") {{item.updated_at}}
+
+        div(class="mt-8 rounded-3xl border border-cyan-200 bg-cyan-50 p-6 shadow-sm")
+            div(class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between")
+                div
+                    p(class="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-600") Four Camera Check
+                    h2(class="mt-2 text-xl font-semibold text-cyan-950") 4개 모서리 카메라로 한 대상 추적은 가능, 운영 검증은 별도 필요
+                    p(class="mt-2 max-w-4xl text-sm leading-6 text-cyan-800") 사각지대를 줄이는 방향으로는 타당합니다. 단, 카메라 4개 결과를 단순 평균내면 안 되고 timestamp 동기화, 바닥 좌표 보정, global person_id 융합이 필요합니다.
+                span(class="shrink-0 rounded-full border border-cyan-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-cyan-700") prototype feasible
+            div(class="mt-5 grid gap-3 md:grid-cols-4")
+                div(class="rounded-2xl border border-cyan-200 bg-white px-4 py-4")
+                    p(class="text-[11px] font-semibold text-cyan-500") 필요 처리량
+                    p(class="mt-1 text-lg font-bold text-cyan-950") 16 fps
+                    p(class="mt-1 text-xs text-cyan-700") 4대 x 서버 4fps
+                div(class="rounded-2xl border border-cyan-200 bg-white px-4 py-4")
+                    p(class="text-[11px] font-semibold text-cyan-500") 320px 예상 부하
+                    p(class="mt-1 text-lg font-bold text-cyan-950") 약 11%
+                    p(class="mt-1 text-xs text-cyan-700") 기존 3명 벤치 기준
+                div(class="rounded-2xl border border-cyan-200 bg-white px-4 py-4")
+                    p(class="text-[11px] font-semibold text-cyan-500") 640px 예상 부하
+                    p(class="mt-1 text-lg font-bold text-cyan-950") 약 45%
+                    p(class="mt-1 text-xs text-cyan-700") 정밀 모드도 후보
+                div(class="rounded-2xl border border-cyan-200 bg-white px-4 py-4")
+                    p(class="text-[11px] font-semibold text-cyan-500") 필수 검증
+                    p(class="mt-1 text-lg font-bold text-cyan-950") ID 유지율
+                    p(class="mt-1 text-xs text-cyan-700") 동기화/가림 복구 포함
+            div(class="mt-4 rounded-2xl border border-cyan-200 bg-white px-4 py-4")
+                p(class="text-sm font-semibold text-cyan-950") 적용 구조
+                p(class="mt-2 text-sm leading-6 text-cyan-800") 카메라별 분석 결과에 camera_id와 timestamp를 붙이고, 바닥 좌표 homography로 같은 사람을 global person_id 하나로 묶습니다. 화면은 한 사람 카드 하나만 보여주고 상세에서 카메라별 근거를 펼치는 방식이 가장 덜 어지럽습니다.
 
         div(class="mt-8 grid gap-6 xl:grid-cols-2")
             div(class="rounded-3xl border border-rose-200 bg-rose-50 p-6 shadow-sm")
@@ -82,7 +123,7 @@ div(class="min-h-screen bg-slate-50")
                         div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
                             div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 1
                             p(class="mt-2 text-sm font-semibold text-sky-900") 데이터 수집
-                            p(class="mt-1 text-xs text-sky-700") RF {{prototypeInfo?.trained_model?.sample_count || 0}}건 · Posture {{prototypeInfo?.dataset_summary?.behavior_sample_count || 0}}윈도우
+                            p(class="mt-1 text-xs text-sky-700") 전체 {{totalTrainingSamples()}}건 · Posture {{prototypeInfo?.dataset_summary?.behavior_sample_count || 0}}윈도우
                         div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
                             div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 2
                             p(class="mt-2 text-sm font-semibold text-sky-900") 전처리
@@ -98,7 +139,7 @@ div(class="min-h-screen bg-slate-50")
                         div(class="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-center")
                             div(class="mx-auto flex size-8 items-center justify-center rounded-full bg-sky-500 text-xs font-bold text-white") 5
                             p(class="mt-2 text-sm font-semibold text-sky-900") 평가
-                            p(class="mt-1 text-xs text-sky-700") 검증 정확도 확인
+                            p(class="mt-1 text-xs text-sky-700") RF {{modelMetricText(modelTrainingStat('rf-fall-v2'))}}
 
                 div(class="rounded-3xl border border-indigo-200 bg-indigo-50 p-6 shadow-sm")
                     h2(class="text-xl font-semibold text-indigo-950") RF-Dual 운영 파이프라인 흐름
@@ -195,19 +236,19 @@ div(class="min-h-screen bg-slate-50")
                             p(class="mt-1 text-xs text-slate-500") bbox 중심/높이/면적 · 종횡비 · 하강 속도/가속도 · 바닥 근접 · skeleton lying/standing score · detection/sample coverage
                     div(class="mt-5 grid gap-3 md:grid-cols-4")
                         div(class="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-center")
-                            p(class="text-xs text-emerald-600") Best F1
-                            p(class="mt-1 text-lg font-bold text-emerald-900") 93.37%
+                            p(class="text-xs text-emerald-600") F1
+                            p(class="mt-1 text-lg font-bold text-emerald-900") {{percentText(modelTrainingStat('rf-fall-v2')?.f1)}}
                         div(class="rounded-xl border border-sky-200 bg-sky-50 p-3 text-center")
                             p(class="text-xs text-sky-600") Precision
-                            p(class="mt-1 text-lg font-bold text-sky-900") 90.80%
+                            p(class="mt-1 text-lg font-bold text-sky-900") {{percentText(modelTrainingStat('rf-fall-v2')?.precision)}}
                         div(class="rounded-xl border border-violet-200 bg-violet-50 p-3 text-center")
                             p(class="text-xs text-violet-600") Recall
-                            p(class="mt-1 text-lg font-bold text-violet-900") 95.36%
+                            p(class="mt-1 text-lg font-bold text-violet-900") {{percentText(modelTrainingStat('rf-fall-v2')?.recall)}}
                         div(class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-center")
-                            p(class="text-xs text-rose-600") F1 Score
-                            p(class="mt-1 text-lg font-bold text-rose-900") 93.02%
+                            p(class="text-xs text-rose-600") 학습 샘플
+                            p(class="mt-1 text-lg font-bold text-rose-900") {{modelTrainingStat('rf-fall-v2')?.sample_count || prototypeInfo?.dataset_summary?.fall_sample_count || 0}}
                     div(class="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3")
-                        p(class="text-xs text-slate-500") 모델 요약: RandomForest 계열 RF-Fall v2 · 65 features · threshold sweep best_f1 0.405 / confirm 0.455
+                        p(class="text-xs text-slate-500") 모델 요약: RandomForest 계열 RF-Fall v2 · 65 features · {{modelMetricText(modelTrainingStat('rf-fall-v2'))}} · confirm {{((prototypeInfo?.decision_thresholds?.fall_detected || 0.455) * 100) | number:'1.0-1'}}%
 
                 div(class="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm")
                     h2(class="text-xl font-semibold text-slate-950") 운영 모델 비교
@@ -223,13 +264,13 @@ div(class="min-h-screen bg-slate-50")
                                     span(class="font-semibold text-emerald-800") RF 낙상 + XG-Posture 설명
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 모델
-                                    span(class="font-semibold text-emerald-800") RandomForest + XGBoost posture
+                                    span(class="font-semibold text-emerald-800") RandomForest + XG-Posture tree
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 낙상 임계값
                                     span(class="font-semibold text-emerald-800") {{((prototypeInfo?.decision_thresholds?.fall_detected || 0.455) * 100) | number:'1.0-1'}}%
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 학습 데이터
-                                    span(class="font-semibold text-emerald-800") RF-Fall v2 1,592 samples
+                                    span(class="font-semibold text-emerald-800") RF-Fall v2 {{modelTrainingStat('rf-fall-v2')?.sample_count || prototypeInfo?.dataset_summary?.fall_sample_count || 0}} samples
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 청크 기준
                                     span(class="font-semibold text-emerald-800") 4초 / 4fps
@@ -243,7 +284,7 @@ div(class="min-h-screen bg-slate-50")
                                     span(class="font-semibold text-violet-800") 5-class posture + 중첩 청크 해석
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 모델
-                                    span(class="font-semibold text-violet-800") XGBoost + 운영 정책
+                                    span(class="font-semibold text-violet-800") {{modelTrainingStat('xg-posture')?.algorithm || 'tree model'}} + 운영 정책
                                 div(class="flex items-center justify-between text-sm")
                                     span(class="text-slate-600") 현재 상태
                                     span(class="font-semibold text-violet-800") 운영 활성

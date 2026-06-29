@@ -1,5 +1,4 @@
 import { Injectable } from '@angular/core';
-import { ChangeDetectorRef } from '@angular/core';
 
 import Auth from './src/auth';
 import Event from './src/event';
@@ -14,7 +13,7 @@ import Formatter from './util/formatter';
 
 @Injectable({ providedIn: 'root' })
 export class Service {
-    public app: ChangeDetectorRef;
+    public app: any = null;
     public inited: boolean = false;
 
     public auth: Auth;
@@ -30,10 +29,13 @@ export class Service {
 
     constructor() { }
 
-    public async init(app: any) {
-        if (app) {
+    public async init(app: any = null) {
+        const hasRenderableRef = app?.ref && typeof app.ref.detectChanges === 'function';
+        if (app && (hasRenderableRef || !this.app)) {
             this.app = app;
+        }
 
+        if (!this.crypto) {
             this.crypto = new Crypto();
             this.file = new File();
             this.request = new Request();
@@ -43,20 +45,23 @@ export class Service {
             this.modal = new Modal(this);
             this.status = new Status(this);
             this.event = new Event(this);
+        }
 
-            if (this.app.translate) {
-                this.lang = new Lang(this);
-                let lang: string = (navigator.language || navigator.userLanguage).substring(0, 2).toLowerCase();
-                if (!['ko', 'en'].includes(lang)) lang = 'en';
-                this.lang.set(lang);
-            }
+        if (this.app?.translate && !this.lang) {
+            this.lang = new Lang(this);
+            let lang: string = (navigator.language || navigator.userLanguage).substring(0, 2).toLowerCase();
+            if (!['ko', 'en'].includes(lang)) lang = 'en';
+            this.lang.set(lang);
+        }
 
+        if (!this.inited && this.auth) {
             await this.auth.init();
             this.inited = true;
             await this.render();
+        } else if (this.auth) {
+            await this.auth.update();
         }
 
-        await this.auth.update();
         return this;
     }
 
@@ -68,18 +73,21 @@ export class Service {
     }
 
     public async render(time: number = 0) {
+        const ref = this.app?.ref;
+        if (!ref || typeof ref.detectChanges !== 'function') return;
         let timeout = () => new Promise((resolve) => {
             setTimeout(resolve, time);
         });
         if (time > 0) {
-            this.app.ref.detectChanges();
+            ref.detectChanges();
             await timeout();
         }
-        this.app.ref.detectChanges();
+        ref.detectChanges();
     }
 
     public href(url: any) {
-        this.app.router.navigateByUrl(url);
+        if (this.app?.router?.navigateByUrl) return this.app.router.navigateByUrl(url);
+        location.href = url;
     }
 
     public random(stringLength: number = 16) {

@@ -223,3 +223,7 @@
 | 2026-04-07 | 001 | XGBoost 가짜 움직임 예측 방지를 위한 키포인트 신뢰도 검사 추가 | [상세](devlog/2026-04-07/001-fix-keypoint-interpolation.md) |
 | 2026-04-07 | N/A | 2026-04-07 일일 개발 보고 추가 | [상세](devlog/2026-04-07/daily_report_20260407.md) |
 | 2026-04-14 | 001 | 모델 복구 및 _desc_dur UnboundLocalError 수정 (33% fallback 해결) | [상세](devlog/2026-04-14/001-model-recovery-and-desc-dur-fix.md) |
+| 2026-06-08 | 001 | 운영 모델 파일 유실 복구 및 재부팅 자동 복원 가드 추가 | [상세](devlog/2026-06-08/001-production-model-restore-guard.md) |
+| 2026-06-08 | 002 | 최신 4대 운영 모델 및 legacy baseline 전체 복구 | [상세](devlog/2026-06-08/002-production-model-full-repair.md) |
+| 2026-06-08 | 003 | 운영 모델 유실 원인 감사 및 emergency artifact 비활성화 | [상세](devlog/2026-06-08/003-production-model-loss-audit.md) |
+| 2026-06-08 | 004 | AI-Hub 원천 재다운로드 및 모델 재학습 복구 큐 시작 | [상세](devlog/2026-06-08/004-aihub-redownload-retraining-recovery.md) |

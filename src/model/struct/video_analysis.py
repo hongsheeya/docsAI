@@ -23,6 +23,39 @@ os.environ.setdefault('MKL_NUM_THREADS', '1')
 os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
 os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
 
+
+def _ensure_fallai_persistent_runtime_links():
+    persistent_root = os.environ.get('FALLAI_PERSISTENT_ROOT') or '/mnt/data/wiz'
+    if not os.path.isdir(persistent_root):
+        return
+
+    pairs = [
+        ('/opt/app/storage', os.path.join(persistent_root, 'storage')),
+        ('/opt/app/_appdata/storage', os.path.join(persistent_root, 'storage')),
+        ('/opt/app/datasets', os.path.join(persistent_root, 'datasets')),
+        ('/opt/app/project/main/storage', os.path.join(persistent_root, 'storage')),
+        ('/opt/app/project/main/outputs', os.path.join(persistent_root, 'storage', 'project-main', 'outputs')),
+    ]
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    for link_path, target_path in pairs:
+        try:
+            os.makedirs(target_path, exist_ok=True)
+            os.makedirs(os.path.dirname(link_path), exist_ok=True)
+            if os.path.islink(link_path):
+                if os.readlink(link_path) == target_path:
+                    continue
+                os.rename(link_path, f"{link_path}.old-link-{stamp}")
+            elif os.path.exists(link_path):
+                if os.path.realpath(link_path) == target_path:
+                    continue
+                os.rename(link_path, f"{link_path}.local-overlay-{stamp}")
+            os.symlink(target_path, link_path)
+        except Exception:
+            pass
+
+
+_ensure_fallai_persistent_runtime_links()
+
 try:
     import cv2
     try:
@@ -62,10 +95,16 @@ class VideoAnalysis:
         self.__class__._prototype_info_cache = None
         self.__class__._prototype_info_cache_ts = 0.0
 
-    _PERSISTENT_MODEL_ROOT = os.path.join('/opt/app', 'storage', 'training', 'fall-detection')
+    _PERSISTENT_STORAGE_ROOT = os.environ.get('FALLAI_STORAGE_ROOT') or (
+        '/mnt/data/wiz/storage' if os.path.isdir('/mnt/data/wiz/storage') else os.path.join('/opt/app', 'storage')
+    )
+    _PERSISTENT_MODEL_ROOT = os.path.join(_PERSISTENT_STORAGE_ROOT, 'training', 'fall-detection')
 
     def _persistent_model_root(self):
-        path = self._PERSISTENT_MODEL_ROOT
+        storage_root = os.environ.get('FALLAI_STORAGE_ROOT') or self._PERSISTENT_STORAGE_ROOT
+        if not os.path.isdir(storage_root) and os.path.isdir('/mnt/data/wiz/storage'):
+            storage_root = '/mnt/data/wiz/storage'
+        path = os.path.join(storage_root, 'training', 'fall-detection')
         try:
             os.makedirs(path, exist_ok=True)
         except Exception:
@@ -87,10 +126,1566 @@ class VideoAnalysis:
                 return legacy_path
         return persistent_path
 
+    _MODEL_FAMILY_META = {
+        'rf-dual': {
+            'label': 'RF-Dual 통합',
+            'description': '현재 운영 중인 낙상 RF와 XG-Posture를 함께 사용하는 기본 파이프라인입니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+        },
+        'rf-fall-v2': {
+            'label': 'RF-Fall',
+            'description': 'RF-Dual에서 낙상 이진 판단 모델만 이 버전으로 교체해 분석합니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['rf_fall_v2_model.pkl', 'model.pkl', 'best_model.pkl'],
+            'summary_names': ['training_summary.json', 'summary.json'],
+        },
+        'rf-pipeline': {
+            'label': 'RF-Pipeline',
+            'description': '레거시 RF 보조 파이프라인 모델입니다. RF-Dual의 fallback RF로 사용할 수 있습니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['rf_hitl_model.pkl', 'best_model.pkl', 'model.pkl'],
+            'summary_names': ['training_summary.json', 'summary.json'],
+        },
+        'xg-posture': {
+            'label': 'XG-Posture',
+            'description': 'RF-Dual에서 자세/행동 분류 모델만 이 버전으로 교체해 분석합니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['xg_posture_model.pkl', 'model.pkl', 'best_model.pkl'],
+            'summary_names': ['training_summary.json', 'summary.json'],
+        },
+        'xg-posture-occlusion-aux': {
+            'label': '가림 보조',
+            'description': '자세가 불확실하거나 keypoint confidence가 낮을 때만 쓰는 가림 보조 모델입니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['xg_posture_occlusion_aux_model.pkl', 'model.pkl', 'best_model.pkl'],
+            'summary_names': ['training_summary.json', 'summary.json'],
+        },
+        'driver-aihub173': {
+            'label': 'AI-Hub 173 상태',
+            'description': '졸림·하품·주의저하 보조 모델입니다. RF-Dual 통합 조합에서 상태 보조 버전을 교체할 수 있습니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['aihub173_driver_state_mobilenetv3.pt', 'model.pt', 'model.pth'],
+            'summary_names': ['aihub173_driver_state_summary.json', 'training_summary.json', 'summary.json'],
+        },
+        'facial-aihub82': {
+            'label': 'AI-Hub 82 표정',
+            'description': '표정 보조 모델입니다. RF-Dual 통합 조합에서 표정 보조 버전을 교체할 수 있습니다.',
+            'selectable': True,
+            'runtime': 'rf-dual',
+            'model_names': ['aihub82_facial_emotion_mobilenetv3.pt', 'model.pt', 'model.pth'],
+            'summary_names': ['aihub82_facial_emotion_summary.json', 'training_summary.json', 'summary.json'],
+        },
+    }
+    _MODEL_PRIMARY_EXTENSIONS = {'.pkl', '.joblib', '.pt', '.pth', '.onnx', '.bin'}
+    _MODEL_ARCHIVE_EXTENSIONS = {'.zip', '.tar', '.tgz', '.gz'}
+
+    def _model_registry_dir(self):
+        path = self._persistent_model_path('model-registry')
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        return path
+
+    def _model_registry_index_path(self):
+        return os.path.join(self._model_registry_dir(), 'registry.json')
+
+    def _model_family_meta(self, family):
+        family = self._normalize_model_family(family)
+        return self._MODEL_FAMILY_META.get(family, self._MODEL_FAMILY_META['rf-dual'])
+
+    def _normalize_model_family(self, family):
+        raw = str(family or '').strip().lower()
+        aliases = {
+            'rf': 'rf-fall-v2',
+            'fall': 'rf-fall-v2',
+            'fall-rf': 'rf-fall-v2',
+            'posture': 'xg-posture',
+            'occlusion': 'xg-posture-occlusion-aux',
+            'xg-occlusion': 'xg-posture-occlusion-aux',
+            'aihub173': 'driver-aihub173',
+            'driver-state': 'driver-aihub173',
+            'aihub82': 'facial-aihub82',
+            'facial': 'facial-aihub82',
+        }
+        raw = aliases.get(raw, raw)
+        return raw if raw in self._MODEL_FAMILY_META else 'rf-fall-v2'
+
+    def _read_model_registry_index(self):
+        data = self._read_json(self._model_registry_index_path(), default={}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        if not isinstance(data.get('items'), list):
+            data['items'] = []
+        if not isinstance(data.get('trash'), list):
+            data['trash'] = []
+        if not isinstance(data.get('runtime_selection'), dict):
+            data['runtime_selection'] = {}
+        if not isinstance(data.get('runtime_bundles'), list):
+            data['runtime_bundles'] = []
+        if not isinstance(data.get('fall_sensitivity'), dict):
+            data['fall_sensitivity'] = {}
+        data.setdefault('schema_version', 1)
+        return data
+
+    def _write_model_registry_index(self, data):
+        data = data if isinstance(data, dict) else {}
+        data['schema_version'] = int(data.get('schema_version', 1) or 1)
+        data['updated_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self._write_json(self._model_registry_index_path(), data)
+        self._invalidate_prototype_info_cache()
+
+    def _fall_sensitivity_config(self, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        raw = index.get('fall_sensitivity') if isinstance(index.get('fall_sensitivity'), dict) else {}
+        try:
+            level = int(float(raw.get('level', 50)))
+        except Exception:
+            level = 50
+        level = max(0, min(100, level))
+        enabled = raw.get('enabled', True)
+        enabled = False if str(enabled).lower() in ('0', 'false', 'no', 'off') else bool(enabled)
+        delta = round((50 - level) / 500.0, 4)
+        if not enabled:
+            delta = 0.0
+        if level >= 75:
+            preset = 'sensitive'
+            label = '민감'
+        elif level <= 25:
+            preset = 'conservative'
+            label = '보수'
+        else:
+            preset = 'balanced'
+            label = '균형'
+        return {
+            'enabled': enabled,
+            'level': level,
+            'preset': str(raw.get('preset') or preset),
+            'label': str(raw.get('label') or label),
+            'threshold_delta': delta,
+            'note': str(raw.get('note') or '').strip(),
+            'updated_at': str(raw.get('updated_at') or '').strip(),
+        }
+
+    def _threshold_entry_number(self, value, default=0.0):
+        if isinstance(value, dict):
+            for key in ('threshold', 'value', 'confirm', 'score'):
+                if value.get(key) is not None:
+                    value = value.get(key)
+                    break
+        return self._metadata_to_number(value, default)
+
+    def _normalize_thresholds(self, confirm, suspect=None, high=None):
+        confirm = max(0.05, min(0.95, float(confirm)))
+        suspect_default = max(0.05, confirm - 0.12)
+        high_default = min(0.95, max(0.75, confirm + 0.15))
+        suspect = max(0.03, min(0.94, float(suspect if suspect is not None else suspect_default)))
+        high = max(0.06, min(0.99, float(high if high is not None else high_default)))
+        if suspect >= confirm:
+            suspect = max(0.03, confirm - 0.08)
+        if high < confirm:
+            high = min(0.99, confirm + 0.08)
+        return {
+            'suspect': round(float(suspect), 4),
+            'confirm': round(float(confirm), 4),
+            'high': round(float(high), 4),
+        }
+
+    def _apply_fall_sensitivity_thresholds(self, thresholds, index=None):
+        thresholds = dict(thresholds or {})
+        config = self._fall_sensitivity_config(index)
+        delta = float(config.get('threshold_delta', 0.0) or 0.0)
+        confirm = float(thresholds.get('confirm', self.fall_decision_threshold) or self.fall_decision_threshold) + delta
+        suspect = float(thresholds.get('suspect', max(0.05, confirm - 0.12)) or max(0.05, confirm - 0.12)) + delta
+        high = float(thresholds.get('high', max(0.75, confirm + 0.15)) or max(0.75, confirm + 0.15)) + delta
+        result = self._normalize_thresholds(confirm, suspect, high)
+        result['sensitivity_level'] = int(config.get('level', 50) or 50)
+        result['sensitivity_delta'] = round(delta, 4)
+        result['sensitivity_label'] = config.get('label') or '균형'
+        return result
+
+    def _rf_base_thresholds(self):
+        summary = self._rf_project_summary()
+        tuned = summary.get('tuned_thresholds', {}) or {}
+        best_config = summary.get('best_config', {}) or {}
+        confirm_source = tuned.get('confirm', best_config.get('threshold', self.fall_decision_threshold))
+        confirm = self._threshold_entry_number(confirm_source, self.fall_decision_threshold)
+        suspect_default = max(0.30, confirm - 0.15)
+        suspect = self._threshold_entry_number(tuned.get('suspect', suspect_default), suspect_default)
+        high_default = max(0.75, confirm + 0.15)
+        high = self._threshold_entry_number(tuned.get('high', high_default), high_default)
+        return self._normalize_thresholds(confirm, suspect, high)
+
+    def _rf_fall_v2_base_thresholds(self, summary=None, bundle=None):
+        summary = summary if isinstance(summary, dict) else self._rf_fall_v2_summary()
+        bundle = bundle if isinstance(bundle, dict) else {}
+        raw = bundle.get('thresholds') if isinstance(bundle.get('thresholds'), dict) else {}
+        if not raw:
+            raw = summary.get('thresholds') if isinstance(summary.get('thresholds'), dict) else {}
+        if not raw:
+            raw = summary.get('tuned_thresholds') if isinstance(summary.get('tuned_thresholds'), dict) else {}
+        base_rf = self._rf_base_thresholds()
+        confirm = self._threshold_entry_number(raw.get('confirm') or raw.get('best_f1'), base_rf.get('confirm', self.fall_decision_threshold))
+        suspect = self._threshold_entry_number(raw.get('suspect'), max(0.05, confirm - 0.12))
+        high = self._threshold_entry_number(raw.get('high'), max(0.75, confirm + 0.15))
+        return self._normalize_thresholds(confirm, suspect, high)
+
+    def _rf_fall_v2_thresholds(self, summary=None, bundle=None):
+        return self._apply_fall_sensitivity_thresholds(self._rf_fall_v2_base_thresholds(summary=summary, bundle=bundle))
+
+    def _fall_sensitivity_info(self, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        config = self._fall_sensitivity_config(index)
+        base = self._rf_fall_v2_base_thresholds()
+        effective = self._apply_fall_sensitivity_thresholds(base, index=index)
+        return {
+            **config,
+            'base_thresholds': base,
+            'effective_thresholds': effective,
+            'confirm_threshold': effective.get('confirm'),
+            'suspect_threshold': effective.get('suspect'),
+            'high_threshold': effective.get('high'),
+            'description': '값을 높이면 confirm/suspect threshold가 낮아져 낙상에 더 민감해지고, 값을 낮추면 오탐을 줄이는 방향으로 보수적으로 동작합니다.',
+            'presets': [
+                {'label': '보수', 'level': 20},
+                {'label': '균형', 'level': 50},
+                {'label': '민감', 'level': 80},
+            ],
+        }
+
+    def set_fall_sensitivity(self, level=50, enabled=True, note=''):
+        index = self._read_model_registry_index()
+        try:
+            level = int(float(level))
+        except Exception:
+            level = 50
+        level = max(0, min(100, level))
+        if level >= 75:
+            preset, label = 'sensitive', '민감'
+        elif level <= 25:
+            preset, label = 'conservative', '보수'
+        else:
+            preset, label = 'balanced', '균형'
+        index['fall_sensitivity'] = {
+            'enabled': False if str(enabled).lower() in ('0', 'false', 'no', 'off') else True,
+            'level': level,
+            'preset': preset,
+            'label': label,
+            'note': str(note or '').strip(),
+            'updated_at': self._model_registry_now_text(),
+        }
+        self._write_model_registry_index(index)
+        return {'ok': True, 'fall_sensitivity': self._fall_sensitivity_info(index), 'registry': self.model_registry()}
+
+    def _safe_registry_relative_path(self, value):
+        raw = str(value or '').replace('\\', '/').strip().strip('/')
+        parts = []
+        for part in raw.split('/'):
+            safe = self._sanitize_filename(part)
+            if safe and safe not in ('.', '..'):
+                parts.append(safe)
+        return '/'.join(parts)
+
+    def _model_registry_metric_from_summary(self, summary):
+        summary = summary or {}
+        if not isinstance(summary, dict):
+            return {}
+        metric_sources = [
+            summary,
+            summary.get('best_metrics', {}) or {},
+            summary.get('cv', {}) or {},
+            summary.get('sequence_group_cv', {}) or {},
+            summary.get('group_cv', {}) or {},
+            summary.get('operational_validation', {}) or {},
+            summary.get('validation', {}) or {},
+        ]
+
+        def pick(*keys):
+            for source in metric_sources:
+                if not isinstance(source, dict):
+                    continue
+                for key in keys:
+                    value = source.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        return float(value)
+                    except Exception:
+                        pass
+            return None
+
+        samples = int(
+            summary.get('training_samples', 0)
+            or summary.get('n_windows', 0)
+            or (int(summary.get('train_rows', 0) or 0) + int(summary.get('val_rows', 0) or 0))
+            or sum((summary.get('class_distribution', {}) or {}).values())
+            or 0
+        )
+        return {
+            'accuracy': pick('accuracy', 'acc', 'cv_accuracy'),
+            'precision': pick('precision'),
+            'recall': pick('recall'),
+            'f1': pick('f1', 'macro_f1', 'f1_macro'),
+            'macro_f1': pick('macro_f1', 'f1_macro', 'f1'),
+            'roc_auc': pick('roc_auc', 'auc'),
+            'sample_count': samples,
+            'feature_count': int(summary.get('feature_count', 0) or summary.get('n_features', 0) or 0),
+            'algorithm': str(summary.get('active_algorithm') or summary.get('algorithm') or '').strip(),
+        }
+
+    def _model_registry_has_performance_metric(self, metrics):
+        metrics = metrics or {}
+        if not isinstance(metrics, dict):
+            return False
+        for key in ('f1', 'macro_f1', 'accuracy', 'precision', 'recall', 'roc_auc'):
+            try:
+                if float(metrics.get(key) or 0.0) > 0.0:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _model_registry_public_path(self, path):
+        path = str(path or '')
+        if not path:
+            return ''
+        try:
+            return self._project_relative_path(path)
+        except Exception:
+            return path
+
+    def _model_registry_item_from_paths(self, *, model_id, family, label, primary_path, summary_path='', source='uploaded', active=False, deletable=True, note='', created_at='', updated_at='', artifact_paths=None, summary_override=None, delete_root=''):
+        family = self._normalize_model_family(family)
+        meta = self._model_family_meta(family)
+        summary = summary_override if isinstance(summary_override, dict) else (self._read_json(summary_path, default={}) if summary_path else {})
+        metrics = self._model_registry_metric_from_summary(summary)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        version_info = self._summary_version_info(summary, primary_path, label or meta.get('label') or family)
+        version_badge = str(version_info.get('version_badge') or '').strip()
+        version_text = str(version_info.get('version_text') or '').strip()
+        item = {
+            'model_id': str(model_id or '').strip(),
+            'family': family,
+            'family_label': meta.get('label') or family,
+            'label': str(label or '').strip() or meta.get('label') or family,
+            'description': meta.get('description') or '',
+            'source': source,
+            'active': bool(active),
+            'deletable': bool(deletable),
+            'selectable': bool(meta.get('selectable') and primary_path),
+            'runtime_model_type': meta.get('runtime') or 'rf-dual',
+            'primary_model_path': str(primary_path or ''),
+            'primary_model_path_display': self._model_registry_public_path(primary_path),
+            'summary_path': str(summary_path or ''),
+            'summary_path_display': self._model_registry_public_path(summary_path),
+            'artifact_paths': list(artifact_paths or ([primary_path] if primary_path else [])),
+            'delete_root': str(delete_root or ''),
+            'note': str(note or '').strip(),
+            'created_at': created_at or now,
+            'updated_at': updated_at or created_at or now,
+            'metrics': metrics,
+            'summary': summary if isinstance(summary, dict) else {},
+            'version_badge': version_badge,
+            'version_label': str(version_info.get('version_label') or '').strip(),
+            'version_text': version_text,
+            'version_source': str(version_info.get('version_source') or '').strip(),
+            'display_version': version_badge or version_text or '-',
+            'option_key': 'rf-dual' if family == 'rf-dual' and active else f"registry:{str(model_id or '').strip()}",
+        }
+        version_for_name = item.get('display_version') if item.get('display_version') != '-' else ''
+        label_for_name = item.get('label') or item.get('model_id') or ''
+        if version_for_name and version_for_name not in label_for_name:
+            item['display_name'] = f"{item['family_label']} {version_for_name} · {label_for_name}"
+        elif label_for_name and item['family_label'] not in label_for_name:
+            item['display_name'] = f"{item['family_label']} · {label_for_name}"
+        else:
+            item['display_name'] = label_for_name or item['family_label']
+        item['comparison_label'] = item['display_name']
+        if item['active'] and family != 'rf-dual':
+            item['option_label'] = f"{item['family_label']} active · {item['label']}"
+        elif item['source'] == 'uploaded':
+            item['option_label'] = f"{item['family_label']} 업로드 · {item['label']}"
+        else:
+            item['option_label'] = f"{item['family_label']} · {item['label']}"
+        return item
+
+    def _active_model_registry_items(self):
+        stats = self._latest_model_training_stats()
+        summary_paths = {
+            'rf-fall-v2': self._rf_fall_v2_summary_path(),
+            'rf-pipeline': self._rf_project_summary_path(),
+            'xg-posture': self._xg_posture_summary_path(),
+            'xg-posture-occlusion-aux': self._xg_posture_occlusion_aux_summary_path(),
+            'driver-aihub173': self._persistent_model_path('facial-state', 'aihub173_driver_state_summary.json'),
+            'facial-aihub82': self._persistent_model_path('facial-state', 'aihub82_facial_emotion_summary.json'),
+        }
+        preferred_rf = self._preferred_rf_pipeline_active_item()
+        if preferred_rf:
+            rf_dual_primary = preferred_rf.get('primary_model_path') or self._rf_active_model_path()
+            rf_dual_summary = preferred_rf.get('summary_path') or self._rf_project_summary_path()
+            rf_dual_summary_override = preferred_rf.get('summary') if isinstance(preferred_rf.get('summary'), dict) else None
+            rf_dual_note = '현재 운영 조합은 더 높은 성능의 RF-Pipeline active를 낙상 판단 모듈로 사용합니다.'
+        else:
+            rf_dual_primary = self._rf_fall_v2_model_path() if self._rf_fall_v2_available() else self._rf_active_model_path()
+            rf_dual_summary = self._rf_fall_v2_summary_path() if self._rf_fall_v2_available() else self._rf_project_summary_path()
+            rf_dual_summary_override = None
+            rf_dual_note = 'RF-Fall + XG-Posture + 조건부 가림 보조를 함께 쓰는 기본 운영 조합입니다.'
+        items = [
+            self._model_registry_item_from_paths(
+                model_id='active:rf-dual',
+                family='rf-dual',
+                label='현재 운영 조합',
+                primary_path=rf_dual_primary,
+                summary_path=rf_dual_summary,
+                source='active',
+                active=True,
+                deletable=False,
+                note=rf_dual_note,
+                summary_override=rf_dual_summary_override,
+            )
+        ]
+        for stat in stats:
+            family = self._normalize_model_family(stat.get('key'))
+            primary_path = str(stat.get('model_path') or '')
+            if not primary_path:
+                continue
+            path_hint = primary_path.replace('\\', '/').lower()
+            if family == 'rf-fall-v2' and ('/rf-pipeline/' in path_hint or os.path.basename(path_hint) == 'rf_hitl_model.pkl'):
+                family = 'rf-pipeline'
+            items.append(self._model_registry_item_from_paths(
+                model_id=f"active:{family}",
+                family=family,
+                label=str(stat.get('base_label') or stat.get('label') or self._model_family_meta(family).get('label') or family),
+                primary_path=primary_path,
+                summary_path=summary_paths.get(family, ''),
+                source='active',
+                active=True,
+                deletable=False,
+                note=str(stat.get('training_run_label') or stat.get('version_text') or '현재 운영 active 모델'),
+                updated_at=str(stat.get('updated_at') or ''),
+                summary_override=stat.get('summary_snapshot') if isinstance(stat.get('summary_snapshot'), dict) else None,
+            ))
+        return items
+
+    def _model_registry_parse_time(self, value):
+        raw = str(value or '').strip()
+        if not raw:
+            return None
+        for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S'):
+            try:
+                return datetime.datetime.strptime(raw, fmt).replace(tzinfo=datetime.timezone.utc)
+            except Exception:
+                pass
+        try:
+            parsed = datetime.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+        except Exception:
+            return None
+
+    def _model_registry_now(self):
+        return datetime.datetime.now(datetime.timezone.utc)
+
+    def _model_registry_now_text(self):
+        return self._model_registry_now().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def _model_registry_delete_after_text(self, hours=24):
+        return (self._model_registry_now() + datetime.timedelta(hours=hours)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def _model_registry_pending_trash(self, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        pending = []
+        now = self._model_registry_now()
+        for entry in index.get('trash') or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('purged_at'):
+                continue
+            delete_after = self._model_registry_parse_time(entry.get('delete_after'))
+            if delete_after and delete_after <= now:
+                continue
+            pending.append(entry)
+        return pending
+
+    def _model_registry_pending_delete_ids(self, index=None):
+        return {
+            str(entry.get('model_id') or '').strip()
+            for entry in self._model_registry_pending_trash(index)
+            if str(entry.get('model_id') or '').strip()
+        }
+
+    def _model_registry_safe_remove_tree(self, path):
+        raw = str(path or '').strip()
+        if not raw:
+            return False
+        try:
+            real = os.path.realpath(raw)
+            allowed_roots = [
+                os.path.realpath(self._persistent_model_root()),
+                os.path.realpath(self._model_registry_dir()),
+            ]
+            if not any(real == root or real.startswith(root + os.sep) for root in allowed_roots):
+                return False
+            if os.path.isdir(real):
+                shutil.rmtree(real, ignore_errors=True)
+                return True
+            if os.path.isfile(real):
+                os.remove(real)
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _model_registry_running_candidate_dirs(self):
+        dirs = set()
+        try:
+            status_paths = [
+                self._continuous_training_status_path('aihub82'),
+                self._continuous_training_status_path('aihub173'),
+                self._continuous_training_status_path('xg-posture'),
+                '/mnt/data/wiz/storage/training/fall-detection/continuous-model-supervisor/status.json',
+            ]
+            for path in status_paths:
+                data = self._read_json(path, {}) or {}
+                if str(data.get('stage') or data.get('status') or '').strip() not in ('running', 'running-command', 'already-running'):
+                    continue
+                output_dir = str(data.get('output_dir') or data.get('current_output_dir') or '').strip()
+                if output_dir:
+                    dirs.add(os.path.realpath(output_dir))
+                current_command = str(data.get('current_command') or '')
+                current_log = str(data.get('current_command_log') or '')
+                _ = current_command, current_log
+        except Exception:
+            pass
+        try:
+            for needle in [
+                'train_driver_state_aihub173.py',
+                'train_facial_emotion_aihub82.py',
+                'retrain_xg_posture_sequence.py',
+                'retrain_rf',
+            ]:
+                for proc in self._command_processes(needle):
+                    cmd = str(proc.get('cmd') or '')
+                    match = re.search(r'--output-dir\s+([^\s]+)', cmd)
+                    if match:
+                        dirs.add(os.path.realpath(match.group(1).strip()))
+        except Exception:
+            pass
+        return {path for path in dirs if path}
+
+    def _model_registry_path_is_under(self, path, roots):
+        try:
+            real = os.path.realpath(str(path or ''))
+            for root in roots or []:
+                root_real = os.path.realpath(str(root or ''))
+                if root_real and (real == root_real or real.startswith(root_real + os.sep)):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _model_registry_prune_trash(self, index):
+        if not isinstance(index, dict):
+            return False
+        changed = False
+        now = self._model_registry_now()
+        active_paths = set()
+        try:
+            for item in self._active_model_registry_items():
+                path = str(item.get('primary_model_path') or '')
+                if path:
+                    active_paths.add(os.path.realpath(path))
+        except Exception:
+            active_paths = set()
+        kept_items = list(index.get('items') or [])
+        kept_trash = []
+        for entry in index.get('trash') or []:
+            if not isinstance(entry, dict):
+                changed = True
+                continue
+            if entry.get('purged_at'):
+                kept_trash.append(entry)
+                continue
+            delete_after = self._model_registry_parse_time(entry.get('delete_after'))
+            if not delete_after or delete_after > now:
+                kept_trash.append(entry)
+                continue
+            if entry.get('source') == 'active':
+                entry['purge_error'] = 'active_model_protected'
+                kept_trash.append(entry)
+                changed = True
+                continue
+            primary_path = str(entry.get('primary_model_path') or '')
+            if primary_path and os.path.realpath(primary_path) in active_paths:
+                entry['purge_error'] = 'active_path_protected'
+                kept_trash.append(entry)
+                changed = True
+                continue
+            delete_root = str(entry.get('delete_root') or '')
+            if entry.get('source') == 'custom-final':
+                bundle_id = str(entry.get('bundle_id') or '').strip()
+                model_id = str(entry.get('model_id') or '')
+                if not bundle_id and model_id.startswith('custom-final:'):
+                    bundle_id = model_id.split(':', 1)[1].strip()
+                if bundle_id:
+                    index['runtime_bundles'] = [
+                        row for row in (index.get('runtime_bundles') or [])
+                        if not (isinstance(row, dict) and str(row.get('bundle_id') or '') == bundle_id)
+                    ]
+            elif delete_root:
+                self._model_registry_safe_remove_tree(delete_root)
+            else:
+                for path in entry.get('artifact_paths') or []:
+                    self._model_registry_safe_remove_tree(path)
+            entry['purged_at'] = self._model_registry_now_text()
+            kept_trash.append(entry)
+            model_id = str(entry.get('model_id') or '')
+            if model_id:
+                kept_items = [item for item in kept_items if not (isinstance(item, dict) and str(item.get('model_id') or '') == model_id)]
+            changed = True
+        index['items'] = kept_items
+        index['trash'] = kept_trash
+        return changed
+
+    def _model_registry_candidate_roots(self):
+        return [
+            ('rf-pipeline', self._persistent_model_path('rf-pipeline', 'candidates')),
+            ('facial-aihub82', self._persistent_model_path('facial-state', 'experiments', 'aihub82_continuous')),
+            ('driver-aihub173', self._persistent_model_path('facial-state', 'experiments', 'aihub173_continuous')),
+            ('driver-aihub173', self._persistent_model_path('facial-state', 'experiments')),
+        ]
+
+    def _candidate_model_registry_items(self, index=None, include_pending=False):
+        items = []
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        pending_delete_ids = set() if include_pending else self._model_registry_pending_delete_ids(index)
+        seen_dirs = set()
+        for family, root in self._model_registry_candidate_roots():
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                dir_real = os.path.realpath(dirpath)
+                if dir_real in seen_dirs:
+                    continue
+                names = set(filenames)
+                meta = self._model_family_meta(family)
+                model_name = next((name for name in meta.get('model_names', []) if name in names), '')
+                summary_name = next((name for name in meta.get('summary_names', []) if name in names), '')
+                if not model_name:
+                    continue
+                seen_dirs.add(dir_real)
+                rel = os.path.relpath(dirpath, root)
+                model_id = 'candidate:' + family + ':' + self._sanitize_filename(rel.replace(os.sep, '-'))
+                if model_id in pending_delete_ids:
+                    continue
+                label = os.path.basename(dirpath)
+                summary_override = None
+                job_meta = self._read_json(self._training_job_path(label), default={}) if family == 'rf-pipeline' else {}
+                if isinstance(job_meta, dict) and job_meta.get('version_badge'):
+                    loaded_summary = self._read_json(os.path.join(dirpath, summary_name), default={}) if summary_name else {}
+                    summary_override = dict(loaded_summary or {})
+                    summary_override.setdefault('model_version', str(job_meta.get('version_badge') or '').strip())
+                    label = f"{job_meta.get('version_badge')} · {label}"
+                item = self._model_registry_item_from_paths(
+                    model_id=model_id,
+                    family=family,
+                    label=label,
+                    primary_path=os.path.join(dirpath, model_name),
+                    summary_path=os.path.join(dirpath, summary_name) if summary_name else '',
+                    source='candidate',
+                    active=False,
+                    deletable=True,
+                    note='학습 후보로 보존된 모델입니다. 운영 active가 참조 중이면 삭제 예약이 차단됩니다.',
+                    updated_at=datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(dirpath, model_name)), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    summary_override=summary_override,
+                    delete_root=dirpath,
+                )
+                if not self._model_registry_has_performance_metric(item.get('metrics')):
+                    continue
+                items.append(item)
+        return items
+
+    def model_registry(self):
+        index = self._read_model_registry_index()
+        if self._model_registry_prune_trash(index):
+            self._write_model_registry_index(index)
+            index = self._read_model_registry_index()
+        pending_delete_ids = self._model_registry_pending_delete_ids(index)
+        uploaded = []
+        for item in index.get('items', []) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get('model_id') or '') in pending_delete_ids:
+                continue
+            primary_path = str(item.get('primary_model_path') or '')
+            summary_path = str(item.get('summary_path') or '')
+            if primary_path and not os.path.exists(primary_path):
+                item['missing'] = True
+                item['selectable'] = False
+            uploaded.append(item)
+        active_items = self._active_model_registry_items()
+        custom_final_items = self._model_registry_custom_final_items(index=index)
+        items = active_items + custom_final_items + self._candidate_model_registry_items(index=index) + uploaded
+        active_paths = {
+            os.path.realpath(str(item.get('primary_model_path') or ''))
+            for item in active_items
+            if str(item.get('primary_model_path') or '')
+        }
+        runtime_selected_ids = {
+            str(value or '').strip()
+            for value in (index.get('runtime_selection') or {}).values()
+            if str(value or '').strip()
+        }
+        for item in items:
+            primary_path = str(item.get('primary_model_path') or '')
+            if item.get('source') != 'active' and primary_path and os.path.realpath(primary_path) in active_paths:
+                item['deletable'] = False
+                item['active_reference'] = True
+                item['note'] = (str(item.get('note') or '').strip() + ' 현재 운영 모델이 이 파일을 참조 중이라 삭제할 수 없습니다.').strip()
+            if str(item.get('model_id') or '') in runtime_selected_ids:
+                item['deletable'] = False
+                item['active_reference'] = True
+                item['note'] = (str(item.get('note') or '').strip() + ' 현재 커스텀 최종 모델이 이 후보를 사용 중이라 삭제할 수 없습니다.').strip()
+        seen = set()
+        unique = []
+        for item in items:
+            model_id = str(item.get('model_id') or '')
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            unique.append(item)
+        families = []
+        for key, meta in self._MODEL_FAMILY_META.items():
+            families.append({
+                'key': key,
+                'label': meta.get('label') or key,
+                'description': meta.get('description') or '',
+                'selectable': bool(meta.get('selectable')),
+            })
+        selectable = [item for item in unique if item.get('selectable') and not item.get('missing')]
+        training_items = self.continuous_training_status_list()
+        running_training = [
+            item for item in training_items
+            if str(item.get('stage') or item.get('status') or '').strip() in ('queued', 'running')
+        ]
+        blocked_training = [
+            item for item in training_items
+            if str(item.get('stage') or item.get('status') or '').strip() in ('blocked', 'failed', 'stale', 'preparing')
+        ]
+        facial_bottleneck = self._read_json(
+            self._project_abspath('outputs', 'continuous_training', 'aihub82_bottleneck_report.json'),
+            {},
+        ) or {}
+        return {
+            'items': unique,
+            'families': families,
+            'selectable_options': [
+                {
+                    'key': item.get('option_key'),
+                    'label': item.get('option_label') or item.get('label'),
+                    'description': item.get('description') or item.get('note') or '',
+                    'available': True,
+                    'model_id': item.get('model_id'),
+                    'family': item.get('family'),
+                    'source': item.get('source'),
+                }
+                for item in selectable
+            ],
+            'comparison': self._model_registry_comparison(unique),
+            'occlusion_policy': self._occlusion_aux_policy_info(),
+            'fall_sensitivity': self._fall_sensitivity_info(index),
+            'runtime_composition': self._model_registry_runtime_composition(unique, index),
+            'runtime_bundles': self._model_registry_runtime_bundles_view(index),
+            'trash': self._model_registry_trash_view(index),
+            'training_dashboard': {
+                'items': training_items,
+                'running_count': len(running_training),
+                'blocked_count': len(blocked_training),
+                'total_count': len(training_items),
+                'facial_bottleneck': facial_bottleneck,
+            },
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+
+    def _model_registry_comparison(self, items):
+        rows = []
+        for item in items:
+            metrics = item.get('metrics') or {}
+            if item.get('source') == 'candidate' and not self._model_registry_has_performance_metric(metrics):
+                continue
+            rows.append({
+                'model_id': item.get('model_id'),
+                'label': item.get('label'),
+                'display_name': item.get('display_name') or item.get('label'),
+                'comparison_label': item.get('comparison_label') or item.get('display_name') or item.get('label'),
+                'family': item.get('family'),
+                'family_label': item.get('family_label'),
+                'source': item.get('source'),
+                'active': item.get('active'),
+                'selectable': item.get('selectable'),
+                'version_badge': item.get('version_badge') or '',
+                'version_text': item.get('version_text') or '',
+                'display_version': item.get('display_version') or item.get('version_badge') or item.get('version_text') or '-',
+                'f1': metrics.get('f1') or metrics.get('macro_f1'),
+                'accuracy': metrics.get('accuracy'),
+                'recall': metrics.get('recall'),
+                'precision': metrics.get('precision'),
+                'sample_count': metrics.get('sample_count') or 0,
+                'updated_at': item.get('updated_at') or '',
+            })
+        def sort_key(row):
+            f1 = row.get('f1')
+            try:
+                f1 = float(f1)
+            except Exception:
+                f1 = -1.0
+            return (-f1, str(row.get('family') or ''), str(row.get('label') or ''))
+        rows.sort(key=sort_key)
+        return {
+            'rows': rows,
+            'best_by_f1': rows[0] if rows and rows[0].get('f1') is not None else {},
+        }
+
+    def _model_registry_trash_view(self, index=None):
+        rows = []
+        for entry in self._model_registry_pending_trash(index):
+            delete_after = str(entry.get('delete_after') or '')
+            remaining_sec = 0
+            parsed = self._model_registry_parse_time(delete_after)
+            if parsed:
+                remaining_sec = max(0, int((parsed - self._model_registry_now()).total_seconds()))
+            rows.append({
+                'model_id': entry.get('model_id'),
+                'label': entry.get('label'),
+                'display_name': entry.get('display_name') or entry.get('label') or entry.get('model_id'),
+                'family': entry.get('family'),
+                'family_label': entry.get('family_label'),
+                'source': entry.get('source'),
+                'deleted_at': entry.get('deleted_at'),
+                'delete_after': delete_after,
+                'remaining_sec': remaining_sec,
+                'remaining_text': self._format_eta_text(remaining_sec) if remaining_sec else '곧 삭제',
+            })
+        rows.sort(key=lambda row: str(row.get('delete_after') or ''))
+        return rows
+
+    def _model_registry_custom_final_items(self, index=None, include_pending=False):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        pending_ids = set() if include_pending else self._model_registry_pending_delete_ids(index)
+        active_bundle_id = str(index.get('active_runtime_bundle_id') or '').strip()
+        rows = []
+        for bundle in self._model_registry_runtime_bundles_view(index):
+            bundle_id = str(bundle.get('bundle_id') or '').strip()
+            if not bundle_id:
+                continue
+            model_id = f"custom-final:{bundle_id}"
+            if model_id in pending_ids:
+                continue
+            f1_values = [
+                self._finite_float(row.get('f1'), 0.0)
+                for row in bundle.get('selection_rows') or []
+                if self._finite_float(row.get('f1'), 0.0) > 0
+            ]
+            composite_f1 = round(sum(f1_values) / len(f1_values), 4) if f1_values else None
+            is_active = bundle_id == active_bundle_id
+            rows.append({
+                'model_id': model_id,
+                'bundle_id': bundle_id,
+                'family': 'rf-dual',
+                'family_label': '커스텀 최종 모델',
+                'label': bundle.get('label') or '사용자 조합',
+                'display_name': '커스텀 최종 모델 · ' + str(bundle.get('label') or '사용자 조합'),
+                'comparison_label': '커스텀 최종 모델 · ' + str(bundle.get('label') or '사용자 조합'),
+                'description': '선택한 세부 모델을 RF-Dual 런타임 조합으로 묶은 최종 운영 후보입니다.',
+                'source': 'custom-final',
+                'active': is_active,
+                'deletable': not is_active,
+                'selectable': False,
+                'runtime_model_type': 'rf-dual',
+                'primary_model_path': '',
+                'primary_model_path_display': '',
+                'summary_path': '',
+                'summary_path_display': '',
+                'artifact_paths': [],
+                'delete_root': '',
+                'note': '현재 사용 중인 조합은 삭제할 수 없습니다.' if is_active else '삭제해도 세부 모델 파일은 삭제하지 않고 저장된 조합만 24시간 유예 후 제거됩니다.',
+                'created_at': bundle.get('created_at') or '',
+                'updated_at': bundle.get('updated_at') or bundle.get('created_at') or '',
+                'metrics': {
+                    'f1': composite_f1,
+                    'macro_f1': composite_f1,
+                    'sample_count': int(bundle.get('selection_count') or 0),
+                    'algorithm': 'RF-Dual custom composition',
+                },
+                'summary': {
+                    'runtime_bundle': bundle,
+                    'model_version': bundle.get('label') or bundle_id,
+                },
+                'version_badge': 'custom',
+                'version_label': bundle.get('label') or '',
+                'version_text': bundle_id,
+                'version_source': 'runtime_bundle',
+                'display_version': 'custom',
+                'option_key': 'rf-dual',
+                'option_label': bundle.get('label') or '커스텀 최종 모델',
+                'selection_rows': bundle.get('selection_rows') or [],
+            })
+        return rows
+
+    def _model_registry_lookup_item(self, model_id, index=None, include_pending=False):
+        model_id = str(model_id or '').strip()
+        if not model_id:
+            return None
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        if not include_pending and model_id in self._model_registry_pending_delete_ids(index):
+            return None
+        for item in index.get('items') or []:
+            if isinstance(item, dict) and str(item.get('model_id') or '') == model_id:
+                return item
+        for item in self._model_registry_custom_final_items(index=index, include_pending=include_pending):
+            if str(item.get('model_id') or '') == model_id:
+                return item
+        for item in self._candidate_model_registry_items(index=index, include_pending=include_pending):
+            if str(item.get('model_id') or '') == model_id:
+                return item
+        return None
+
+    def _model_registry_runtime_bundles_view(self, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        active_bundle_id = str(index.get('active_runtime_bundle_id') or '').strip()
+        rows = []
+        for bundle in index.get('runtime_bundles') or []:
+            if not isinstance(bundle, dict):
+                continue
+            selections = bundle.get('selections') if isinstance(bundle.get('selections'), dict) else {}
+            selection_rows = []
+            missing_count = 0
+            for family, model_id in sorted(selections.items()):
+                family = self._normalize_model_family(family)
+                model_id = str(model_id or '').strip()
+                if not model_id:
+                    continue
+                item = self._model_registry_lookup_item(model_id, index=index)
+                if not item:
+                    missing_count += 1
+                    selection_rows.append({
+                        'family': family,
+                        'family_label': self._model_family_meta(family).get('label') or family,
+                        'model_id': model_id,
+                        'label': '삭제되었거나 찾을 수 없음',
+                        'missing': True,
+                    })
+                    continue
+                metrics = item.get('metrics') or {}
+                selection_rows.append({
+                    'family': family,
+                    'family_label': item.get('family_label') or self._model_family_meta(family).get('label') or family,
+                    'model_id': model_id,
+                    'label': item.get('display_name') or item.get('label') or model_id,
+                    'display_version': item.get('display_version') or '-',
+                    'source': item.get('source') or '',
+                    'f1': metrics.get('f1') or metrics.get('macro_f1'),
+                    'missing': False,
+                })
+            rows.append({
+                'bundle_id': str(bundle.get('bundle_id') or '').strip(),
+                'label': str(bundle.get('label') or '').strip() or '사용자 조합',
+                'description': str(bundle.get('description') or '').strip(),
+                'selections': dict(selections),
+                'selection_rows': selection_rows,
+                'selection_count': len([row for row in selection_rows if not row.get('missing')]),
+                'missing_count': missing_count,
+                'active': str(bundle.get('bundle_id') or '').strip() == active_bundle_id,
+                'created_at': bundle.get('created_at') or '',
+                'updated_at': bundle.get('updated_at') or bundle.get('created_at') or '',
+            })
+        rows.sort(key=lambda row: (not row.get('active'), str(row.get('updated_at') or ''), str(row.get('label') or '')), reverse=False)
+        return rows
+
+    def _model_registry_runtime_composition(self, items=None, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        items = list(items or [])
+        selection = index.get('runtime_selection') if isinstance(index.get('runtime_selection'), dict) else {}
+        active_bundle_id = str(index.get('active_runtime_bundle_id') or '').strip()
+        active_by_family = {}
+        options_by_family = {}
+        for item in items:
+            family = self._normalize_model_family(item.get('family'))
+            if item.get('source') == 'active':
+                active_by_family.setdefault(family, item)
+            if item.get('selectable') and not item.get('missing') and not item.get('active_reference'):
+                options_by_family.setdefault(family, []).append(item)
+        rows = []
+        for family, meta in self._MODEL_FAMILY_META.items():
+            if family == 'rf-dual' or not meta.get('selectable'):
+                continue
+            active_item = active_by_family.get(family) or {}
+            if not active_item and family == 'rf-fall-v2':
+                try:
+                    active_item = self._model_registry_item_from_paths(
+                        model_id='active:rf-fall-v2',
+                        family='rf-fall-v2',
+                        label='RF-Fall active 기본값',
+                        primary_path=self._rf_fall_v2_model_path(),
+                        summary_path=self._rf_fall_v2_summary_path(),
+                        source='active',
+                        active=True,
+                        deletable=False,
+                        note='RF-Pipeline보다 낮으면 RF-Dual에서 fallback 후보로만 유지됩니다.',
+                    )
+                except Exception:
+                    active_item = {}
+            selected_id = str(selection.get(family) or '').strip()
+            selected_item = next((item for item in options_by_family.get(family, []) if str(item.get('model_id') or '') == selected_id), None)
+            effective_item = selected_item or active_item
+            family_options = []
+            if active_item:
+                family_options.append({
+                    'model_id': '',
+                    'label': 'active 기본값 사용',
+                    'display_name': active_item.get('display_name') or active_item.get('label') or meta.get('label') or family,
+                    'display_version': active_item.get('display_version') or '-',
+                    'source': 'active',
+                    'metric_f1': (active_item.get('metrics') or {}).get('f1') or (active_item.get('metrics') or {}).get('macro_f1'),
+                })
+            for item in options_by_family.get(family, []):
+                family_options.append({
+                    'model_id': item.get('model_id'),
+                    'label': item.get('label'),
+                    'display_name': item.get('display_name') or item.get('label'),
+                    'display_version': item.get('display_version') or '-',
+                    'source': item.get('source'),
+                    'metric_f1': (item.get('metrics') or {}).get('f1') or (item.get('metrics') or {}).get('macro_f1'),
+                })
+            rows.append({
+                'family': family,
+                'family_label': meta.get('label') or family,
+                'description': meta.get('description') or '',
+                'selected_model_id': selected_id,
+                'effective_model_id': effective_item.get('model_id') or '',
+                'effective_label': effective_item.get('display_name') or effective_item.get('label') or 'active 기본값',
+                'effective_version': effective_item.get('display_version') or '-',
+                'overridden': bool(selected_item),
+                'options': family_options,
+            })
+        return {
+            'headline': 'RF-Dual 통합 모델은 아래 세부 모델 경로를 실행 시점에 합쳐서 사용합니다. 여기서 세부 모델을 바꾸면 통합 분석도 해당 버전으로 해석됩니다.',
+            'families': rows,
+            'active_bundle_id': active_bundle_id,
+        }
+
+    def _validate_runtime_selection_map(self, selections, index=None):
+        index = index if isinstance(index, dict) else self._read_model_registry_index()
+        cleaned = {}
+        if not isinstance(selections, dict):
+            return cleaned
+        for family, model_id in selections.items():
+            family = self._normalize_model_family(family)
+            model_id = str(model_id or '').strip()
+            if family == 'rf-dual' or not self._model_family_meta(family).get('selectable'):
+                continue
+            if not model_id or model_id.startswith('active:'):
+                continue
+            item = self._model_registry_lookup_item(model_id, index=index)
+            if not item:
+                raise Exception(f'선택한 모델을 찾지 못했습니다: {model_id}')
+            if self._normalize_model_family(item.get('family')) != family:
+                raise Exception(f'선택한 모델 종류가 조합과 맞지 않습니다: {model_id}')
+            if item.get('missing') or not item.get('primary_model_path') or not os.path.exists(str(item.get('primary_model_path') or '')):
+                raise Exception(f'선택한 모델 파일이 없습니다: {item.get("label") or model_id}')
+            cleaned[family] = model_id
+        return cleaned
+
+    def save_runtime_model_bundle(self, label='', selections=None, description=''):
+        index = self._read_model_registry_index()
+        if selections is None:
+            selections = index.get('runtime_selection') if isinstance(index.get('runtime_selection'), dict) else {}
+        cleaned = self._validate_runtime_selection_map(selections, index=index)
+        now = self._model_registry_now_text()
+        raw_label = str(label or '').strip() or f"사용자 조합 {datetime.datetime.now().strftime('%m%d-%H%M')}"
+        digest_src = json.dumps(cleaned, sort_keys=True, ensure_ascii=False) + raw_label + now
+        digest = hashlib.sha1(digest_src.encode('utf-8')).hexdigest()[:8]
+        bundle_id = 'bundle-' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '-' + digest
+        bundle = {
+            'bundle_id': bundle_id,
+            'label': raw_label,
+            'description': str(description or '').strip(),
+            'selections': cleaned,
+            'created_at': now,
+            'updated_at': now,
+        }
+        index.setdefault('runtime_bundles', []).append(bundle)
+        index['runtime_selection'] = cleaned
+        index['active_runtime_bundle_id'] = bundle_id
+        self._write_model_registry_index(index)
+        return {'ok': True, 'bundle': bundle, 'registry': self.model_registry()}
+
+    def apply_runtime_model_bundle(self, bundle_id):
+        bundle_id = str(bundle_id or '').strip()
+        if not bundle_id:
+            raise Exception('적용할 조합 ID가 없습니다.')
+        index = self._read_model_registry_index()
+        bundle = next((row for row in index.get('runtime_bundles') or [] if isinstance(row, dict) and str(row.get('bundle_id') or '') == bundle_id), None)
+        if not bundle:
+            raise Exception('적용할 모델 조합을 찾지 못했습니다.')
+        cleaned = self._validate_runtime_selection_map(bundle.get('selections') or {}, index=index)
+        index['runtime_selection'] = cleaned
+        index['active_runtime_bundle_id'] = bundle_id
+        bundle['updated_at'] = self._model_registry_now_text()
+        self._write_model_registry_index(index)
+        return {'ok': True, 'bundle_id': bundle_id, 'runtime_selection': cleaned, 'registry': self.model_registry()}
+
+    def delete_runtime_model_bundle(self, bundle_id):
+        bundle_id = str(bundle_id or '').strip()
+        if not bundle_id:
+            raise Exception('삭제할 조합 ID가 없습니다.')
+        return self.delete_model_asset(f'custom-final:{bundle_id}')
+
+    def upload_model_asset(self, uploaded_file, family='rf-fall-v2', label='', note='', metadata=None):
+        metadata = metadata or {}
+        if uploaded_file is None:
+            raise Exception('업로드된 모델 파일이 없습니다.')
+        family = self._normalize_model_family(family or metadata.get('family'))
+        filename = self._sanitize_filename(getattr(uploaded_file, 'filename', 'model'))
+        content = uploaded_file.read()
+        if not content:
+            raise Exception('비어 있는 모델 파일은 등록할 수 없습니다.')
+        size_mb = round(len(content) / (1024 * 1024), 2)
+        model_id = self._sanitize_filename(metadata.get('model_id') or metadata.get('import_id') or '')
+        if not model_id:
+            digest = hashlib.sha1((filename + str(len(content)) + str(time.time())).encode('utf-8')).hexdigest()[:10]
+            model_id = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{digest}"
+        item_dir = os.path.join(self._model_registry_dir(), family, model_id)
+        files_dir = os.path.join(item_dir, 'files')
+        os.makedirs(files_dir, exist_ok=True)
+        rel = self._safe_registry_relative_path(metadata.get('relative_path') or filename) or filename
+        save_path = os.path.join(files_dir, rel)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'wb') as file:
+            file.write(content)
+
+        index = self._read_model_registry_index()
+        existing = None
+        for item in index.get('items', []) or []:
+            if item.get('model_id') == model_id:
+                existing = item
+                break
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        if existing is None:
+            existing = self._model_registry_item_from_paths(
+                model_id=model_id,
+                family=family,
+                label=label or model_id,
+                primary_path='',
+                summary_path='',
+                source='uploaded',
+                active=False,
+                deletable=True,
+                note=note,
+                created_at=now,
+                artifact_paths=[],
+            )
+            index.setdefault('items', []).append(existing)
+
+        artifact_paths = list(existing.get('artifact_paths') or [])
+        if save_path not in artifact_paths:
+            artifact_paths.append(save_path)
+        existing['artifact_paths'] = artifact_paths
+        existing['family'] = family
+        existing['family_label'] = self._model_family_meta(family).get('label') or family
+        existing['label'] = str(label or existing.get('label') or model_id).strip()
+        existing['note'] = str(note or existing.get('note') or '').strip()
+        existing['updated_at'] = now
+        existing['size_mb'] = round(float(existing.get('size_mb', 0) or 0) + size_mb, 2)
+        existing['deletable'] = True
+        existing['source'] = 'uploaded'
+        ext = os.path.splitext(filename.lower())[1]
+        lower_name = filename.lower()
+        if ext == '.json' or lower_name.endswith('_summary.json') or lower_name == 'training_summary.json':
+            existing['summary_path'] = save_path
+            summary = self._read_json(save_path, default={}) or {}
+            existing['summary'] = summary
+            existing['metrics'] = self._model_registry_metric_from_summary(summary)
+            version_info = self._summary_version_info(summary, existing.get('primary_model_path') or '', existing.get('label') or family)
+            existing['version_badge'] = str(version_info.get('version_badge') or '').strip()
+            existing['version_label'] = str(version_info.get('version_label') or '').strip()
+            existing['version_text'] = str(version_info.get('version_text') or '').strip()
+            existing['version_source'] = str(version_info.get('version_source') or '').strip()
+            existing['display_version'] = existing.get('version_badge') or existing.get('version_text') or '-'
+        elif ext in self._MODEL_PRIMARY_EXTENSIONS:
+            existing['primary_model_path'] = save_path
+            existing['primary_model_path_display'] = self._model_registry_public_path(save_path)
+            version_info = self._summary_version_info(existing.get('summary') or {}, save_path, existing.get('label') or family)
+            existing['version_badge'] = str(version_info.get('version_badge') or '').strip()
+            existing['version_label'] = str(version_info.get('version_label') or '').strip()
+            existing['version_text'] = str(version_info.get('version_text') or '').strip()
+            existing['version_source'] = str(version_info.get('version_source') or '').strip()
+            existing['display_version'] = existing.get('version_badge') or existing.get('version_text') or '-'
+        elif ext in self._MODEL_ARCHIVE_EXTENSIONS:
+            existing['archive_path'] = save_path
+        existing['summary_path_display'] = self._model_registry_public_path(existing.get('summary_path') or '')
+        existing['selectable'] = bool(self._model_family_meta(family).get('selectable') and existing.get('primary_model_path'))
+        existing['runtime_model_type'] = self._model_family_meta(family).get('runtime') or 'rf-dual'
+        existing['option_key'] = f"registry:{model_id}"
+        existing['option_label'] = f"{existing['family_label']} 업로드 · {existing['label']}"
+        self._write_model_registry_index(index)
+        return {
+            'ok': True,
+            'model_id': model_id,
+            'saved_path': save_path,
+            'item': existing,
+            'registry': self.model_registry(),
+        }
+
+    def delete_model_asset(self, model_id):
+        model_id = str(model_id or '').strip()
+        if not model_id:
+            raise Exception('삭제할 모델 ID가 없습니다.')
+        index = self._read_model_registry_index()
+        if model_id in self._model_registry_pending_delete_ids(index):
+            return {'ok': True, 'deleted_model_id': model_id, 'already_pending': True, 'registry': self.model_registry()}
+        active_items = self._active_model_registry_items()
+        active_paths = {
+            os.path.realpath(str(item.get('primary_model_path') or ''))
+            for item in active_items
+            if str(item.get('primary_model_path') or '')
+        }
+        running_dirs = self._model_registry_running_candidate_dirs()
+        active_ids = {str(item.get('model_id') or '') for item in active_items}
+        runtime_selected_ids = {
+            str(value or '').strip()
+            for value in (index.get('runtime_selection') or {}).values()
+            if str(value or '').strip()
+        }
+        deleted = self._model_registry_lookup_item(model_id, index=index, include_pending=True)
+        if deleted is None:
+            raise Exception('삭제할 모델을 찾지 못했습니다.')
+        primary_path = str(deleted.get('primary_model_path') or '')
+        if deleted.get('source') == 'active' or deleted.get('active') or model_id in active_ids:
+            raise Exception('운영 active 모델은 삭제할 수 없습니다.')
+        if model_id in runtime_selected_ids:
+            raise Exception('현재 커스텀 최종 모델이 사용 중인 후보는 삭제할 수 없습니다.')
+        if deleted.get('source') == 'custom-final':
+            bundle_id = str(deleted.get('bundle_id') or '').strip()
+            if bundle_id and str(index.get('active_runtime_bundle_id') or '') == bundle_id:
+                raise Exception('현재 사용 중인 커스텀 최종 모델은 삭제할 수 없습니다.')
+        if primary_path and os.path.realpath(primary_path) in active_paths:
+            raise Exception('현재 운영 모델이 참조 중인 파일이라 삭제할 수 없습니다.')
+        if self._model_registry_path_is_under(deleted.get('delete_root') or primary_path, running_dirs):
+            raise Exception('현재 학습 프로세스가 쓰고 있는 후보 폴더라 삭제할 수 없습니다.')
+        if deleted.get('deletable') is False:
+            raise Exception('보호된 모델이라 삭제할 수 없습니다.')
+        family = self._normalize_model_family(deleted.get('family'))
+        if not deleted.get('delete_root') and deleted.get('source') == 'uploaded':
+            deleted['delete_root'] = os.path.join(self._model_registry_dir(), family, self._sanitize_filename(model_id))
+        now = self._model_registry_now_text()
+        trash_entry = {
+            'model_id': model_id,
+            'family': family,
+            'family_label': deleted.get('family_label') or self._model_family_meta(family).get('label') or family,
+            'label': deleted.get('label') or model_id,
+            'display_name': deleted.get('display_name') or deleted.get('label') or model_id,
+            'source': deleted.get('source') or 'candidate',
+            'bundle_id': deleted.get('bundle_id') or '',
+            'deleted_at': now,
+            'delete_after': self._model_registry_delete_after_text(24),
+            'primary_model_path': primary_path,
+            'summary_path': deleted.get('summary_path') or '',
+            'artifact_paths': list(deleted.get('artifact_paths') or ([primary_path] if primary_path else [])),
+            'delete_root': deleted.get('delete_root') or '',
+            'reason': 'manual_delete_request',
+        }
+        index.setdefault('trash', []).append(trash_entry)
+        selection = index.get('runtime_selection') if isinstance(index.get('runtime_selection'), dict) else {}
+        for key, selected_id in list(selection.items()):
+            if str(selected_id or '') == model_id:
+                selection.pop(key, None)
+        index['runtime_selection'] = selection
+        for bundle in index.get('runtime_bundles') or []:
+            if not isinstance(bundle, dict) or not isinstance(bundle.get('selections'), dict):
+                continue
+            for key, selected_id in list(bundle.get('selections', {}).items()):
+                if str(selected_id or '') == model_id:
+                    bundle['selections'].pop(key, None)
+                    bundle['updated_at'] = now
+        self._write_model_registry_index(index)
+        return {'ok': True, 'deleted_model_id': model_id, 'delete_after': trash_entry['delete_after'], 'registry': self.model_registry()}
+
+    def cancel_model_delete(self, model_id):
+        model_id = str(model_id or '').strip()
+        if not model_id:
+            raise Exception('삭제 취소할 모델 ID가 없습니다.')
+        index = self._read_model_registry_index()
+        before = len(index.get('trash') or [])
+        index['trash'] = [
+            entry for entry in (index.get('trash') or [])
+            if not (isinstance(entry, dict) and str(entry.get('model_id') or '') == model_id and not entry.get('purged_at'))
+        ]
+        if len(index['trash']) == before:
+            raise Exception('삭제 예약된 모델을 찾지 못했습니다.')
+        self._write_model_registry_index(index)
+        return {'ok': True, 'model_id': model_id, 'registry': self.model_registry()}
+
+    def set_runtime_model_selection(self, family, model_id=''):
+        family = self._normalize_model_family(family)
+        if family == 'rf-dual':
+            raise Exception('RF-Dual 자체가 아니라 RF/XG/표정/상태 세부 모델을 선택해야 합니다.')
+        if not self._model_family_meta(family).get('selectable'):
+            raise Exception('선택 가능한 모델 종류가 아닙니다.')
+        index = self._read_model_registry_index()
+        selection = index.get('runtime_selection') if isinstance(index.get('runtime_selection'), dict) else {}
+        model_id = str(model_id or '').strip()
+        if not model_id or model_id.startswith('active:'):
+            selection.pop(family, None)
+            index['runtime_selection'] = selection
+            self._write_model_registry_index(index)
+            return {'ok': True, 'family': family, 'model_id': '', 'registry': self.model_registry()}
+        item = self._model_registry_lookup_item(model_id, index=index)
+        if not item:
+            raise Exception('선택한 모델을 찾지 못했습니다.')
+        if self._normalize_model_family(item.get('family')) != family:
+            raise Exception('선택한 모델 종류가 현재 세부 모델과 맞지 않습니다.')
+        if item.get('missing') or not item.get('primary_model_path') or not os.path.exists(str(item.get('primary_model_path') or '')):
+            raise Exception('선택한 모델 파일이 없습니다.')
+        selection[family] = model_id
+        index['runtime_selection'] = selection
+        self._write_model_registry_index(index)
+        return {'ok': True, 'family': family, 'model_id': model_id, 'registry': self.model_registry()}
+
+    def cleanup_model_candidates(self, keep_per_family=2, min_f1=0.0):
+        try:
+            keep_per_family = max(1, int(keep_per_family or 2))
+        except Exception:
+            keep_per_family = 2
+        try:
+            min_f1 = max(0.0, min(1.0, float(min_f1 or 0.0)))
+        except Exception:
+            min_f1 = 0.0
+        registry = self.model_registry()
+        items = [item for item in registry.get('items') or [] if item.get('source') == 'candidate' and item.get('deletable') is not False]
+        by_family = {}
+        for item in items:
+            family = self._normalize_model_family(item.get('family'))
+            by_family.setdefault(family, []).append(item)
+        scheduled = []
+        low_score_count = 0
+        extra_count = 0
+        running_dirs = self._model_registry_running_candidate_dirs()
+        for family, rows in by_family.items():
+            def score_value(item):
+                metrics = item.get('metrics') or {}
+                return self._finite_float(
+                    metrics.get('f1', metrics.get('macro_f1', metrics.get('accuracy'))),
+                    -1.0,
+                )
+
+            def score_key(item):
+                return (-score_value(item), str(item.get('updated_at') or ''))
+
+            rows.sort(key=score_key)
+            keep_ids = {str(item.get('model_id') or '') for item in rows[:keep_per_family]}
+            for item in rows:
+                if self._model_registry_path_is_under(item.get('delete_root') or item.get('primary_model_path'), running_dirs):
+                    continue
+                model_id = str(item.get('model_id') or '')
+                if model_id in keep_ids:
+                    continue
+                score = score_value(item)
+                reason = 'extra_candidate'
+                if min_f1 > 0 and score >= 0 and score < min_f1:
+                    reason = 'low_score'
+                else:
+                    reason = 'extra_candidate'
+                try:
+                    result = self.delete_model_asset(model_id)
+                    if reason == 'low_score':
+                        low_score_count += 1
+                    else:
+                        extra_count += 1
+                    scheduled.append({
+                        'model_id': model_id,
+                        'delete_after': result.get('delete_after'),
+                        'family': family,
+                        'score': round(score, 4) if score >= 0 else None,
+                        'reason': reason,
+                    })
+                except Exception:
+                    pass
+        return {
+            'ok': True,
+            'scheduled': scheduled,
+            'scheduled_count': len(scheduled),
+            'low_score_count': low_score_count,
+            'extra_count': extra_count,
+            'keep_per_family': keep_per_family,
+            'min_f1': min_f1,
+            'registry': self.model_registry(),
+        }
+
+    def _resolve_runtime_model_selection(self, model_type):
+        raw = str(model_type or 'rf-dual').strip()
+        lowered = raw.lower()
+        selection = {
+            'requested_key': raw or 'rf-dual',
+            'runtime_model_type': lowered or 'rf-dual',
+            'model_id': '',
+            'family': '',
+            'label': self._model_option_label(raw),
+            'item': {},
+        }
+        if lowered in ('', 'auto', 'rf-dual', 'rf-dual-runtime'):
+            preferred = self._preferred_rf_pipeline_active_item()
+            if preferred:
+                selection.update({
+                    'runtime_model_type': str(preferred.get('runtime_model_type') or 'rf-dual').strip().lower(),
+                    'model_id': preferred.get('model_id') or '',
+                    'family': self._normalize_model_family(preferred.get('family')),
+                    'label': 'RF-Dual 운영 조합 · ' + str(preferred.get('option_label') or preferred.get('label') or 'RF-Pipeline active'),
+                    'item': preferred,
+                })
+        if lowered.startswith('registry:'):
+            model_id = raw.split(':', 1)[1].strip()
+            item = next((it for it in self.model_registry().get('items', []) if str(it.get('model_id') or '') == model_id), None)
+            if not item:
+                raise Exception(f'선택한 모델 버전을 찾을 수 없습니다: {model_id}')
+            if not item.get('primary_model_path') or not os.path.exists(str(item.get('primary_model_path'))):
+                raise Exception(f'선택한 모델 파일이 없습니다: {item.get("label") or model_id}')
+            selection.update({
+                'runtime_model_type': str(item.get('runtime_model_type') or 'rf-dual').strip().lower(),
+                'model_id': model_id,
+                'family': self._normalize_model_family(item.get('family')),
+                'label': item.get('option_label') or item.get('label') or model_id,
+                'item': item,
+            })
+        return selection
+
+    def _selected_registry_item_for_family(self, family):
+        selection = getattr(self, '_runtime_model_selection', None) or {}
+        if self._normalize_model_family(selection.get('family')) == self._normalize_model_family(family):
+            item = selection.get('item') or {}
+            if item.get('primary_model_path'):
+                return item
+        try:
+            normalized = self._normalize_model_family(family)
+            index = self._read_model_registry_index()
+            selected_id = str((index.get('runtime_selection') or {}).get(normalized) or '').strip()
+            if selected_id:
+                item = self._model_registry_lookup_item(selected_id, index=index)
+                if item and item.get('primary_model_path'):
+                    return item
+        except Exception:
+            pass
+        return None
+
+    def _preferred_rf_pipeline_active_item(self):
+        try:
+            pipeline_path = self._rf_project_model_path()
+            pipeline_summary_path = self._rf_project_summary_path()
+            v2_summary_path = self._rf_fall_v2_summary_path()
+            if not pipeline_path or not os.path.isfile(pipeline_path):
+                return {}
+            pipeline_summary = self._read_json(pipeline_summary_path, default={}) or {}
+            v2_summary = self._read_json(v2_summary_path, default={}) or {}
+            pipeline_metrics = self._model_registry_metric_from_summary(pipeline_summary)
+            v2_metrics = self._model_registry_metric_from_summary(v2_summary)
+            pipeline_f1 = self._finite_float(pipeline_metrics.get('macro_f1'), 0.0)
+            v2_f1 = self._finite_float(v2_metrics.get('macro_f1'), 0.0)
+            if pipeline_f1 <= 0 or pipeline_f1 + 0.0005 < v2_f1:
+                return {}
+            return self._model_registry_item_from_paths(
+                model_id='active:rf-pipeline',
+                family='rf-pipeline',
+                label='RF-Pipeline',
+                primary_path=pipeline_path,
+                summary_path=pipeline_summary_path,
+                source='active',
+                active=True,
+                deletable=False,
+                note='현재 RF-Dual 운영 조합에서 더 높은 성능의 낙상 판단 모듈로 사용됩니다.',
+                summary_override=pipeline_summary,
+            )
+        except Exception:
+            return {}
+
+    def _occlusion_aux_thresholds(self):
+        summary = self._read_json(self._xg_posture_occlusion_aux_summary_path(), default={}) or {}
+        policy = summary.get('trigger_policy') if isinstance(summary.get('trigger_policy'), dict) else {}
+
+        def _num(key, env_key, default):
+            value = os.environ.get(env_key)
+            if value is None:
+                value = policy.get(key)
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        return {
+            'avg_conf_lt': _num('avg_conf_lt', 'POSTURE_OCC_AUX_AVG_CONF_LT', 0.38),
+            'lower_body_visibility_lt': _num('lower_body_visibility_lt', 'POSTURE_OCC_AUX_LOWER_VIS_LT', 0.42),
+            'posture_margin_lt': _num('main_margin_lt', 'POSTURE_OCC_AUX_MARGIN_LT', 0.07),
+        }
+
+    def _occlusion_aux_policy_info(self):
+        thresholds = self._occlusion_aux_thresholds()
+        training_status = self._posture_occlusion_training_status()
+        return {
+            'headline': '가림 보조는 몸이 38% 이상 가려졌다는 뜻이 아니라, 검출 신뢰도와 하체 가시성이 낮을 때 조건부로 켜지는 보조 모델입니다.',
+            'avg_conf_lt': thresholds['avg_conf_lt'],
+            'lower_body_visibility_lt': thresholds['lower_body_visibility_lt'],
+            'posture_margin_lt': thresholds['posture_margin_lt'],
+            'training_status': {
+                'stage': training_status.get('stage') or training_status.get('status') or '',
+                'status': training_status.get('status') or training_status.get('stage') or '',
+                'eta_text': training_status.get('eta_text') or '',
+                'message': training_status.get('message') or '',
+                'latest_log': training_status.get('latest_log') or '',
+                'active_macro_f1': training_status.get('active_macro_f1') or 0,
+                'sequence_macro_f1': training_status.get('sequence_macro_f1') or training_status.get('best_sequence_macro_f1') or 0,
+                'best_macro_f1': training_status.get('best_macro_f1') or 0,
+                'best_sequence_macro_f1': training_status.get('best_sequence_macro_f1') or training_status.get('sequence_macro_f1') or 0,
+                'target_macro_f1': training_status.get('target_macro_f1') or 0.97,
+                'active_version_text': training_status.get('active_version_text') or '',
+                'candidate_version_text': training_status.get('candidate_version_text') or '',
+                'training_version_text': training_status.get('training_version_text') or '',
+                'ready': training_status.get('ready'),
+            },
+            'explanation': [
+                f"avg_conf < {thresholds['avg_conf_lt']:.2f}은 keypoint 평균 confidence가 낮다는 뜻입니다. 실제 가림 비율 기준이 아닙니다.",
+                f"lower_body_visibility < {thresholds['lower_body_visibility_lt']:.2f}는 하체 keypoint가 충분히 보이지 않는 상황을 잡기 위한 별도 기준입니다.",
+                f"posture margin < {thresholds['posture_margin_lt']:.2f}이면 주 자세 모델이 sit/lie/stand 사이에서 애매하다고 보고 보조 확률을 섞습니다.",
+                '이 수치는 학습 supervisor가 holdout 후보별로 sweep하면서 최고 후보를 기록하고, 적용된 모델의 trigger_policy를 운영에서 읽습니다.',
+            ],
+            'tuning_plan': [
+                '실제 가림 holdout을 하체/좌/우 × mild/moderate/severe로 나눕니다.',
+                'avg_conf 임계값 0.30, 0.34, 0.38, 0.42, 0.46, 0.50을 sweep합니다.',
+                '낙상 Recall 하락 없이 비낙상 FP와 sit/lie confusion이 줄어드는 지점을 운영값으로 선택합니다.',
+            ],
+        }
+
     def _project_abspath(self, *paths):
         base = self._project_root()
-        if paths and paths[0] in ['data', 'storage']:
+        if paths and paths[0] in ['data', 'storage', 'outputs']:
             root_name = paths[0]
+            if root_name == 'storage':
+                storage_root = os.environ.get('FALLAI_STORAGE_ROOT') or self._PERSISTENT_STORAGE_ROOT
+                if os.path.isdir(storage_root):
+                    return os.path.join(storage_root, *paths[1:]) if len(paths) > 1 else storage_root
+            if root_name == 'outputs':
+                outputs_root = os.environ.get('FALLAI_OUTPUTS_ROOT') or os.path.join(
+                    os.environ.get('FALLAI_STORAGE_ROOT') or self._PERSISTENT_STORAGE_ROOT,
+                    'project-main',
+                    'outputs',
+                )
+                if os.path.isdir(outputs_root):
+                    return os.path.join(outputs_root, *paths[1:]) if len(paths) > 1 else outputs_root
             root_link = os.path.join(base, root_name)
             if os.path.lexists(root_link):
                 resolved_root = os.path.realpath(root_link)
@@ -107,6 +1702,31 @@ class VideoAnalysis:
                 return json.load(file)
         except Exception:
             return default
+
+    def _model_summary_is_emergency_recovery(self, summary):
+        text = ' '.join(str((summary or {}).get(key) or '') for key in [
+            'source',
+            'model_type',
+            'version',
+            'model_version',
+            'run_id',
+            'recovery_note',
+        ]).lower()
+        return any(marker in text for marker in [
+            'emergency',
+            'synthetic-runtime',
+            'synthetic-bootstrap',
+            'runtime-contract-recovery',
+            'random-init',
+        ])
+
+    def _model_summary_ready(self, summary):
+        summary = summary or {}
+        if summary.get('ready') is False:
+            return False
+        if self._model_summary_is_emergency_recovery(summary):
+            return False
+        return True
 
     def _write_json(self, path, data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -343,10 +1963,11 @@ class VideoAnalysis:
             fc_path = self._normalize_existing_path(fc_path)
         return bool(pd_weights and os.path.exists(pd_weights) and fc_path and os.path.exists(fc_path))
 
-    def _infer_with_trained_model(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0, realtime_context=None):
-        requested = str(model_type or 'rf-dual').strip().lower()
-        if requested not in ['', 'rf-dual', 'rf-dual-runtime']:
-            requested = 'rf-dual'
+    def _infer_with_trained_model(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0, realtime_context=None, include_timeseries_result=False):
+        selection = self._resolve_runtime_model_selection(model_type)
+        previous_selection = getattr(self, '_runtime_model_selection', None)
+        self._runtime_model_selection = selection
+        requested = str(selection.get('runtime_model_type') or model_type or 'rf-dual').strip().lower()
         if requested in ['rf', 'rf-pipeline-runtime']:
             requested = 'rf-pipeline'
         if requested in ['rf-pose-runtime']:
@@ -374,7 +1995,7 @@ class VideoAnalysis:
             'person-feature': lambda: self._infer_person_feature(video_path, filename, analysis_profile),
             'rf-pipeline': lambda: self._infer_rf_pipeline(video_path, filename, analysis_profile, input_source=input_source),
             'rf-pose': lambda: self._infer_rf_pose_pipeline(video_path, filename, analysis_profile, input_source=input_source),
-            'rf-dual': lambda: self._infer_rf_dual(video_path, filename, analysis_profile, input_source=input_source, duration_hint=duration_hint, realtime_context=realtime_context),
+            'rf-dual': lambda: self._infer_rf_dual(video_path, filename, analysis_profile, input_source=input_source, duration_hint=duration_hint, realtime_context=realtime_context, include_timeseries_result=include_timeseries_result),
         }
 
         if requested in runners:
@@ -388,34 +2009,44 @@ class VideoAnalysis:
             ]
 
         errors = []
-        for mode in ordered_modes:
-            if available.get(mode) is not True:
-                if mode == 'person-feature':
-                    errors.append('person-feature 파이프라인 준비가 완료되지 않았습니다.')
-                elif mode == 'rf-pipeline':
-                    errors.append('RF 파이프라인 모델 파일이 존재하지 않습니다.')
-                elif mode == 'rf-pose':
-                    errors.append('RF-Pose 파이프라인 모델 파일이 존재하지 않습니다.')
-                elif mode == 'rf-dual':
-                    errors.append('RF-Dual 모델 준비가 완료되지 않았습니다 (RF 모델 필수).')
-                continue
-            try:
-                result = runners[mode]()
-                # FN-0003: person-feature가 0점(사람 미검출 등)이면 RF fallback 시도
-                if mode == 'person-feature' and requested != 'person-feature':
-                    pf_score = self._metadata_to_number(result.get('risk_score', 0), 0)
-                    pf_windows = int((result.get('runtime_inference', {}) or {}).get('windows', 0) or 0)
-                    if pf_score <= 0.0 and pf_windows == 0 and rf_ready:
-                        result['_person_feature_zero_note'] = 'XGBoost v2가 0점을 반환해 RF 보조 파이프라인으로 자동 전환했습니다.'
-                        try:
-                            return self._infer_rf_pipeline(video_path, filename, analysis_profile, input_source=input_source)
-                        except Exception:
-                            pass
-                return result
-            except Exception as e:
-                errors.append(f'{mode} 실패: {str(e)}')
+        try:
+            for mode in ordered_modes:
+                if available.get(mode) is not True:
+                    if mode == 'person-feature':
+                        errors.append('person-feature 파이프라인 준비가 완료되지 않았습니다.')
+                    elif mode == 'rf-pipeline':
+                        errors.append('RF 파이프라인 모델 파일이 존재하지 않습니다.')
+                    elif mode == 'rf-pose':
+                        errors.append('RF-Pose 파이프라인 모델 파일이 존재하지 않습니다.')
+                    elif mode == 'rf-dual':
+                        errors.append('RF-Dual 모델 준비가 완료되지 않았습니다 (RF 모델 필수).')
+                    continue
+                try:
+                    result = runners[mode]()
+                    if selection.get('model_id'):
+                        result['selected_model_version'] = {
+                            'model_id': selection.get('model_id'),
+                            'family': selection.get('family'),
+                            'label': selection.get('label'),
+                        }
+                        result['runtime_label'] = f"{result.get('runtime_label') or self._model_option_label(mode)} · {selection.get('label')}"
+                    # FN-0003: person-feature가 0점(사람 미검출 등)이면 RF fallback 시도
+                    if mode == 'person-feature' and requested != 'person-feature':
+                        pf_score = self._metadata_to_number(result.get('risk_score', 0), 0)
+                        pf_windows = int((result.get('runtime_inference', {}) or {}).get('windows', 0) or 0)
+                        if pf_score <= 0.0 and pf_windows == 0 and rf_ready:
+                            result['_person_feature_zero_note'] = 'XGBoost v2가 0점을 반환해 RF 보조 파이프라인으로 자동 전환했습니다.'
+                            try:
+                                return self._infer_rf_pipeline(video_path, filename, analysis_profile, input_source=input_source)
+                            except Exception:
+                                pass
+                    return result
+                except Exception as e:
+                    errors.append(f'{mode} 실패: {str(e)}')
 
-        raise Exception(' / '.join(errors) if len(errors) > 0 else '사용 가능한 학습 모델이 없습니다.')
+            raise Exception(' / '.join(errors) if len(errors) > 0 else '사용 가능한 학습 모델이 없습니다.')
+        finally:
+            self._runtime_model_selection = previous_selection
 
     # NOTE: _infer_yolo_cls (legacy YOLO 분류 모델) 제거됨 — FN-0008
     # auto 모드 fallback 순서: rf-pose → rf-pipeline → person-feature
@@ -585,7 +2216,7 @@ class VideoAnalysis:
             pf_summary = '사람 추적 기반 특징 분석 결과 낙상 가능성이 높습니다.'
         else:
             pf_summary = '사람 추적 기반 특징 분석 결과 즉시 낙상 가능성은 낮습니다.'
-        return {
+        _result = {
             'fall_detected': fall_detected,
             'behavior_class': behavior_class,
             'behavior_label': behavior_label,
@@ -620,6 +2251,7 @@ class VideoAnalysis:
                 'fps': round(self._metadata_to_number(video_info.get('fps', 0.0), 0.0), 2),
             },
         }
+        return _result
 
     # ── RF Pipeline (RandomForest + YOLOv8n-Pose person detection) ──────────
 
@@ -637,7 +2269,7 @@ class VideoAnalysis:
     _POSTURE_REALTIME_TARGET_FPS = 4
     _POSTURE_UPLOAD_TARGET_FPS = 8
     _FACIAL_AUX_MAX_FRAMES = 5
-    _FACIAL_AUX_SCORE_CAP = 0.14
+    _FACIAL_AUX_SCORE_CAP = 0.06
     _FACIAL_AUX_TRIGGER_MARGIN = 0.12
     _FACIAL_EMOTION_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'facial-state', 'emotion-ferplus-8.onnx')
     _FACIAL_AIHUB82_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'facial-state', 'aihub82_facial_emotion_mobilenetv3.pt')
@@ -662,6 +2294,9 @@ class VideoAnalysis:
         'embarrassed': '당황',
         'surprise': '놀람',
         'anxiety': '불안',
+        'distress': '불편/고통',
+        'non_distress': '비불편',
+        'normal': '정상/무증상',
         'hurt': '상처',
         'sadness': '슬픔',
         'anger': '분노',
@@ -757,11 +2392,11 @@ class VideoAnalysis:
     _rt_rolling_cache = {}         # {session_id: {'timeseries_tail': [...], 'chunk_id': int, 'ts': float}}
     _rt_llm_review_cache = {}      # {session_id: {'ts': float, 'review': dict, 'override_label': str, 'confidence': float}}
     _RT_ROLLING_TAIL_SEC = 1.5     # seconds of tail data to keep from previous chunk
-    _REALTIME_CHUNK_POLICY_VERSION = 'dense-bootstrap-v2'
-    _UPLOAD_CHUNK_POLICY_VERSION = 'common-4s-chunk-v1'
+    _REALTIME_CHUNK_POLICY_VERSION = 'overlap-4s-stride2-v3'
+    _UPLOAD_CHUNK_POLICY_VERSION = 'overlap-4s-stride2-v3'
     _LEGACY_CHUNK_POLICY_VERSION = 'legacy-rf-dual-v1'
     _REALTIME_STEADY_CHUNK_SEC = 4
-    _REALTIME_STRIDE_SEC = 4
+    _REALTIME_STRIDE_SEC = 2
 
     # FN-0004: RF-Pose model (bbox+keypoint combined features)
     _RF_POSE_MODEL_REL_PATH = os.path.join('storage', 'training', 'fall-detection', 'rf-pose', 'rf_pose_model.pkl')
@@ -809,6 +2444,8 @@ class VideoAnalysis:
         '02.라벨링데이터',
     )
     _EXTERNAL_POSE_DATASET_SEARCH_ROOTS = [
+        os.path.join('/opt/app', 'tmp', 'datasets', 'action_behavior', 'aihub_71461'),
+        os.path.join('/opt/app', 'ephemeral-datasets', 'action_behavior', 'aihub_71461'),
         os.path.join('/opt/app', 'datasets', 'action_behavior', 'aihub_71461'),
         os.path.join('/opt/app', 'datasets', 'action_behavior', 'aihubs_71461'),
     ]
@@ -849,12 +2486,18 @@ class VideoAnalysis:
     _xg_posture_occlusion_aux_model_path_cache = None
 
     def _rf_project_model_path(self):
+        selected = self._selected_registry_item_for_family('rf-pipeline')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('rf-pipeline', 'rf_hitl_model.pkl'),
             self._project_abspath(self._RF_PROJECT_MODEL_REL_PATH),
         )
 
     def _rf_project_summary_path(self):
+        selected = self._selected_registry_item_for_family('rf-pipeline')
+        if selected:
+            return str(selected.get('summary_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('rf-pipeline', 'training_summary.json'),
             self._project_abspath(self._RF_PROJECT_SUMMARY_REL_PATH),
@@ -864,12 +2507,18 @@ class VideoAnalysis:
         return self._read_json(self._rf_project_summary_path(), default={}) or {}
 
     def _rf_fall_v2_model_path(self):
+        selected = self._selected_registry_item_for_family('rf-fall-v2')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('rf-fall-v2', 'rf_fall_v2_model.pkl'),
             self._project_abspath(self._RF_FALL_V2_MODEL_REL_PATH),
         )
 
     def _rf_fall_v2_summary_path(self):
+        selected = self._selected_registry_item_for_family('rf-fall-v2')
+        if selected:
+            return str(selected.get('summary_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('rf-fall-v2', 'training_summary.json'),
             self._project_abspath(self._RF_FALL_V2_SUMMARY_REL_PATH),
@@ -880,7 +2529,9 @@ class VideoAnalysis:
 
     def _rf_fall_v2_available(self):
         summary = self._rf_fall_v2_summary()
-        return bool(os.path.isfile(self._rf_fall_v2_model_path()) and summary.get('ready', True))
+        if self._selected_registry_item_for_family('rf-fall-v2'):
+            return os.path.isfile(self._rf_fall_v2_model_path())
+        return bool(os.path.isfile(self._rf_fall_v2_model_path()) and self._model_summary_ready(summary))
 
     def _get_rf_fall_v2_model(self):
         import sys as _sys
@@ -903,24 +2554,7 @@ class VideoAnalysis:
         return self.__class__._rf_fall_v2_model_cache
 
     def _rf_thresholds(self):
-        summary = self._rf_project_summary()
-        tuned = summary.get('tuned_thresholds', {}) or {}
-        best_config = summary.get('best_config', {}) or {}
-        confirm_source = tuned.get('confirm', best_config.get('threshold', self.fall_decision_threshold))
-        confirm = self._metadata_to_number(confirm_source, self.fall_decision_threshold)
-        suspect_default = max(0.30, confirm - 0.15)
-        suspect = self._metadata_to_number(tuned.get('suspect', suspect_default), suspect_default)
-        high_default = max(0.75, confirm + 0.15)
-        high = self._metadata_to_number(tuned.get('high', high_default), high_default)
-        if suspect >= confirm:
-            suspect = max(0.0, confirm - 0.10)
-        if high < confirm:
-            high = confirm
-        return {
-            'suspect': round(float(suspect), 4),
-            'confirm': round(float(confirm), 4),
-            'high': round(float(high), 4),
-        }
+        return self._apply_fall_sensitivity_thresholds(self._rf_base_thresholds())
 
     def _rf_confirm_threshold(self):
         return float(self._rf_thresholds().get('confirm', self.fall_decision_threshold))
@@ -950,20 +2584,12 @@ class VideoAnalysis:
     def _xg_fall_thresholds(self):
         summary = self._xg_fall_summary()
         tuned = summary.get('tuned_thresholds', {}) or {}
-        confirm = self._metadata_to_number(tuned.get('confirm', self._XG_FALL_THRESHOLD), self._XG_FALL_THRESHOLD)
+        confirm = self._threshold_entry_number(tuned.get('confirm', self._XG_FALL_THRESHOLD), self._XG_FALL_THRESHOLD)
         suspect_default = max(0.30, confirm - 0.12)
-        suspect = self._metadata_to_number(tuned.get('suspect', suspect_default), suspect_default)
+        suspect = self._threshold_entry_number(tuned.get('suspect', suspect_default), suspect_default)
         high_default = max(0.75, confirm + 0.12)
-        high = self._metadata_to_number(tuned.get('high', high_default), high_default)
-        if suspect >= confirm:
-            suspect = max(0.0, confirm - 0.10)
-        if high < confirm:
-            high = confirm
-        return {
-            'suspect': round(float(suspect), 4),
-            'confirm': round(float(confirm), 4),
-            'high': round(float(high), 4),
-        }
+        high = self._threshold_entry_number(tuned.get('high', high_default), high_default)
+        return self._apply_fall_sensitivity_thresholds(self._normalize_thresholds(confirm, suspect, high))
 
     def _fall_decision_band(self, score, motion_gate_passed=True, short_clip=False):
         thresholds = self._xg_fall_thresholds()
@@ -1140,24 +2766,36 @@ class VideoAnalysis:
         return self.__class__._xg_fall_model_cache
 
     def _xg_posture_model_path(self):
+        selected = self._selected_registry_item_for_family('xg-posture')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('xg-posture', 'xg_posture_model.pkl'),
             self._project_abspath(self._XG_POSTURE_MODEL_REL_PATH),
         )
 
     def _xg_posture_summary_path(self):
+        selected = self._selected_registry_item_for_family('xg-posture')
+        if selected:
+            return str(selected.get('summary_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('xg-posture', 'training_summary.json'),
             self._project_abspath(self._XG_POSTURE_SUMMARY_REL_PATH),
         )
 
     def _xg_posture_occlusion_aux_model_path(self):
+        selected = self._selected_registry_item_for_family('xg-posture-occlusion-aux')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('xg-posture-occlusion-aux', 'xg_posture_occlusion_aux_model.pkl'),
             self._project_abspath(self._XG_POSTURE_OCCLUSION_AUX_MODEL_REL_PATH),
         )
 
     def _xg_posture_occlusion_aux_summary_path(self):
+        selected = self._selected_registry_item_for_family('xg-posture-occlusion-aux')
+        if selected:
+            return str(selected.get('summary_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('xg-posture-occlusion-aux', 'training_summary.json'),
             self._project_abspath(self._XG_POSTURE_OCCLUSION_AUX_SUMMARY_REL_PATH),
@@ -1173,9 +2811,10 @@ class VideoAnalysis:
 
     def _xg_posture_cv_accuracy(self, summary=None):
         summary = summary if summary is not None else self._xg_posture_summary()
+        sequence_cv = summary.get('sequence_group_cv', {}) or {}
         group_cv = summary.get('group_cv', {}) or {}
         cv = summary.get('cv', {}) or {}
-        return float(summary.get('cv_accuracy', group_cv.get('accuracy', cv.get('accuracy', 0.0))) or 0.0)
+        return float(summary.get('cv_accuracy', sequence_cv.get('accuracy', group_cv.get('accuracy', cv.get('accuracy', 0.0)))) or 0.0)
 
     def _xg_posture_sequence_cv(self, summary=None):
         summary = summary if summary is not None else self._xg_posture_summary()
@@ -1185,7 +2824,10 @@ class VideoAnalysis:
         return os.path.isfile(self._xg_posture_model_path())
 
     def _xg_posture_occlusion_aux_available(self):
-        return os.path.isfile(self._xg_posture_occlusion_aux_model_path())
+        summary = self._read_json(self._xg_posture_occlusion_aux_summary_path(), default={}) or {}
+        if self._selected_registry_item_for_family('xg-posture-occlusion-aux'):
+            return os.path.isfile(self._xg_posture_occlusion_aux_model_path())
+        return bool(os.path.isfile(self._xg_posture_occlusion_aux_model_path()) and self._model_summary_ready(summary))
 
     def _external_pose_dataset_root(self):
         roots = self._external_pose_dataset_roots()
@@ -1198,7 +2840,12 @@ class VideoAnalysis:
 
         candidates = []
         suffix_names = {'Training', 'Validation'}
-        for search_root in self._EXTERNAL_POSE_DATASET_SEARCH_ROOTS:
+        env_roots = []
+        for raw_root in str(os.environ.get('FALLAI_71461_DATASET_ROOTS') or '').split(os.pathsep):
+            raw_root = raw_root.strip()
+            if raw_root:
+                env_roots.append(raw_root)
+        for search_root in list(env_roots) + list(self._EXTERNAL_POSE_DATASET_SEARCH_ROOTS):
             if not os.path.isdir(search_root):
                 continue
             for root, dirs, files in os.walk(search_root):
@@ -1206,10 +2853,23 @@ class VideoAnalysis:
                 parts = root_norm.split(os.sep)
                 if len(parts) >= 2 and parts[-2] in suffix_names and parts[-1] == '02.라벨링데이터':
                     json_count = len([name for name in files if name.endswith('.json')])
+                    if json_count <= 0:
+                        for sub_root, _sub_dirs, sub_files in os.walk(root_norm):
+                            json_count += len([name for name in sub_files if name.endswith('.json')])
+                            if json_count >= 10000:
+                                break
                     if json_count > 0:
                         candidates.append((json_count, root_norm))
         candidates.sort(key=lambda item: (-item[0], item[1]))
-        return [root for _, root in candidates]
+        deduped = []
+        seen = set()
+        for _, root in candidates:
+            key = os.path.realpath(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(root)
+        return deduped
 
     def _build_external_pose_feature_row(self, label, filename, image_meta, annotation):
         import math
@@ -1432,12 +3092,25 @@ class VideoAnalysis:
                 label = self._aihub61_label_from_zip_name(file_name)
                 if label:
                     found.append((label, os.path.join(root, file_name)))
+            base = os.path.basename(root)
+            if any(token in base for token in wanted):
+                label = self._aihub61_label_from_zip_name(base)
+                if label and any(name.endswith('.json') for _r, _d, names in os.walk(root) for name in names):
+                    found.append((label, root))
         found.sort(key=lambda item: (
             item[0],
-            -int(os.path.getsize(item[1]) if os.path.exists(item[1]) else 0),
+            -int(os.path.getsize(item[1]) if os.path.isfile(item[1]) else 0),
             item[1],
         ))
-        return found
+        unique = []
+        seen = set()
+        for item in found:
+            key = (item[0], os.path.realpath(item[1]))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
 
     def _aihub61_convert_keypoints_to_coco17(self, raw_keypoints, invisible_keys=None):
         invisible = {str(key) for key in (invisible_keys or [])}
@@ -1712,144 +3385,145 @@ class VideoAnalysis:
         rule_counts = collections.Counter()
         action_counts = collections.Counter()
         limits = dict(self._EXTERNAL_POSE_CLASS_LIMITS)
-        all_candidates = []
-        json_paths = []
+        selected_rows = []
+
+        def limits_met():
+            return all(int(counts.get(label, 0) or 0) >= int(limit or 0) for label, limit in limits.items() if int(limit or 0) > 0)
+
+        stop_scan = False
         for scan_root in dataset_roots:
+            if stop_scan:
+                break
             for root, dirs, files in os.walk(scan_root):
-                for file_name in files:
-                    if file_name.endswith('.json'):
-                        json_paths.append((scan_root, os.path.join(root, file_name)))
-        for scan_root, path in sorted(json_paths, key=lambda item: item[1]):
-            name = os.path.relpath(path, scan_root)
-            result['scanned_files'] += 1
-            try:
-                data = self._read_json(path, default={}) or {}
-            except Exception:
-                continue
-            action_map = {}
-            for item in data.get('action_categories', []) or []:
-                try:
-                    action_map[int(item.get('id'))] = str(item.get('name', '')).strip().lower()
-                except Exception:
-                    continue
-            target_center = None
-            target_actions = []
-            for action in data.get('actions', []) or []:
-                try:
-                    action_name = action_map.get(int(action.get('name', -1)), '')
-                except Exception:
-                    action_name = ''
-                object_name = ''
-                try:
-                    object_id = int(action.get('object', -1))
-                except Exception:
-                    object_id = -1
-                for category in data.get('Categories', []) or []:
+                dirs.sort()
+                if stop_scan:
+                    break
+                for file_name in sorted(files):
+                    if not file_name.endswith('.json'):
+                        continue
+                    if limits_met():
+                        stop_scan = True
+                        break
+                    path = os.path.join(root, file_name)
+                    name = os.path.relpath(path, scan_root)
+                    result['scanned_files'] += 1
                     try:
-                        if int(category.get('id', -1)) == object_id:
-                            object_name = str(category.get('name', '')).strip().lower()
-                            break
+                        data = self._read_json(path, default={}) or {}
                     except Exception:
                         continue
-                if len(action_name) == 0:
-                    continue
-                target_actions.append({'action': action_name, 'object': object_name})
-                boxes_h = list(action.get('boxes_h', []) or [])
-                if target_center is None and len(boxes_h) >= 2:
-                    try:
+                    action_map = {}
+                    for item in data.get('action_categories', []) or []:
+                        try:
+                            action_map[int(item.get('id'))] = str(item.get('name', '')).strip().lower()
+                        except Exception:
+                            continue
+                    target_center = None
+                    target_actions = []
+                    for action in data.get('actions', []) or []:
+                        try:
+                            action_name = action_map.get(int(action.get('name', -1)), '')
+                        except Exception:
+                            action_name = ''
+                        object_name = ''
+                        try:
+                            object_id = int(action.get('object', -1))
+                        except Exception:
+                            object_id = -1
+                        for category in data.get('Categories', []) or []:
+                            try:
+                                if int(category.get('id', -1)) == object_id:
+                                    object_name = str(category.get('name', '')).strip().lower()
+                                    break
+                            except Exception:
+                                continue
+                        if len(action_name) == 0:
+                            continue
+                        target_actions.append({'action': action_name, 'object': object_name})
+                        boxes_h = list(action.get('boxes_h', []) or [])
+                        if target_center is None and len(boxes_h) >= 2:
+                            try:
+                                width = float(((data.get('images', [{}]) or [{}])[0]).get('width', 0) or 0)
+                                height = float(((data.get('images', [{}]) or [{}])[0]).get('height', 0) or 0)
+                                if width > 0 and height > 0:
+                                    target_center = (float(boxes_h[0]) / width, float(boxes_h[1]) / height)
+                            except Exception:
+                                target_center = None
+                    if len(target_actions) == 0:
+                        continue
+
+                    ann_candidates = []
+                    for ann in data.get('annotations', []) or []:
+                        if int(ann.get('category_id', -1) or -1) != 1:
+                            continue
+                        keypoints = list(ann.get('keypoints', []) or [])
+                        if len(keypoints) < 51:
+                            continue
+                        bbox = list(ann.get('bbox', []) or [])
+                        if len(bbox) < 4:
+                            continue
+                        bx, by, bw, bh = [float(v or 0.0) for v in bbox[:4]]
+                        cx = bx + bw / 2.0
+                        cy = by + bh / 2.0
+                        ann_candidates.append({'annotation': ann, 'cx': cx, 'cy': cy})
+                    if len(ann_candidates) == 0:
+                        if len(result['skipped_files']) < 20:
+                            result['skipped_files'].append({'file': name, 'reason': 'no-person-keypoints'})
+                        continue
+
+                    selected = ann_candidates[0]['annotation']
+                    if target_center is not None:
                         width = float(((data.get('images', [{}]) or [{}])[0]).get('width', 0) or 0)
                         height = float(((data.get('images', [{}]) or [{}])[0]).get('height', 0) or 0)
                         if width > 0 and height > 0:
-                            target_center = (float(boxes_h[0]) / width, float(boxes_h[1]) / height)
-                    except Exception:
-                        target_center = None
-            if len(target_actions) == 0:
-                continue
+                            selected = min(
+                                ann_candidates,
+                                key=lambda item: (item['cx'] / width - target_center[0]) ** 2 + (item['cy'] / height - target_center[1]) ** 2,
+                            )['annotation']
 
-            ann_candidates = []
-            for ann in data.get('annotations', []) or []:
-                if int(ann.get('category_id', -1) or -1) != 1:
-                    continue
-                keypoints = list(ann.get('keypoints', []) or [])
-                if len(keypoints) < 51:
-                    continue
-                bbox = list(ann.get('bbox', []) or [])
-                if len(bbox) < 4:
-                    continue
-                bx, by, bw, bh = [float(v or 0.0) for v in bbox[:4]]
-                cx = bx + bw / 2.0
-                cy = by + bh / 2.0
-                ann_candidates.append({'annotation': ann, 'cx': cx, 'cy': cy})
-            if len(ann_candidates) == 0:
-                result['skipped_files'].append({'file': name, 'reason': 'no-person-keypoints'})
-                continue
+                    image_meta = ((data.get('images', [{}]) or [{}])[0]) if data.get('images') else {}
+                    row = self._build_external_pose_feature_row('external', name, image_meta, selected)
+                    if row is None:
+                        if len(result['skipped_files']) < 20:
+                            result['skipped_files'].append({'file': name, 'reason': 'feature-build-failed'})
+                        continue
+                    best_match = None
+                    for action_info in target_actions:
+                        scored = self._score_external_pose_label(action_info.get('action', ''), action_info.get('object', ''), row)
+                        if scored is None:
+                            continue
+                        if best_match is None or float(scored.get('confidence', 0.0) or 0.0) > float(best_match.get('confidence', 0.0) or 0.0):
+                            best_match = {
+                                **scored,
+                                'action': action_info.get('action', ''),
+                                'object': action_info.get('object', ''),
+                            }
+                    if best_match is None:
+                        continue
 
-            selected = ann_candidates[0]['annotation']
-            if target_center is not None:
-                width = float(((data.get('images', [{}]) or [{}])[0]).get('width', 0) or 0)
-                height = float(((data.get('images', [{}]) or [{}])[0]).get('height', 0) or 0)
-                if width > 0 and height > 0:
-                    selected = min(
-                        ann_candidates,
-                        key=lambda item: (item['cx'] / width - target_center[0]) ** 2 + (item['cy'] / height - target_center[1]) ** 2,
-                    )['annotation']
-
-            image_meta = ((data.get('images', [{}]) or [{}])[0]) if data.get('images') else {}
-            row = self._build_external_pose_feature_row('external', name, image_meta, selected)
-            if row is None:
-                result['skipped_files'].append({'file': name, 'reason': 'feature-build-failed'})
-                continue
-            best_match = None
-            for action_info in target_actions:
-                scored = self._score_external_pose_label(action_info.get('action', ''), action_info.get('object', ''), row)
-                if scored is None:
-                    continue
-                if best_match is None or float(scored.get('confidence', 0.0) or 0.0) > float(best_match.get('confidence', 0.0) or 0.0):
-                    best_match = {
-                        **scored,
-                        'action': action_info.get('action', ''),
-                        'object': action_info.get('object', ''),
+                    label = best_match['label']
+                    if int(counts.get(label, 0) or 0) >= int(limits.get(label, 0) or 0):
+                        continue
+                    normalized = {
+                        'video': row['video'],
+                        'posture': label,
+                        'source': f"external-image:{best_match['rule']}",
                     }
-            if best_match is None:
-                continue
-
-            normalized = {
-                'video': row['video'],
-                'posture': best_match['label'],
-                'source': f"external-image:{best_match['rule']}",
-            }
-            for col in feature_cols:
-                normalized[col] = float(row.get(col, 0.0) or 0.0)
-            all_candidates.append({
-                'row': normalized,
-                'file': name,
-                'label': best_match['label'],
-                'action': best_match['action'],
-                'object': best_match['object'],
-                'rule': best_match['rule'],
-                'confidence': float(best_match.get('confidence', 0.0) or 0.0),
-            })
-
-        selected_rows = []
-        for label, limit in limits.items():
-            label_candidates = [item for item in all_candidates if item.get('label') == label]
-            label_candidates.sort(key=lambda item: (-float(item.get('confidence', 0.0) or 0.0), str(item.get('file', ''))))
-            chosen = label_candidates[:max(int(limit or 0), 0)] if int(limit or 0) > 0 else []
-            for item in chosen:
-                selected_rows.append(item['row'])
-                counts[label] += 1
-                rule_counts[item.get('rule', 'unknown')] += 1
-                action_counts[item.get('action', 'unknown')] += 1
-                result['used_files'] += 1
-                result['selected_examples'].setdefault(label, [])
-                if len(result['selected_examples'][label]) < 5:
-                    result['selected_examples'][label].append({
-                        'file': item.get('file', ''),
-                        'action': item.get('action', ''),
-                        'object': item.get('object', ''),
-                        'rule': item.get('rule', ''),
-                        'confidence': round(float(item.get('confidence', 0.0) or 0.0), 4),
-                    })
+                    for col in feature_cols:
+                        normalized[col] = float(row.get(col, 0.0) or 0.0)
+                    selected_rows.append(normalized)
+                    counts[label] += 1
+                    rule_counts[best_match.get('rule', 'unknown')] += 1
+                    action_counts[best_match.get('action', 'unknown')] += 1
+                    result['used_files'] += 1
+                    result['selected_examples'].setdefault(label, [])
+                    if len(result['selected_examples'][label]) < 5:
+                        result['selected_examples'][label].append({
+                            'file': name,
+                            'action': best_match.get('action', ''),
+                            'object': best_match.get('object', ''),
+                            'rule': best_match.get('rule', ''),
+                            'confidence': round(float(best_match.get('confidence', 0.0) or 0.0), 4),
+                        })
 
         remaining_aihub61_limits = {}
         for label, target in self._AIHUB61_POSE_CLASS_TARGETS.items():
@@ -2353,6 +4027,7 @@ class VideoAnalysis:
     def _rf_runtime_meta(self):
         active_model_path = self._rf_active_model_path()
         project_summary = self._rf_project_summary()
+        continuous_items = self.continuous_training_status_list()
         info = {
             'ready': self._rf_pipeline_available(),
             'model_path': active_model_path,
@@ -2522,26 +4197,42 @@ class VideoAnalysis:
         weights = {
             'fear': 1.00,
             'anxiety': 1.00,
+            'distress': 1.00,
             'hurt': 0.90,
-            'sadness': 0.90,
-            'anger': 0.75,
-            'disgust': 0.65,
-            'embarrassed': 0.45,
-            'contempt': 0.35,
-            'surprise': 0.35,
+            'sadness': 0.72,
+            'anger': 0.42,
+            'disgust': 0.40,
+            'embarrassed': 0.22,
+            'contempt': 0.22,
+            'surprise': 0.18,
         }
         score = 0.0
         for label, weight in weights.items():
             score += self._finite_float(probs.get(label), 0.0) * weight
+        neutralish = max(
+            self._finite_float(probs.get('neutral'), 0.0),
+            self._finite_float(probs.get('normal'), 0.0),
+            self._finite_float(probs.get('non_distress'), 0.0),
+            self._finite_float(probs.get('happiness'), 0.0) * 0.85,
+        )
+        distress_top = max(
+            self._finite_float(probs.get(label), 0.0)
+            for label in ('fear', 'anxiety', 'distress', 'hurt', 'sadness', 'anger', 'disgust', 'contempt')
+        )
+        if neutralish >= 0.25 and distress_top <= neutralish + 0.18:
+            score *= 0.45
+        if self._finite_float(probs.get('anger'), 0.0) >= distress_top and distress_top < 0.55:
+            score *= 0.55
         return max(0.0, min(1.0, score))
 
     def _facial_emotion_labels_for_probs(self, detections):
         labels = []
         preferred = list(self._FACIAL_EMOTION_LABELS)
+        aihub_labels = list(self._FACIAL_AIHUB82_LABELS) + ['distress', 'non_distress', 'normal']
         for det in detections or []:
             probs = (det or {}).get('emotion_probs') or {}
-            if any(label in probs for label in self._FACIAL_AIHUB82_LABELS):
-                preferred = list(self._FACIAL_AIHUB82_LABELS)
+            if any(label in probs for label in aihub_labels):
+                preferred = list(aihub_labels)
                 break
         for label in preferred:
             if label not in labels:
@@ -2579,11 +4270,16 @@ class VideoAnalysis:
         face_conf = self._finite_float(avg_face_conf, 0.0)
         head_ratio = self._finite_float(head_roi_ratio, 0.0)
         frame_consistency = max(0.0, min(1.0, self._finite_float(consistency, 1.0)))
-        reliable_medium = top_score >= 0.30 and margin >= 0.035 and face_conf >= 0.32 and entropy <= 0.94 and frame_consistency >= 0.50
-        reliable_high = top_score >= 0.42 and margin >= 0.090 and face_conf >= 0.42 and entropy <= 0.86 and frame_consistency >= 0.67
+        distress_like_top = top_label in ('fear', 'anxiety', 'hurt', 'sadness', 'anger', 'distress', 'disgust', 'contempt')
+        if distress_like_top:
+            reliable_medium = top_score >= 0.38 and margin >= 0.070 and face_conf >= 0.38 and entropy <= 0.88 and frame_consistency >= 0.60
+            reliable_high = top_score >= 0.55 and margin >= 0.130 and face_conf >= 0.48 and entropy <= 0.78 and frame_consistency >= 0.72
+        else:
+            reliable_medium = top_score >= 0.30 and margin >= 0.035 and face_conf >= 0.32 and entropy <= 0.94 and frame_consistency >= 0.50
+            reliable_high = top_score >= 0.42 and margin >= 0.090 and face_conf >= 0.42 and entropy <= 0.86 and frame_consistency >= 0.67
         if head_ratio >= 0.50:
-            reliable_medium = reliable_medium and top_score >= 0.34 and margin >= 0.050
-            reliable_high = reliable_high and top_score >= 0.48 and margin >= 0.100
+            reliable_medium = reliable_medium and top_score >= (0.46 if distress_like_top else 0.34) and margin >= (0.100 if distress_like_top else 0.050)
+            reliable_high = reliable_high and top_score >= (0.62 if distress_like_top else 0.48) and margin >= (0.160 if distress_like_top else 0.100)
         if reliable_high:
             quality = 'high'
         elif reliable_medium:
@@ -2652,12 +4348,18 @@ class VideoAnalysis:
         return lines
 
     def _facial_aihub82_model_path(self):
+        selected = self._selected_registry_item_for_family('facial-aihub82')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('facial-state', 'aihub82_facial_emotion_mobilenetv3.pt'),
             self._project_abspath(self._FACIAL_AIHUB82_MODEL_REL_PATH),
         )
 
     def _facial_driver_state_model_path(self):
+        selected = self._selected_registry_item_for_family('driver-aihub173')
+        if selected:
+            return str(selected.get('primary_model_path') or '')
         return self._promote_model_asset(
             self._persistent_model_path('facial-state', 'aihub173_driver_state_mobilenetv3.pt'),
             self._project_abspath(self._FACIAL_DRIVER_STATE_MODEL_REL_PATH),
@@ -2843,6 +4545,9 @@ class VideoAnalysis:
         model_path = self._facial_aihub82_model_path()
         if not os.path.isfile(model_path):
             return None
+        summary = self._read_json(self._persistent_model_path('facial-state', 'aihub82_facial_emotion_summary.json'), default={}) or {}
+        if self._model_summary_is_emergency_recovery(summary):
+            return None
         try:
             mtime = os.path.getmtime(model_path)
         except Exception:
@@ -2865,7 +4570,16 @@ class VideoAnalysis:
                 pass
             from torchvision import models as _tv_models
             ckpt = torch.load(model_path, map_location='cpu')
+            if isinstance(ckpt, dict) and self._model_summary_is_emergency_recovery(ckpt):
+                return None
             class_names = list(ckpt.get('class_names') or self._FACIAL_AIHUB82_LABELS)
+            ckpt_metrics = ckpt.get('metrics') or {}
+            summary_metrics = summary.get('best_metrics') if isinstance(summary.get('best_metrics'), dict) else {}
+            decision_threshold = self._finite_float(
+                summary_metrics.get('decision_threshold'),
+                self._finite_float(ckpt_metrics.get('decision_threshold'), 0.50),
+            )
+            decision_threshold = max(0.0, min(1.0, decision_threshold))
             model, model_type = self._make_torchvision_mobilenet(_tv_models, torch, ckpt.get('model_type'), len(class_names))
             model.load_state_dict(ckpt.get('state_dict') or ckpt)
             model.eval()
@@ -2876,7 +4590,9 @@ class VideoAnalysis:
                 'class_names': class_names,
                 'image_size': int(ckpt.get('image_size') or 160),
                 'path': model_path,
-                'metrics': ckpt.get('metrics') or {},
+                'metrics': ckpt_metrics,
+                'decision_threshold': decision_threshold,
+                'summary_ready': self._model_summary_ready(summary),
             }
             self.__class__._facial_aihub82_model_cache = bundle
             self.__class__._facial_aihub82_model_mtime = mtime
@@ -2919,6 +4635,9 @@ class VideoAnalysis:
                 if idx < len(probs_tensor)
             }
             top_label = max(probs, key=lambda key: probs.get(key, 0.0))
+            decision_threshold = self._finite_float(bundle.get('decision_threshold'), 0.50)
+            if 'distress' in probs and 'non_distress' in probs:
+                top_label = 'distress' if self._finite_float(probs.get('distress'), 0.0) >= decision_threshold else 'non_distress'
             distress = self._facial_emotion_distress_score(probs)
             return {
                 'available': True,
@@ -2931,6 +4650,7 @@ class VideoAnalysis:
                 'top_label_ko': self._FACIAL_EMOTION_LABEL_KO.get(top_label, top_label),
                 'top_score': round(float(probs.get(top_label, 0.0)), 4),
                 'distress_score': round(float(distress), 4),
+                'distress_decision_threshold': round(float(decision_threshold), 4),
             }
         except Exception as e:
             return {
@@ -2947,6 +4667,9 @@ class VideoAnalysis:
     def _get_facial_driver_state_model(self):
         model_path = self._facial_driver_state_model_path()
         if not os.path.isfile(model_path):
+            return None
+        summary = self._read_json(self._persistent_model_path('facial-state', 'aihub173_driver_state_summary.json'), default={}) or {}
+        if not self._model_summary_ready(summary):
             return None
         try:
             mtime = os.path.getmtime(model_path)
@@ -2970,6 +4693,8 @@ class VideoAnalysis:
                 pass
             from torchvision import models as _tv_models
             ckpt = torch.load(model_path, map_location='cpu')
+            if isinstance(ckpt, dict) and self._model_summary_is_emergency_recovery(ckpt):
+                return None
             class_names = list(ckpt.get('class_names') or self._FACIAL_DRIVER_STATE_LABELS)
             model, model_type = self._make_torchvision_mobilenet(_tv_models, torch, ckpt.get('model_type'), len(class_names))
             model.load_state_dict(ckpt.get('state_dict') or ckpt)
@@ -3065,15 +4790,37 @@ class VideoAnalysis:
 
     def _classify_facial_emotion(self, face_gray):
         provider = str(os.environ.get('FACIAL_EMOTION_PROVIDER', 'auto') or 'auto').strip().lower().replace('_', '-')
-        if provider in ('auto', 'external', 'external-emotionnet', 'emotionnet'):
+        internal_first_providers = ('auto', 'internal', 'local', 'local-aihub82', 'aihub82', 'aihub82-local')
+        emotionnet_providers = ('external', 'external-only', 'external-emotionnet', 'external-emotionnet-only', 'emotionnet', 'emotionnet-only')
+        efficientnet_providers = ('external-efficientnet', 'external-efficientnet-only', 'external-efficientnet-b5', 'external-efficientnet-b5-only', 'efficientnet', 'efficientnet-only', 'efficientnet-b5', 'efficientnet-b5-only')
+        external_only_providers = ('external-only', 'external-emotionnet-only', 'external-efficientnet-only', 'external-efficientnet-b5-only', 'emotionnet-only', 'efficientnet-only', 'efficientnet-b5-only')
+        if provider in internal_first_providers:
+            aihub = self._classify_facial_emotion_aihub82(face_gray)
+            if aihub is not None:
+                return aihub
+            if provider == 'auto':
+                external = self._classify_facial_emotion_external_aihub82(face_gray, 'emotionnet')
+                if external is not None:
+                    return external
+        if provider in emotionnet_providers:
             external = self._classify_facial_emotion_external_aihub82(face_gray, 'emotionnet')
             if external is not None:
                 return external
-        if provider in ('external-efficientnet', 'external-efficientnet-b5', 'efficientnet', 'efficientnet-b5'):
+        if provider in efficientnet_providers:
             external = self._classify_facial_emotion_external_aihub82(face_gray, 'efficientnet-b5')
             if external is not None:
                 return external
-        aihub = None if provider in ('external-only', 'external-emotionnet-only', 'external-efficientnet-only') else self._classify_facial_emotion_aihub82(face_gray)
+        if provider in external_only_providers:
+            return {
+                'available': False,
+                'reason': 'external_aihub82_emotion_model_unavailable',
+                'probs': {},
+                'top_label': 'unavailable',
+                'top_label_ko': '분석 불가',
+                'top_score': 0.0,
+                'distress_score': 0.0,
+            }
+        aihub = None if provider in internal_first_providers else self._classify_facial_emotion_aihub82(face_gray)
         if aihub is not None:
             return aihub
         if face_gray is not None and len(getattr(face_gray, 'shape', [])) == 3:
@@ -3348,6 +5095,12 @@ class VideoAnalysis:
             return self._facial_aux_default('opencv_unavailable', 'OpenCV를 사용할 수 없어 표정 보조 분석을 건너뛰었습니다.')
         if not raw_frames or not timeseries:
             return self._facial_aux_default('no_frames', '공유 추출 프레임이 없어 표정 보조 분석을 건너뛰었습니다.')
+        _rt_ctx = realtime_context or {}
+        if _rt_ctx.get('skip_facial_aux'):
+            if _rt_ctx.get('person_track_analysis'):
+                return self._facial_aux_default('person_track_skip', '사람별 행동 카드는 중복 비용을 줄이기 위해 표정 보조 분석을 반복 실행하지 않습니다.')
+            return self._facial_aux_default('fast_chunk_skip', '업로드 분할 로그의 응답 시간을 줄이기 위해 청크별 표정 보조 분석은 건너뛰고 메인 분석 결과에서만 표정 근거를 계산합니다.')
+        _profile_key = str(_rt_ctx.get('analysis_profile') or '').strip().lower()
 
         score = self._finite_float(fall_score, 0.0)
         confirm = self._finite_float(effective_threshold, self.fall_decision_threshold)
@@ -3356,9 +5109,9 @@ class VideoAnalysis:
             suspect = max(0.15, confirm - self._FACIAL_AUX_TRIGGER_MARGIN)
         suspect = self._finite_float(suspect, max(0.15, confirm - self._FACIAL_AUX_TRIGGER_MARGIN))
         body_suspected = bool(fall_detected) or score >= suspect
-        _rt_ctx = realtime_context or {}
-        _force_refresh = bool(_rt_ctx.get('force_facial_refresh') or _rt_ctx.get('upload_chunk'))
         _upload_chunk = bool(_rt_ctx.get('upload_chunk'))
+        _shared_timeseries_reuse = bool(_rt_ctx.get('shared_timeseries_reuse'))
+        _force_refresh = bool(_rt_ctx.get('force_facial_refresh') or (_upload_chunk and not _shared_timeseries_reuse))
         session_key = str(_rt_ctx.get('session_id') or 'default').strip() or 'default'
         cache_map = self.__class__._facial_state_realtime_cache
         if not isinstance(cache_map, dict):
@@ -3411,6 +5164,8 @@ class VideoAnalysis:
         realtime_precise_frames = max(1, int(os.environ.get('FACIAL_AUX_REALTIME_PRECISE_FRAMES', '2') or 2))
         realtime_monitor_frames = max(1, int(os.environ.get('FACIAL_AUX_REALTIME_MONITOR_FRAMES', '2') or 2))
         upload_chunk_frames = max(1, int(os.environ.get('FACIAL_AUX_UPLOAD_CHUNK_FRAMES', '2') or 2))
+        upload_frames_default = 5 if _profile_key in ('full', 'precise', 'precision') else 2
+        upload_frames = max(1, int(os.environ.get('FACIAL_AUX_UPLOAD_FRAMES', str(upload_frames_default)) or upload_frames_default))
         if is_realtime:
             if _upload_chunk:
                 frame_limit = min(self._FACIAL_AUX_MAX_FRAMES, upload_chunk_frames)
@@ -3421,17 +5176,27 @@ class VideoAnalysis:
             else:
                 frame_limit = 1
         else:
-            frame_limit = self._FACIAL_AUX_MAX_FRAMES if body_suspected else 4
+            frame_limit = min(self._FACIAL_AUX_MAX_FRAMES, upload_frames if body_suspected else min(upload_frames, 2))
         candidate_entries = clean_ts[-frame_limit:]
         run_facial_models = bool(body_suspected or not is_realtime or should_refresh_realtime)
         realtime_driver_enabled = os.environ.get('FACIAL_AUX_REALTIME_DRIVER', 'true').lower() not in ('0', 'false', 'no')
+        upload_driver_enabled = os.environ.get('FACIAL_AUX_UPLOAD_DRIVER', 'false').lower() not in ('0', 'false', 'no')
         run_driver_model = bool(
             run_facial_models
             and (
-                not is_realtime
-                or body_suspected
-                or _force_refresh
-                or (realtime_driver_enabled and (cached_entry is None or cache_age >= driver_interval))
+                (
+                    not is_realtime
+                    and upload_driver_enabled
+                    and (body_suspected or _force_refresh or cached_entry is None)
+                )
+                or (
+                    is_realtime
+                    and (
+                        body_suspected
+                        or _force_refresh
+                        or (realtime_driver_enabled and (cached_entry is None or cache_age >= driver_interval))
+                    )
+                )
             )
         )
 
@@ -3562,11 +5327,14 @@ class VideoAnalysis:
                 'emotion_available': bool(emotion.get('available')),
                 'emotion_model': emotion.get('model') or 'unavailable',
                 'emotion_model_path': emotion.get('model_path') or '',
+                'emotion_model_source': emotion.get('model_source') or '',
+                'emotion_model_labels': emotion.get('labels') or [],
                 'emotion_top': emotion.get('top_label') or 'unavailable',
                 'emotion_top_label': emotion.get('top_label_ko') or '분석 불가',
                 'emotion_score': round(self._finite_float(emotion.get('top_score'), 0.0), 4),
                 'emotion_probs': emotion.get('probs') or {},
                 'distress_score': round(self._finite_float(emotion.get('distress_score'), 0.0), 4),
+                'emotion_distress_threshold': round(self._finite_float(emotion.get('distress_decision_threshold'), 0.50), 4),
                 'driver_state_available': bool(driver_state and driver_state.get('available')),
                 'driver_state_model': (driver_state or {}).get('model') or 'unavailable',
                 'driver_state_top': (driver_state or {}).get('top_label') or 'unavailable',
@@ -3611,8 +5379,31 @@ class VideoAnalysis:
         top_emotion_label = self._FACIAL_EMOTION_LABEL_KO.get(top_emotion, '분석 불가')
         top_emotion_score = self._finite_float(emotion_probs.get(top_emotion), 0.0) if emotion_probs else 0.0
         distress_score = self._facial_emotion_distress_score(emotion_probs)
+        model_distress_thresholds = [
+            self._finite_float(d.get('emotion_distress_threshold'), 0.0)
+            for d in emotion_detections
+            if self._finite_float(d.get('emotion_distress_threshold'), 0.0) > 0.0
+        ]
+        model_distress_threshold = (
+            sum(model_distress_thresholds) / max(len(model_distress_thresholds), 1)
+            if model_distress_thresholds else 0.50
+        )
         active_emotion_model = emotion_detections[-1].get('emotion_model') if emotion_detections else 'unavailable'
         active_emotion_model_path = emotion_detections[-1].get('emotion_model_path') if emotion_detections else ''
+        active_emotion_model_source = emotion_detections[-1].get('emotion_model_source') if emotion_detections else ''
+        active_emotion_model_labels = emotion_detections[-1].get('emotion_model_labels') if emotion_detections else []
+        if not isinstance(active_emotion_model_labels, list):
+            active_emotion_model_labels = []
+        active_emotion_label_set = {str(label) for label in active_emotion_model_labels}
+        if active_emotion_label_set and active_emotion_label_set.issubset({'neutral', 'distress', 'non_distress', 'normal'}):
+            emotion_output_mode = 'distress_signal'
+            emotion_output_description = '중립/불편 신호 모델입니다. 기쁨 같은 세부 표정 퍼센트가 아니라 낙상 보조용 불편 가능성을 표시합니다.'
+        elif 'distress' in active_emotion_label_set:
+            emotion_output_mode = 'fall_aux_emotion'
+            emotion_output_description = '기쁨/당황/불편/중립을 구분하는 낙상 보조 표정 모델입니다.'
+        else:
+            emotion_output_mode = 'emotion_label'
+            emotion_output_description = '표정 라벨 확률을 표시합니다.'
         head_roi_ratio = sum(1 for d in detections if d.get('source') == 'pose_head_roi') / max(det_count, 1)
         emotion_consistency = 0.0
         if emotion_available_count and top_emotion != 'unavailable':
@@ -3650,7 +5441,17 @@ class VideoAnalysis:
         support = 0.0
         near_miss_floor = max(0.28, confirm - 0.14)
         near_miss_rescue_candidate = False
-        distress_apply_threshold = 0.30 if head_roi_ratio >= 0.50 or avg_conf < 0.42 else 0.20
+        try:
+            calibrated_distress_threshold = float(os.environ.get('FACIAL_AUX_DISTRESS_THRESHOLD', str(model_distress_threshold)) or model_distress_threshold)
+        except Exception:
+            calibrated_distress_threshold = model_distress_threshold
+        try:
+            low_quality_distress_threshold = float(os.environ.get('FACIAL_AUX_DISTRESS_LOW_QUALITY_THRESHOLD', '0.65') or 0.65)
+        except Exception:
+            low_quality_distress_threshold = 0.65
+        calibrated_distress_threshold = max(0.0, min(1.0, calibrated_distress_threshold))
+        low_quality_distress_threshold = max(calibrated_distress_threshold, min(1.0, low_quality_distress_threshold))
+        distress_apply_threshold = low_quality_distress_threshold if head_roi_ratio >= 0.50 or avg_conf < 0.42 else calibrated_distress_threshold
         facial_micro_evidence = bool(
             (avg_conf >= 0.42 and eye_closed_ratio >= 0.50)
             or (actual_face_ratio >= 0.50 and mouth_ratio >= 0.40)
@@ -3658,7 +5459,7 @@ class VideoAnalysis:
         )
         if emotion_available_count:
             emotion_weight = 0.085 * (0.55 if head_roi_ratio >= 0.50 or avg_conf < 0.42 else 1.0)
-            emotion_support_allowed = emotion_reliable or (facial_micro_evidence and trusted_distress_score >= 0.20)
+            emotion_support_allowed = emotion_reliable or (facial_micro_evidence and trusted_distress_score >= max(0.20, calibrated_distress_threshold - 0.10))
             if trusted_distress_score >= distress_apply_threshold and emotion_support_allowed:
                 support += trusted_distress_score * emotion_weight
             if avg_conf >= 0.42 and eye_closed_ratio >= 0.50 and trusted_distress_score >= distress_apply_threshold:
@@ -3710,22 +5511,29 @@ class VideoAnalysis:
         elif not emotion_available_count:
             state = 'emotion_model_unavailable'
             label = '얼굴 검출/표정모델 없음'
-        elif emotion_reliable and top_emotion == 'neutral' and trusted_distress_score < 0.20 and driver_risk_score < 0.35:
+        elif emotion_reliable and top_emotion in ('neutral', 'non_distress', 'normal', 'happiness') and trusted_distress_score < 0.25 and driver_risk_score < 0.35:
             state = 'neutral_face'
-            label = '표정 이상 없음'
-        elif emotion_reliable and trusted_distress_score < 0.20 and driver_risk_score < 0.35:
+            label = '평온/차분'
+        elif emotion_reliable and trusted_distress_score < min(0.35, distress_apply_threshold) and driver_risk_score < 0.35:
             state = 'neutral_or_low_risk_face'
-            label = '표정 이상 없음'
-        elif emotion_reliable and trusted_distress_score >= 0.45 and top_emotion in ('fear', 'anxiety', 'hurt', 'sadness', 'anger', 'disgust', 'contempt'):
+            label = '평온/차분'
+        elif (
+            top_emotion in ('fear', 'anxiety', 'hurt', 'sadness', 'anger', 'distress', 'disgust', 'contempt')
+            and trusted_distress_score < distress_apply_threshold
+            and driver_risk_score < 0.35
+        ):
+            state = 'distress_label_not_trusted'
+            label = '표정 근거 약함'
+        elif emotion_reliable and trusted_distress_score >= max(0.50, distress_apply_threshold) and top_emotion in ('fear', 'anxiety', 'hurt', 'sadness', 'anger', 'distress', 'disgust', 'contempt'):
             state = 'distress_possible'
             label = f'{display_emotion_label} 기반 불편 가능'
         elif emotion_reliable and top_emotion == 'surprise' and top_emotion_score >= 0.35:
             state = 'surprise_possible'
             label = '놀람 가능'
-        elif eye_closed_ratio >= 0.50 and avg_conf >= 0.42 and trusted_distress_score >= 0.20:
+        elif eye_closed_ratio >= 0.50 and avg_conf >= 0.42 and trusted_distress_score >= max(0.20, calibrated_distress_threshold - 0.10):
             state = 'eyes_closed_possible'
             label = '눈 감김 가능'
-        elif trusted_distress_score >= 0.30 and (emotion_reliable or facial_micro_evidence):
+        elif trusted_distress_score >= distress_apply_threshold and (emotion_reliable or facial_micro_evidence):
             state = 'weak_distress_possible'
             label = '약한 불편 신호'
         elif driver_reliable and driver_risk_score >= 0.45 and driver_top in ('drowsy', 'yawn'):
@@ -3760,14 +5568,17 @@ class VideoAnalysis:
             'driver_state_model': active_driver_model,
             'emotion_model_path': active_emotion_model_path or (self._facial_aihub82_model_path() if os.path.isfile(self._facial_aihub82_model_path()) else self._facial_emotion_model_path()),
             'driver_state_model_path': self._facial_driver_state_model_path(),
-            'emotion_model_source': 'External AI-Hub 82 EmotionNet if available, otherwise local AI-Hub 82/FER+ fallback',
+            'emotion_model_source': active_emotion_model_source or 'Local active AI-Hub 82 first, external AI-Hub 82/FER+ fallback',
+            'emotion_model_labels': active_emotion_model_labels,
+            'emotion_output_mode': emotion_output_mode,
+            'emotion_output_description': emotion_output_description,
             'driver_state_model_source': 'AI-Hub 173 fine-tuned driver-state auxiliary classifier',
             'available': True,
             'applied': False,
             'state': state,
             'label': label,
             'reason': 'analyzed',
-            'description': 'OpenCV 얼굴 검출 후 AI-Hub 82 학습 모델을 우선 사용하고, 없으면 FER+ ONNX 모델로 감정 확률을 계산합니다. 최종 낙상 점수 반영은 낙상 의심 구간에서만 수행합니다.',
+            'description': 'OpenCV 얼굴 검출 후 현재 active AI-Hub 82 학습 모델을 우선 사용합니다. 표정/불편 신호는 모델 확신도이며, 최종 낙상 점수 반영은 낙상 의심 구간에서 신뢰보정 후 제한적으로 수행합니다.',
             'face_detected': bool(actual_face_count > 0),
             'face_visible': bool(actual_face_count > 0),
             'facial_emotion': state,
@@ -3787,6 +5598,11 @@ class VideoAnalysis:
             'distress_score': round(float(distress_score), 4),
             'trusted_distress_score': round(float(trusted_distress_score), 4),
             'distress_apply_threshold': round(float(distress_apply_threshold), 4),
+            'distress_threshold_policy': {
+                'base': round(float(calibrated_distress_threshold), 4),
+                'low_quality': round(float(low_quality_distress_threshold), 4),
+                'source': 'conservative neutral-first runtime calibration 2026-06-09',
+            },
             'driver_state_top': driver_top,
             'driver_state_top_label': driver_top_label,
             'driver_state_confidence': round(float(driver_top_score), 4),
@@ -3863,12 +5679,24 @@ class VideoAnalysis:
         'upper_lower_height_ratio', 'upper_lower_center_gap',
         'upper_lower_width_ratio', 'torso_verticality',
         'leg_verticality', 'lower_body_extension',
+        # === Upper-body/shoulder temporal motion ===
+        'upper_body_temporal_motion', 'upper_motion_energy',
+        'upper_center_x_span', 'upper_center_dx_abs_mean',
+        'upper_center_y_std', 'upper_center_dy_abs_mean',
+        'shoulder_center_x_span', 'shoulder_center_dx_abs_mean',
+        'shoulder_center_y_std',
         # === Temporal / transition 5 ===
         'descent_duration', 'oscillation_count', 'speed_std',
         'post_descent_stillness', 'upper_body_motion',
         # === Transition phase 4 ===
         'time_to_max_down_speed', 'time_from_peak_to_stillness',
         'pre_descent_stillness', 'post_peak_recovery_ratio',
+        # === Window phase/change features ===
+        'center_x_net_displacement', 'center_y_net_displacement',
+        'center_x_direction_change_ratio', 'center_y_direction_change_ratio',
+        'center_path_efficiency', 'height_change_abs_mean', 'height_change_std',
+        'pose_height_delta', 'torso_tilt_delta', 'knee_bend_delta',
+        'lower_body_visibility_min', 'lower_body_visibility_std',
         # === Gait cycle 3 ===
         'step_period_est', 'knee_angle_cycle_strength', 'center_y_periodicity',
         # === Lie/fall discrimination 3 ===
@@ -3878,6 +5706,10 @@ class VideoAnalysis:
         'slow_descent_ratio', 'tilt_height_collapse',
         # === Behavior-disambiguation derived features ===
         'horizontal_motion_energy', 'vertical_motion_energy', 'total_motion_energy',
+        'body_translation_signal', 'weak_body_translation_signal',
+        'walk_displacement_signal', 'gait_translation_consistency',
+        'occluded_upper_motion_score', 'upright_motion_conflict_score',
+        'sit_lie_transition_score',
         'gait_dynamic_score', 'run_stride_score', 'sit_geometry_score',
         'lie_geometry_score', 'upright_geometry_score', 'knee_bend_intensity',
         'stationary_bent_score', 'flatness_score', 'support_stability_score',
@@ -3963,6 +5795,12 @@ class VideoAnalysis:
         torso_verticality = _num('torso_verticality')
         leg_verticality = _num('leg_verticality')
         lower_body_extension = _num('lower_body_extension')
+        center_path_efficiency = _num('center_path_efficiency')
+        pose_height_delta = _num('pose_height_delta')
+        torso_tilt_delta = _num('torso_tilt_delta')
+        knee_bend_delta = _num('knee_bend_delta')
+        lower_vis_min = max(0.0, min(1.0, _num('lower_body_visibility_min', lower_vis)))
+        lower_vis_std = max(0.0, _num('lower_body_visibility_std'))
 
         horizontal_energy = center_dx + center_x_span
         vertical_energy = abs(center_dy) + max_down_speed + speed_std
@@ -4000,6 +5838,19 @@ class VideoAnalysis:
         weak_body_translation_signal = center_x_span >= 0.045 or center_dx >= 0.012 or (speed_std >= 0.008 and center_x_span >= 0.030)
         walk_displacement_signal = self._walk_displacement_signal(center_x_span, center_dx, speed_std, lower_vis)
         upper_gait_support = upper_motion_energy if walk_displacement_signal else upper_motion_energy * 0.20
+        gait_translation_consistency = (
+            (1.0 if walk_displacement_signal else 0.0)
+            * max(0.0, min(1.0, center_path_efficiency))
+            * (1.0 - stillness)
+        )
+        occluded_upper_motion = upper_motion_energy * max(0.0, 0.45 - lower_vis_min) / 0.45
+        upright_motion_conflict = max(0.0, support_leg + straight_leg - 0.7) * (horizontal_energy + upper_motion_energy)
+        sit_lie_transition = (
+            max(0.0, -pose_height_delta) * 1.4
+            + max(0.0, torso_tilt_delta) / 90.0
+            + max(0.0, -knee_bend_delta) / 180.0
+            + lower_vis_std * 0.35
+        )
         row.update({
             'horizontal_motion_energy': horizontal_energy,
             'vertical_motion_energy': vertical_energy,
@@ -4008,6 +5859,10 @@ class VideoAnalysis:
             'body_translation_signal': 1.0 if body_translation_signal else 0.0,
             'weak_body_translation_signal': 1.0 if weak_body_translation_signal else 0.0,
             'walk_displacement_signal': 1.0 if walk_displacement_signal else 0.0,
+            'gait_translation_consistency': gait_translation_consistency,
+            'occluded_upper_motion_score': occluded_upper_motion,
+            'upright_motion_conflict_score': upright_motion_conflict,
+            'sit_lie_transition_score': sit_lie_transition,
             'gait_dynamic_score': (center_x_span + center_dx * 2.2 + upper_gait_support * 0.55) * (1.0 - stillness) + periodicity * 0.22 + knee_cycle * 0.16,
             'run_stride_score': (center_x_span + center_dx * 3.2 + speed_std * 2.0 + upper_gait_support * 0.45) / (stillness + 0.25),
             'sit_geometry_score': bent_leg * 1.6 + knee_bend * 1.2 + floor_prox * 0.35 + stillness * 0.55 - center_x_span * 0.9,
@@ -4040,7 +5895,8 @@ class VideoAnalysis:
         return row
 
     def _extract_unified_timeseries(self, video_path, input_source='upload', duration_hint=0,
-                                     target_fps_override=None, max_frames_override=None):
+                                     target_fps_override=None, max_frames_override=None,
+                                     yolo_imgsz_override=None):
         """Extract unified per-frame bbox + keypoint timeseries (all normalized coords).
 
         Returns dict with:
@@ -4080,7 +5936,7 @@ class VideoAnalysis:
         # FN-0003: allow callers (e.g. rf-dual single-pass) to override fps/max_frames
         target_fps = target_fps_override or (self._POSTURE_REALTIME_TARGET_FPS if _is_realtime else self._RF_TARGET_FPS)
         max_frames = max_frames_override if max_frames_override is not None else (int(4 * self._POSTURE_REALTIME_TARGET_FPS) if _is_realtime else 0)
-        yolo_imgsz = self._RF_REALTIME_YOLO_IMGSZ if _is_realtime else self._RF_YOLO_IMGSZ
+        yolo_imgsz = int(yolo_imgsz_override or (self._RF_REALTIME_YOLO_IMGSZ if _is_realtime else self._RF_YOLO_IMGSZ))
         step = max(int(round(orig_fps / target_fps)), 1)
         expected_sampled_frames = 0
         if total_frames_raw > 0:
@@ -4159,9 +6015,66 @@ class VideoAnalysis:
             _norm_h = max(vid_height, 1)
             _coord_sx = vid_width / _resize_to[0] if _resize_to else 1.0
             _coord_sy = vid_height / _resize_to[1] if _resize_to else 1.0
+            _max_vis_persons = max(1, int(os.environ.get('FALLAI_MAX_VIS_PERSONS', '5') or 5))
 
             local_timeseries = []
             local_detection_frames_vis = []
+            local_person_tracks = {}
+            active_tracks = {}
+            next_track_id = 1
+
+            def _box_iou(box_a, box_b):
+                ax1, ay1, ax2, ay2 = box_a
+                bx1, by1, bx2, by2 = box_b
+                ix1 = max(ax1, bx1)
+                iy1 = max(ay1, by1)
+                ix2 = min(ax2, bx2)
+                iy2 = min(ay2, by2)
+                iw = max(0.0, ix2 - ix1)
+                ih = max(0.0, iy2 - iy1)
+                inter = iw * ih
+                if inter <= 0:
+                    return 0.0
+                area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+                area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+                return inter / max(area_a + area_b - inter, 1e-9)
+
+            def _center_distance(a, b):
+                return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+            def _assign_chunk_tracks(candidates, sample_seq):
+                nonlocal next_track_id
+                assigned = set()
+                for candidate in candidates:
+                    best_tid = None
+                    best_score = -999.0
+                    for tid, track in active_tracks.items():
+                        if tid in assigned:
+                            continue
+                        stale = max(0, int(sample_seq) - int(track.get('last_seen_seq', sample_seq)))
+                        if stale > 3:
+                            continue
+                        iou = _box_iou(candidate['xyxy_orig'], track['xyxy_orig'])
+                        dist = _center_distance(candidate['center_norm'], track['center_norm'])
+                        if iou < 0.05 and dist > 0.22:
+                            continue
+                        score = iou - dist * 0.35 - stale * 0.04
+                        if score > best_score:
+                            best_score = score
+                            best_tid = tid
+                    if best_tid is None:
+                        best_tid = next_track_id
+                        next_track_id += 1
+                    candidate['track_id'] = int(best_tid)
+                    assigned.add(best_tid)
+                    active_tracks[best_tid] = {
+                        'xyxy_orig': candidate['xyxy_orig'],
+                        'center_norm': candidate['center_norm'],
+                        'last_seen_seq': int(sample_seq),
+                    }
+                for tid in list(active_tracks.keys()):
+                    if int(sample_seq) - int(active_tracks[tid].get('last_seen_seq', sample_seq)) > 3:
+                        active_tracks.pop(tid, None)
 
             for i, r in enumerate(batch_results):
                 fidx = frame_indices[i]
@@ -4217,26 +6130,85 @@ class VideoAnalysis:
 
                 local_timeseries.append(entry)
 
-                vis_dets = []
+                person_candidates = []
                 for bi2, b2 in enumerate(boxes):
                     if int(b2.cls.item()) != self._RF_PERSON_CLASS_ID:
                         continue
                     vx1, vy1, vx2, vy2 = b2.xyxy[0].tolist()
+                    ovx1, ovy1 = vx1 * _coord_sx, vy1 * _coord_sy
+                    ovx2, ovy2 = vx2 * _coord_sx, vy2 * _coord_sy
+                    person_candidates.append({
+                        'idx': bi2,
+                        'box': b2,
+                        'area': max(0.0, (vx2 - vx1) * (vy2 - vy1)),
+                        'xyxy_orig': (ovx1, ovy1, ovx2, ovy2),
+                        'center_norm': (((ovx1 + ovx2) / 2) / _norm_w, ((ovy1 + ovy2) / 2) / _norm_h),
+                    })
+                person_candidates.sort(key=lambda item: item.get('area', 0.0), reverse=True)
+                visible_candidates = person_candidates[:_max_vis_persons]
+                _assign_chunk_tracks(visible_candidates, i)
+                vis_dets = []
+                for person_rank, candidate in enumerate(visible_candidates):
+                    bi2 = int(candidate.get('idx', -1))
+                    b2 = candidate.get('box')
+                    if b2 is None or bi2 < 0:
+                        continue
+                    vx1, vy1, vx2, vy2 = b2.xyxy[0].tolist()
+                    track_id = int(candidate.get('track_id') or (person_rank + 1))
                     det_vis = {
                         'x1': round(vx1 * _coord_sx, 1), 'y1': round(vy1 * _coord_sy, 1),
                         'x2': round(vx2 * _coord_sx, 1), 'y2': round(vy2 * _coord_sy, 1),
                         'conf': round(float(b2.conf.item()), 3),
+                        'person_index': person_rank + 1,
+                        'track_id': track_id,
+                        'track_scope': 'analysis_chunk',
+                        'person_label': f'P{track_id}',
+                        'is_primary': bi2 == best_idx,
+                        'bbox_area': round(float(candidate.get('area', 0.0)) * _coord_sx * _coord_sy, 1),
+                    }
+                    ovx1, ovy1, ovx2, ovy2 = candidate.get('xyxy_orig') or (
+                        vx1 * _coord_sx,
+                        vy1 * _coord_sy,
+                        vx2 * _coord_sx,
+                        vy2 * _coord_sy,
+                    )
+                    pbw, pbh = max(0.0, ovx2 - ovx1), max(0.0, ovy2 - ovy1)
+                    person_entry = {
+                        'frame_idx': fidx,
+                        'time_sec': round(fidx / orig_fps, 4) if orig_fps > 0 else 0,
+                        'track_id': track_id,
+                        'person_index': person_rank + 1,
+                        'person_label': f'P{track_id}',
+                        'is_primary': bi2 == best_idx,
+                        'bbox': {
+                            'cx': ((ovx1 + ovx2) / 2) / _norm_w,
+                            'cy': ((ovy1 + ovy2) / 2) / _norm_h,
+                            'w': pbw / _norm_w,
+                            'h': pbh / _norm_h,
+                            'aspect_ratio': (pbw / _norm_w) / ((pbh / _norm_h) + 1e-9),
+                            'area': (pbw / _norm_w) * (pbh / _norm_h),
+                            'conf': float(b2.conf.item()),
+                        },
+                        'keypoints': None,
                     }
                     if kpts is not None and bi2 < len(kpts.data):
                         kp_raw = kpts.data[bi2].cpu().numpy()
                         kp_s = []
+                        kp_norm = []
                         for kp in kp_raw:
                             kp_s.append([
                                 round(float(kp[0]) * _coord_sx, 1),
                                 round(float(kp[1]) * _coord_sy, 1),
                                 round(float(kp[2]), 3),
                             ])
+                            kp_norm.append({
+                                'x': float(kp[0]) * _coord_sx / _norm_w,
+                                'y': float(kp[1]) * _coord_sy / _norm_h,
+                                'conf': float(kp[2]),
+                            })
                         det_vis['keypoints'] = kp_s
+                        person_entry['keypoints'] = kp_norm
+                    local_person_tracks.setdefault(str(track_id), []).append(person_entry)
                     vis_dets.append(det_vis)
                 if vis_dets:
                     local_detection_frames_vis.append({
@@ -4245,7 +6217,7 @@ class VideoAnalysis:
                         'detections': vis_dets,
                     })
 
-            return local_timeseries, local_detection_frames_vis
+            return local_timeseries, local_detection_frames_vis, local_person_tracks
 
         # FN-0021: webm fps correction — webm often reports 0 or 1000fps
         if _is_realtime and total_frames_raw > 0 and duration_hint > 0:
@@ -4272,7 +6244,11 @@ class VideoAnalysis:
             else:
                 _resize_to = (int(vid_width * 360 / max(vid_height, 1)), 360)
 
-        if total_frames_raw > 0 and step > 1:
+        force_seek_sampling = os.environ.get('RF_FORCE_SEEK_FRAME_SAMPLE', '0') == '1'
+        if force_seek_sampling and total_frames_raw > 0:
+            frames = _sample_video_frames_by_seek(step, max_frames)
+            _perf['frame_extract_force_seek'] = True
+        elif total_frames_raw > 0 and step > 1:
             target_indices = list(range(0, total_frames_raw, step))
             if max_frames > 0:
                 target_indices = target_indices[:max_frames]
@@ -4378,7 +6354,7 @@ class VideoAnalysis:
 
         # -- Build unified timeseries (normalized coordinates) --
         _t = _time.time()
-        timeseries, detection_frames_vis = _build_unified_timeseries(frame_indices, frame_images, batch_results)
+        timeseries, detection_frames_vis, person_timeseries = _build_unified_timeseries(frame_indices, frame_images, batch_results)
 
         _min_det = 1 if _is_realtime else 2
         retry_info = []
@@ -4399,6 +6375,7 @@ class VideoAnalysis:
 
             best_timeseries = timeseries
             best_detection_frames_vis = detection_frames_vis
+            best_person_timeseries = person_timeseries
             best_frames = frames
             for retry in retry_candidates:
                 retry_frames = _sample_video_frames(retry['step'], retry['max_frames'])
@@ -4413,23 +6390,26 @@ class VideoAnalysis:
                     imgsz=retry['imgsz'],
                     device=self._get_yolo_device()
                 )
-                retry_timeseries, retry_detection_frames_vis = _build_unified_timeseries(retry_indices, retry_images, retry_results)
+                retry_timeseries, retry_detection_frames_vis, retry_person_timeseries = _build_unified_timeseries(retry_indices, retry_images, retry_results)
                 retry_info.append({
                     'conf': retry['conf'],
                     'imgsz': retry['imgsz'],
                     'step': retry['step'],
                     'sampled_frames': len(retry_frames),
                     'detected_frames': len(retry_timeseries),
+                    'tracked_persons': len(retry_person_timeseries),
                 })
                 if len(retry_timeseries) > len(best_timeseries):
                     best_timeseries = retry_timeseries
                     best_detection_frames_vis = retry_detection_frames_vis
+                    best_person_timeseries = retry_person_timeseries
                     best_frames = retry_frames
                 if len(best_timeseries) >= _min_det:
                     break
 
             timeseries = best_timeseries
             detection_frames_vis = best_detection_frames_vis
+            person_timeseries = best_person_timeseries
             frames = best_frames
             frame_indices = [fidx for fidx, _ in frames]
 
@@ -4448,18 +6428,116 @@ class VideoAnalysis:
                 'total_frames': total_frames_raw,
             },
             'detection_frames': detection_frames_vis,
+            'person_timeseries': person_timeseries,
             'perf': _perf,
             'raw_frames': frames,
             'total_sampled': len(frames),
             'frame_sampling': {
                 'target_fps': target_fps,
                 'step': step,
+                'yolo_imgsz': yolo_imgsz,
                 'expected_sampled_frames': expected_sampled_frames,
                 'actual_sampled_frames': len(frames),
                 'last_sampled_frame': last_sampled_frame,
                 'total_frames': total_frames_raw,
             },
             'decode_warning': decode_warning,
+        }
+
+    def _slice_unified_timeseries_result(self, ts_result, window):
+        """Reuse a full-video unified timeseries for one overlapped upload window."""
+        source = ts_result or {}
+        start_sec = float((window or {}).get('start_sec', 0.0) or 0.0)
+        end_sec = float((window or {}).get('end_sec', start_sec) or start_sec)
+        duration_sec = max(0.0, end_sec - start_sec)
+        eps = 1e-4
+        vid_meta = dict(source.get('vid_meta') or {})
+        fps = float(vid_meta.get('fps', 0.0) or 0.0)
+        if fps <= 0:
+            fps = 30.0
+
+        def _inside_time(value):
+            t = float(value or 0.0)
+            return t + eps >= start_sec and t <= end_sec + eps
+
+        sliced_timeseries = []
+        for entry in list(source.get('timeseries') or []):
+            source_t = float(entry.get('time_sec', 0.0) or 0.0)
+            if not _inside_time(source_t):
+                continue
+            cloned = copy.deepcopy(entry)
+            cloned['source_time_sec'] = round(source_t, 4)
+            cloned['time_sec'] = round(max(0.0, source_t - start_sec), 4)
+            sliced_timeseries.append(cloned)
+
+        sliced_detection_frames = []
+        for frame in list(source.get('detection_frames') or []):
+            source_t = float(frame.get('time_sec', 0.0) or 0.0)
+            if not _inside_time(source_t):
+                continue
+            cloned = copy.deepcopy(frame)
+            cloned['source_time_sec'] = round(source_t, 4)
+            cloned['time_sec'] = round(max(0.0, source_t - start_sec), 4)
+            sliced_detection_frames.append(cloned)
+
+        sliced_person_timeseries = {}
+        for track_id, entries in (source.get('person_timeseries') or {}).items():
+            sliced_track = []
+            for entry in list(entries or []):
+                source_t = float(entry.get('time_sec', 0.0) or 0.0)
+                if not _inside_time(source_t):
+                    continue
+                cloned = copy.deepcopy(entry)
+                cloned['source_time_sec'] = round(source_t, 4)
+                cloned['time_sec'] = round(max(0.0, source_t - start_sec), 4)
+                sliced_track.append(cloned)
+            if sliced_track:
+                sliced_person_timeseries[str(track_id)] = sliced_track
+
+        sliced_raw_frames = []
+        for frame_idx, frame in list(source.get('raw_frames') or []):
+            try:
+                source_t = float(frame_idx) / fps if fps > 0 else 0.0
+            except Exception:
+                source_t = 0.0
+            if _inside_time(source_t):
+                sliced_raw_frames.append((frame_idx, frame))
+
+        source_sampling = dict(source.get('frame_sampling') or {})
+        target_fps = float(source_sampling.get('target_fps', 0.0) or 0.0)
+        expected = int(math.ceil(duration_sec * target_fps)) + 1 if target_fps > 0 else len(sliced_raw_frames)
+        window_meta = dict(vid_meta)
+        window_meta.update({
+            'duration': round(duration_sec, 4),
+            'source_duration': vid_meta.get('duration', 0.0),
+            'total_frames': max(len(sliced_raw_frames), int(round(duration_sec * fps)) if fps > 0 else 0),
+        })
+        return {
+            'timeseries': sliced_timeseries,
+            'vid_meta': window_meta,
+            'detection_frames': sliced_detection_frames,
+            'person_timeseries': sliced_person_timeseries,
+            'perf': {
+                'shared_timeseries_reuse': True,
+                'shared_window_slice': round(duration_sec, 3),
+            },
+            'raw_frames': sliced_raw_frames,
+            'total_sampled': len(sliced_raw_frames) or len(sliced_timeseries),
+            'frame_sampling': {
+                **source_sampling,
+                'source': 'shared_upload_timeseries_window',
+                'window': {
+                    'start_sec': round(start_sec, 3),
+                    'end_sec': round(end_sec, 3),
+                    'duration_sec': round(duration_sec, 3),
+                    'label': (window or {}).get('label', ''),
+                },
+                'expected_sampled_frames': expected,
+                'actual_sampled_frames': len(sliced_raw_frames),
+                'detected_frames': len(sliced_timeseries),
+                'source_actual_sampled_frames': source_sampling.get('actual_sampled_frames', source.get('total_sampled', 0)),
+            },
+            'decode_warning': source.get('decode_warning'),
         }
 
     def _build_xg_feature_windows(self, timeseries, vid_meta, window_sec=1.0, stride_sec=0.5):
@@ -4603,6 +6681,24 @@ class VideoAnalysis:
             dx_list = [cxs[i+1] - cxs[i] for i in range(len(cxs)-1)]
             center_dx_abs_mean = float(np.mean(np.abs(dx_list))) if dx_list else 0.0
             center_x_span = float(np.max(cxs) - np.min(cxs)) if cxs else 0.0
+            center_x_net_displacement = float(cxs[-1] - cxs[0]) if len(cxs) >= 2 else 0.0
+            center_y_net_displacement = float(cys[-1] - cys[0]) if len(cys) >= 2 else 0.0
+            center_path_distance = float(sum(abs(d) for d in dx_list)) if dx_list else 0.0
+            center_path_efficiency = abs(center_x_net_displacement) / (center_path_distance + 1e-9) if center_path_distance > 0 else 0.0
+
+            def _direction_change_ratio(deltas, eps=0.003):
+                signs = [1 if d > eps else -1 if d < -eps else 0 for d in deltas]
+                signs = [s for s in signs if s != 0]
+                if len(signs) < 2:
+                    return 0.0
+                changes = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
+                return float(changes) / max(len(signs) - 1, 1)
+
+            center_x_direction_change_ratio = _direction_change_ratio(dx_list)
+            center_y_direction_change_ratio = _direction_change_ratio(dy_list)
+            h_deltas = [hs[i+1] - hs[i] for i in range(len(hs)-1)]
+            height_change_abs_mean = float(np.mean(np.abs(h_deltas))) if h_deltas else 0.0
+            height_change_std = float(np.std(h_deltas)) if len(h_deltas) >= 2 else 0.0
             vert_sum = sum(abs(d) for d in dy_list) if dy_list else 0.0
             horiz_sum = sum(abs(d) for d in dx_list) if dx_list else 0.0
             vh_ratio = vert_sum / (horiz_sum + 1e-9) if horiz_sum > 0 else vert_sum
@@ -4637,6 +6733,7 @@ class VideoAnalysis:
             shoulder_center_xs, shoulder_center_ys = [], []
             pose_vecs = []
             upper_motions = []
+            lower_body_visibility_flags = []
             lower_body_visible_frames = 0
             straight_leg_frames = 0
             support_leg_frames = 0
@@ -4644,7 +6741,9 @@ class VideoAnalysis:
             for f in w_frames:
                 kps = f.get('keypoints')
                 if kps is None or len(kps) < 17:
+                    lower_body_visibility_flags.append(0.0)
                     continue
+                frame_lower_visible = 0.0
                 ls, rs = kps[5], kps[6]
                 lh, rh = kps[11], kps[12]
                 lk, rk = kps[13], kps[14]
@@ -4700,6 +6799,8 @@ class VideoAnalysis:
                         support_leg_frames += 1
                     if knee_angle <= 125.0:
                         bent_leg_frames += 1
+                    frame_lower_visible = 1.0
+                lower_body_visibility_flags.append(frame_lower_visible)
 
                 valid_xs = [kps[j]['x'] for j in range(17) if _kp_ok(kps[j])]
                 if len(valid_xs) >= 3:
@@ -4786,6 +6887,8 @@ class VideoAnalysis:
             pose_sp_mean = float(np.mean(spreads)) if spreads else 0.0
             pose_sp_max = float(np.max(spreads)) if spreads else 0.0
             lower_body_visibility = lower_body_visible_frames / max(len(w_frames), 1)
+            lower_body_visibility_min = float(np.min(lower_body_visibility_flags)) if lower_body_visibility_flags else 0.0
+            lower_body_visibility_std = float(np.std(lower_body_visibility_flags)) if len(lower_body_visibility_flags) >= 2 else 0.0
             straight_leg_ratio = straight_leg_frames / max(lower_body_visible_frames, 1)
             support_leg_ratio = support_leg_frames / max(lower_body_visible_frames, 1)
             bent_leg_ratio = bent_leg_frames / max(lower_body_visible_frames, 1)
@@ -4828,6 +6931,9 @@ class VideoAnalysis:
             torso_width_std = float(np.std(torso_width_series)) if len(torso_width_series) >= 2 else 0.0
             shoulder_width_std = float(np.std(shoulder_widths)) if len(shoulder_widths) >= 2 else 0.0
             torso_tilt_std = float(np.std(tilts)) if len(tilts) >= 2 else 0.0
+            pose_height_delta = float(p_hrs[-1] - p_hrs[0]) if len(p_hrs) >= 2 else 0.0
+            torso_tilt_delta = float(tilts[-1] - tilts[0]) if len(tilts) >= 2 else 0.0
+            knee_bend_delta = float(knees[-1] - knees[0]) if len(knees) >= 2 else 0.0
 
             def _mean_abs_delta(vals):
                 if len(vals) < 2:
@@ -4964,6 +7070,13 @@ class VideoAnalysis:
                 'vert_horiz_ratio': vh_ratio,
                 'center_dx_abs_mean': center_dx_abs_mean,
                 'center_x_span': center_x_span,
+                'center_x_net_displacement': center_x_net_displacement,
+                'center_y_net_displacement': center_y_net_displacement,
+                'center_x_direction_change_ratio': center_x_direction_change_ratio,
+                'center_y_direction_change_ratio': center_y_direction_change_ratio,
+                'center_path_efficiency': center_path_efficiency,
+                'height_change_abs_mean': height_change_abs_mean,
+                'height_change_std': height_change_std,
                 'max_down_speed': max_down,
                 'avg_conf': avg_conf,
                 'n_points': n_pts,
@@ -4976,6 +7089,8 @@ class VideoAnalysis:
                 'pose_knee_support_mean': pose_kb_support_mean,
                 'pose_knee_support_min': pose_kb_support_min,
                 'lower_body_visibility': lower_body_visibility,
+                'lower_body_visibility_min': lower_body_visibility_min,
+                'lower_body_visibility_std': lower_body_visibility_std,
                 'straight_leg_ratio': straight_leg_ratio,
                 'support_leg_ratio': support_leg_ratio,
                 'bent_leg_ratio': bent_leg_ratio,
@@ -5035,6 +7150,9 @@ class VideoAnalysis:
                 'torso_width_std': torso_width_std,
                 'shoulder_width_std': shoulder_width_std,
                 'torso_tilt_std': torso_tilt_std,
+                'pose_height_delta': pose_height_delta,
+                'torso_tilt_delta': torso_tilt_delta,
+                'knee_bend_delta': knee_bend_delta,
                 'upper_center_x_span': upper_center_x_span,
                 'upper_center_dx_abs_mean': upper_center_dx_abs_mean,
                 'upper_center_y_std': upper_center_y_std,
@@ -5051,6 +7169,13 @@ class VideoAnalysis:
             if _mean_valid < 3.0 and feat['max_down_speed'] < 0.08 and feat['center_dy'] < 0.03:
                 feat['stillness'] = 1.0
                 feat['center_dy'] = 0.0
+                feat['center_x_net_displacement'] = 0.0
+                feat['center_y_net_displacement'] = 0.0
+                feat['center_x_direction_change_ratio'] = 0.0
+                feat['center_y_direction_change_ratio'] = 0.0
+                feat['center_path_efficiency'] = 0.0
+                feat['height_change_abs_mean'] = 0.0
+                feat['height_change_std'] = 0.0
                 feat['max_down_speed'] = 0.0
                 feat['speed_std'] = 0.0
                 feat['descent_duration'] = 0.0
@@ -5063,6 +7188,13 @@ class VideoAnalysis:
                 feat['shoulder_center_x_span'] = 0.0
                 feat['shoulder_center_dx_abs_mean'] = 0.0
                 feat['shoulder_center_y_std'] = 0.0
+                feat['body_translation_signal'] = 0.0
+                feat['weak_body_translation_signal'] = 0.0
+                feat['walk_displacement_signal'] = 0.0
+                feat['gait_translation_consistency'] = 0.0
+                feat['occluded_upper_motion_score'] = 0.0
+                feat['upright_motion_conflict_score'] = 0.0
+                feat['sit_lie_transition_score'] = 0.0
                 feat['pose_change_mean'] = 0.0
                 feat['pose_change_max'] = 0.0
                 feat['pose_descent_mean'] = 0.0
@@ -6343,7 +8475,8 @@ class VideoAnalysis:
         runtime_key = str(result.get('runtime_key', '') or '')
         risk_score = self._metadata_to_number(result.get('risk_score', 0.0), 0.0)
         fall_detected = bool(result.get('fall_detected', False))
-        threshold = float(self._rf_confirm_threshold())
+        runtime_inference = result.get('runtime_inference', {}) or {}
+        threshold = self._metadata_to_number(runtime_inference.get('effective_threshold'), self._rf_confirm_threshold())
         if runtime_key == 'xg-dual':
             posture_class_label = self._xg_posture_class_label()
             xg_threshold = float(self._xg_fall_thresholds().get('confirm', self._XG_FALL_THRESHOLD))
@@ -6600,21 +8733,24 @@ class VideoAnalysis:
         rf_meta = self._rf_runtime_meta()
         rf_fall_v2_summary = self._rf_fall_v2_summary()
         rf_fall_v2_ready = self._rf_fall_v2_available()
-        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
-        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_fall_v2_raw_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_thresholds = self._rf_fall_v2_thresholds(summary=rf_fall_v2_summary)
+        rf_fall_v2_confirm = float(rf_fall_v2_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold())
         rf_fall_v2_metrics = (
             (rf_fall_v2_summary.get('operational_validation', {}) or {})
             or (rf_fall_v2_summary.get('validation', {}) or {})
-            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
-            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('confirm', {}) or {})
         )
         rf_feature_count = int(rf_fall_v2_summary.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))
         rf_training_samples = int(rf_fall_v2_summary.get('training_samples', rf_meta.get('training_samples', 0)) or 0)
         xg_posture_summary = self._xg_posture_summary()
         posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_algorithm = str(xg_posture_summary.get('active_algorithm') or xg_posture_summary.get('algorithm') or 'tree_model')
         posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_sequence_cv = xg_posture_summary.get('sequence_group_cv', {}) or {}
         posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
-        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_cv_f1 = float(posture_sequence_cv.get('f1_macro', posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0))) or 0.0)
         posture_windows = int(
             xg_posture_summary.get('n_windows', 0)
             or xg_posture_summary.get('training_samples', 0)
@@ -6634,7 +8770,7 @@ class VideoAnalysis:
         if selected_runtime == 'rf-dual-runtime':
             runtime_label = 'RF-Dual 운영 파이프라인 (RF Fall + XG-Posture)'
             runtime_key = 'rf-dual-runtime'
-            runtime_note = f"현재 공식 운영 모델입니다. RF-Fall v2 {rf_feature_count}개 특징 낙상 판정({rf_training_samples}건 학습, threshold {round(rf_fall_v2_confirm * 100, 1)}%, F1 {round(float(rf_fall_v2_metrics.get('f1', 0.0) or 0.0) * 100, 1)}%)과 XG-Posture {posture_class_label}({posture_windows}건, {posture_feature_count} features, Group CV macro F1 {round(posture_cv_f1 * 100, 1)}%)가 함께 동작합니다."
+            runtime_note = f"현재 공식 운영 모델입니다. RF-Fall v2 {rf_feature_count}개 특징 낙상 판정({rf_training_samples}건 학습, threshold {round(rf_fall_v2_confirm * 100, 1)}%, F1 {round(float(rf_fall_v2_metrics.get('f1', 0.0) or 0.0) * 100, 1)}%)과 XG-Posture {posture_class_label}({posture_windows}건, {posture_feature_count} features, sequence CV macro F1 {round(posture_cv_f1 * 100, 1)}%)가 함께 동작합니다."
         elif selected_runtime == 'heuristic-fallback':
             runtime_label = '규칙·메타데이터 기반 fallback 분석'
             runtime_key = 'heuristic-fallback'
@@ -6662,7 +8798,7 @@ class VideoAnalysis:
                 {
                     'title': '자세 설명 레이어',
                     'status': 'ready' if xg_posture_ready else 'training-needed',
-                    'active_label': f"XG-Posture {posture_class_label} / {posture_windows} rows / {posture_feature_count} features / Group F1 {round(posture_cv_f1 * 100, 1)}%",
+                    'active_label': f"XG-Posture {posture_class_label} / {posture_windows} rows / {posture_feature_count} features / sequence F1 {round(posture_cv_f1 * 100, 1)}%",
                     'summary_exists': bool(xg_posture_summary),
                     'model_exists': xg_posture_ready,
                     'sample_count': posture_windows,
@@ -6685,21 +8821,23 @@ class VideoAnalysis:
         rf_summary = self._rf_project_summary()
         rf_metrics = (rf_summary.get('best_metrics', {}) or {})
         rf_fall_v2_summary = self._rf_fall_v2_summary()
-        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_raw_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_thresholds = self._rf_fall_v2_thresholds(summary=rf_fall_v2_summary)
         rf_fall_v2_metrics = (
             (rf_fall_v2_summary.get('operational_validation', {}) or {})
             or (rf_fall_v2_summary.get('validation', {}) or {})
-            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
-            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('confirm', {}) or {})
             or rf_metrics
         )
-        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_fall_v2_confirm = float(rf_fall_v2_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold())
         rf_feature_count = int(rf_fall_v2_summary.get('feature_count', len(self._RF_FEATURE_COLUMNS)) or len(self._RF_FEATURE_COLUMNS))
         xg_posture_summary = self._xg_posture_summary()
         posture_class_label = self._xg_posture_class_label(xg_posture_summary)
         posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_sequence_cv = xg_posture_summary.get('sequence_group_cv', {}) or {}
         posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
-        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_cv_f1 = float(posture_sequence_cv.get('f1_macro', posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0))) or 0.0)
         posture_windows = int(
             xg_posture_summary.get('n_windows', 0)
             or xg_posture_summary.get('training_samples', 0)
@@ -6726,7 +8864,7 @@ class VideoAnalysis:
             items.append({
                 'severity': 'info',
                 'title': 'XG-Posture 자세 레이어가 운영 설명에 사용됩니다.',
-                'description': f"{posture_class_label} 자세 분류기 기준 {posture_windows}건, {posture_feature_count}개 feature, Group CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%입니다.",
+                'description': f"{posture_class_label} 자세 분류기 기준 {posture_windows}건, {posture_feature_count}개 feature, sequence CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%입니다.",
                 'action': 'lie / sit / fall 경계 사례가 늘어나면 XG-Posture 재학습 후 summary를 다시 반영하세요.',
             })
         else:
@@ -6768,7 +8906,7 @@ class VideoAnalysis:
             })
         return {
             'status': overall_status,
-            'headline': '현재 분석 품질은 RF-Dual 운영 모델, XG-Posture 설명 레이어, 그리고 4초 무삭제 실시간 청크 정책에 의해 좌우됩니다.',
+            'headline': '현재 분석 품질은 RF-Dual 운영 모델, XG-Posture 설명 레이어, 그리고 4초 창/2초 stride 중첩 무삭제 청크 정책에 의해 좌우됩니다.',
             'items': items,
         }
 
@@ -6821,6 +8959,22 @@ class VideoAnalysis:
             # FN-0014 Stage A: rf-pose deprecated — UI에서 숨김
             # config에서 직접 model_type=rf-pose 지정 시에만 사용 가능
         ]
+        try:
+            for item in self.model_registry().get('selectable_options', []) or []:
+                key = str(item.get('key') or '').strip()
+                if not key or key == 'rf-dual':
+                    continue
+                options.append({
+                    'key': key,
+                    'label': item.get('label') or key,
+                    'description': item.get('description') or '',
+                    'available': bool(item.get('available', True)),
+                    'family': item.get('family') or '',
+                    'source': item.get('source') or '',
+                    'model_id': item.get('model_id') or '',
+                })
+        except Exception:
+            pass
         default_key = 'rf-dual'
         return {
             'default': default_key,
@@ -6828,7 +8982,17 @@ class VideoAnalysis:
         }
 
     def _model_option_label(self, key):
-        key = str(key or 'rf-dual').strip().lower()
+        raw_key = str(key or 'rf-dual').strip()
+        if raw_key.lower().startswith('registry:'):
+            model_id = raw_key.split(':', 1)[1].strip()
+            try:
+                item = next((it for it in self.model_registry().get('items', []) if str(it.get('model_id') or '') == model_id), None)
+                if item:
+                    return item.get('option_label') or item.get('label') or raw_key
+            except Exception:
+                pass
+            return raw_key
+        key = raw_key.lower()
         labels = {
             'person-feature': 'XGBoost v2 파이프라인',
             'rf-pipeline': 'RF 보조 파이프라인',
@@ -7735,6 +9899,471 @@ class VideoAnalysis:
             'metadata': ['촬영 위치', '카메라 각도', 'fps', '해상도', '환경 조건'],
         }
 
+    def _normalize_training_target_model(self, target_model='rf-dual'):
+        value = str(target_model or 'rf-dual').strip().lower().replace('_', '-')
+        aliases = {
+            'all': 'rf-dual',
+            'full': 'rf-dual',
+            'rf': 'rf-fall-v2',
+            'fall': 'rf-fall-v2',
+            'rf-fall': 'rf-fall-v2',
+            'posture': 'xg-posture',
+            'xg': 'xg-posture',
+            'xgboost-posture': 'xg-posture',
+            'aihub82': 'facial-aihub82',
+            'facial': 'facial-aihub82',
+            'face': 'facial-aihub82',
+            'emotion': 'facial-aihub82',
+            'aihub173': 'driver-aihub173',
+            'driver': 'driver-aihub173',
+            'driver-state': 'driver-aihub173',
+        }
+        value = aliases.get(value, value)
+        allowed = {'rf-dual', 'rf-fall-v2', 'xg-posture', 'facial-aihub82', 'driver-aihub173'}
+        return value if value in allowed else 'rf-dual'
+
+    def _training_target_options(self):
+        return [
+            {
+                'key': 'rf-dual',
+                'label': 'RF-Dual 통합',
+                'job_type': 'full',
+                'description': '낙상 Y/N과 행동 라벨을 함께 반영하는 대시보드 통합 학습입니다.',
+            },
+            {
+                'key': 'rf-fall-v2',
+                'label': 'RF-Fall v2',
+                'job_type': 'rf',
+                'description': '낙상/비낙상 이진 분류와 occlusion-aware RF 모델 보강 자료입니다.',
+            },
+            {
+                'key': 'xg-posture',
+                'label': 'XG-Posture',
+                'job_type': 'posture',
+                'description': 'stand/walk/run/sit/lie 행동 분류 모델 보강 자료입니다.',
+            },
+            {
+                'key': 'facial-aihub82',
+                'label': 'AI-Hub 82 표정',
+                'job_type': 'aihub82',
+                'description': '7-class 한국인 표정 보조 모델 자료입니다. 운영 승격은 연속 학습 감독기가 성능 개선 시에만 처리합니다.',
+            },
+            {
+                'key': 'driver-aihub173',
+                'label': 'AI-Hub 173 상태',
+                'job_type': 'aihub173',
+                'description': '졸림/하품/통화/흡연 등 운전자 상태 보조 모델 자료입니다.',
+            },
+        ]
+
+    def _summary_metric(self, summary, *keys, default=0.0):
+        sources = [
+            summary or {},
+            (summary or {}).get('best_metrics', {}) or {},
+            (summary or {}).get('sequence_group_cv', {}) or {},
+            (summary or {}).get('group_cv', {}) or {},
+            (summary or {}).get('validation', {}) or {},
+            ((summary or {}).get('thresholds', {}) or {}).get('confirm', {}) or {},
+            ((summary or {}).get('thresholds', {}) or {}).get('best_f1', {}) or {},
+        ]
+        for key in keys:
+            for source in sources:
+                try:
+                    value = source.get(key)
+                except Exception:
+                    value = None
+                if value is not None:
+                    try:
+                        return float(value)
+                    except Exception:
+                        pass
+        return float(default or 0.0)
+
+    def _parse_training_version_label(self, label):
+        raw = os.path.basename(str(label or '').strip().rstrip('/'))
+        match = re.match(r'^(\d+)_([A-Za-z0-9_.-]+?)(?:_\d{8}_\d{6})?$', raw)
+        if not match:
+            return {
+                'label': raw,
+                'index': None,
+                'name': raw,
+                'text': raw or '-',
+            }
+        idx = int(match.group(1))
+        name = match.group(2).replace('_', ' ')
+        return {
+            'label': raw,
+            'index': idx,
+            'name': name,
+            'text': f"#{idx:04d} {name}",
+        }
+
+    def _extract_version_badge(self, *values):
+        for value in values:
+            text = str(value or '').strip()
+            if not text:
+                continue
+            match = re.search(r'(?:^|[^A-Za-z0-9])v\s*([0-9]{8,20})(?:[^A-Za-z0-9]|$)', text, re.IGNORECASE)
+            if match:
+                return f"v{match.group(1)}"
+            match = re.search(r'(?:^|[^A-Za-z0-9])v\s*([0-9]{1,4})(?:[^A-Za-z0-9]|$)', text, re.IGNORECASE)
+            if match:
+                return f"v{int(match.group(1))}"
+            match = re.search(r'(?:^|[^A-Za-z0-9])cycle\s*0*([1-9][0-9]{0,5})(?:[^0-9]|$)', text, re.IGNORECASE)
+            if match:
+                return f"v{int(match.group(1))}"
+            match = re.match(r'^0*([1-9][0-9]{0,3})_', os.path.basename(text))
+            if match:
+                return f"v{int(match.group(1))}"
+        return ''
+
+    def _version_badge_from_info(self, info):
+        info = info or {}
+        direct = str(info.get('version_badge') or '').strip()
+        if direct:
+            return direct
+        idx = info.get('version_index')
+        if idx is None:
+            idx = info.get('index')
+        try:
+            if idx is not None:
+                return f"v{int(idx)}"
+        except Exception:
+            pass
+        return self._extract_version_badge(info.get('version_label'), info.get('label'), info.get('version_text'), info.get('text'))
+
+    def _attach_model_version_badge(self, info, fallback_name=''):
+        info = dict(info or {})
+        badge = self._version_badge_from_info(info) or self._extract_version_badge(fallback_name)
+        if not badge and str(fallback_name or '').strip().lower() in ('xg-posture',):
+            badge = 'v1'
+        info['version_badge'] = badge
+        if badge:
+            info['training_run_label'] = f"active {badge}"
+        else:
+            info['training_run_label'] = ''
+        return info
+
+    def _summary_version_info(self, summary=None, model_path='', fallback_name=''):
+        summary = summary or {}
+        explicit = str(summary.get('model_version') or summary.get('version_badge') or summary.get('version') or summary.get('run_id') or '').strip()
+        if explicit:
+            return self._attach_model_version_badge({
+                'version_badge': str(summary.get('version_badge') or '').strip(),
+                'version_label': explicit,
+                'version_index': None,
+                'version_name': explicit,
+                'version_text': explicit,
+                'version_source': 'summary',
+            }, fallback_name)
+        output_model = str(summary.get('output_model') or '').strip()
+        if output_model:
+            label = os.path.basename(os.path.dirname(output_model))
+            parsed = self._parse_training_version_label(label)
+            if parsed.get('label'):
+                return self._attach_model_version_badge({
+                    'version_label': parsed.get('label'),
+                    'version_index': parsed.get('index'),
+                    'version_name': parsed.get('name'),
+                    'version_text': parsed.get('text'),
+                    'version_source': 'output_model',
+                }, fallback_name)
+        model_type = str(summary.get('model_type') or summary.get('active_algorithm') or summary.get('algorithm') or fallback_name or '').strip()
+        stamp = str(summary.get('updated_at') or summary.get('trained_at') or summary.get('created_at') or '').strip()
+        if model_type and stamp:
+            return self._attach_model_version_badge({
+                'version_label': f"{model_type}@{stamp}",
+                'version_index': None,
+                'version_name': model_type,
+                'version_text': f"{model_type} · {stamp}",
+                'version_source': 'summary_timestamp',
+            }, fallback_name)
+        if model_path:
+            try:
+                mtime = datetime.datetime.fromtimestamp(os.path.getmtime(model_path)).strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                mtime = ''
+            name = os.path.basename(model_path)
+            text = f"{name} · {mtime}" if mtime else name
+            return self._attach_model_version_badge({
+                'version_label': name,
+                'version_index': None,
+                'version_name': name,
+                'version_text': text,
+                'version_source': 'model_file',
+            }, fallback_name)
+        return self._attach_model_version_badge({
+            'version_label': '',
+            'version_index': None,
+            'version_name': '',
+            'version_text': '-',
+            'version_source': '',
+        }, fallback_name)
+
+    def _continuous_training_version_summary(self, status):
+        status = status or {}
+        candidate = status.get('candidate_version') or {}
+        active = status.get('active_version') or {}
+        candidate_badge = self._version_badge_from_info(candidate)
+        active_badge = self._version_badge_from_info(active)
+        stage = str(status.get('stage') or status.get('status') or '').strip()
+        if candidate_badge:
+            if stage == 'running':
+                current = f"학습 중 {candidate_badge}"
+            elif stage in ('completed', 'already-running'):
+                current = f"후보 {candidate_badge}"
+            else:
+                current = f"후보 {candidate_badge}"
+        else:
+            current = ''
+        return {
+            'candidate_version_badge': candidate_badge,
+            'active_version_badge': active_badge,
+            'current_training_badge': current,
+        }
+
+    def _dashboard_rf_training_summary_from_job(self, job):
+        job = job or {}
+        result = job.get('result') if isinstance(job.get('result'), dict) else {}
+        summary = result.get('rf_pipeline_training') if isinstance(result.get('rf_pipeline_training'), dict) else {}
+        if not summary:
+            for step in job.get('steps') or []:
+                if str(step.get('name') or '') != 'rf_pipeline':
+                    continue
+                step_result = step.get('result') if isinstance(step.get('result'), dict) else {}
+                candidate = step_result.get('summary') if isinstance(step_result.get('summary'), dict) else {}
+                if candidate:
+                    summary = candidate
+                    break
+        if not summary:
+            return {}
+
+        cv = summary.get('cv') if isinstance(summary.get('cv'), dict) else {}
+        intake = job.get('intake_summary') if isinstance(job.get('intake_summary'), dict) else {}
+        class_distribution = summary.get('class_distribution') if isinstance(summary.get('class_distribution'), dict) else {}
+        if not class_distribution:
+            class_distribution = {key: int(intake.get(key, 0) or 0) for key in ('Y', 'N')}
+
+        dashboard_summary = dict(summary)
+        dashboard_summary.update({
+            'training_samples': int(summary.get('training_samples', 0) or intake.get('total', 0) or 0),
+            'class_distribution': class_distribution,
+            'feature_count': int(summary.get('feature_count', 0) or len(summary.get('features') or []) or len(self._RF_FEATURE_COLUMNS)),
+            'accuracy': self._finite_float(cv.get('accuracy'), self._finite_float(summary.get('accuracy'), 0.0)),
+            'precision': self._finite_float(cv.get('precision'), self._finite_float(summary.get('precision'), 0.0)),
+            'recall': self._finite_float(cv.get('recall'), self._finite_float(summary.get('recall'), 0.0)),
+            'f1': self._finite_float(cv.get('f1'), self._finite_float(summary.get('f1'), 0.0)),
+            'roc_auc': self._finite_float(cv.get('roc_auc'), self._finite_float(summary.get('roc_auc'), 0.0)),
+            'model_version': str(job.get('version_badge') or summary.get('model_version') or '').strip(),
+            'updated_at': job.get('applied_at') or job.get('updated_at') or summary.get('updated_at') or '',
+            'ready': bool(summary.get('ready', True)),
+            'source': 'dashboard-applied-rf-job',
+            'applied_job_id': job.get('job_id') or '',
+            'applied_at': job.get('applied_at') or '',
+        })
+        return dashboard_summary
+
+    def _latest_applied_dashboard_rf_job(self, exclude_job_id=''):
+        exclude_job_id = str(exclude_job_id or '').strip()
+        candidates = []
+        try:
+            for name in os.listdir(self._training_jobs_dir()):
+                if not name.endswith('.json'):
+                    continue
+                path = os.path.join(self._training_jobs_dir(), name)
+                data = self._read_json(path, {}) or {}
+                if str(data.get('status') or '') != 'applied':
+                    continue
+                if exclude_job_id and str(data.get('job_id') or name[:-5]) == exclude_job_id:
+                    continue
+                target = self._normalize_training_target_model(data.get('target_model') or data.get('job_type') or '')
+                if target not in ('rf-dual', 'rf-fall-v2'):
+                    continue
+                summary = self._dashboard_rf_training_summary_from_job(data)
+                if not summary:
+                    continue
+                stamp = str(data.get('applied_at') or data.get('updated_at') or data.get('finished_at') or data.get('created_at') or '')
+                candidates.append((stamp, os.path.getmtime(path), data))
+        except Exception:
+            return {}
+        if not candidates:
+            return {}
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return candidates[0][2] or {}
+
+    def _dashboard_rf_job_f1(self, job):
+        summary = self._dashboard_rf_training_summary_from_job(job)
+        return self._finite_float(summary.get('f1'), 0.0) if summary else 0.0
+
+    def _latest_model_training_stats(self, rf_fall_v2_summary=None, xg_posture_summary=None):
+        rf_fall_v2_summary = rf_fall_v2_summary if rf_fall_v2_summary is not None else self._rf_fall_v2_summary()
+        xg_posture_summary = xg_posture_summary if xg_posture_summary is not None else self._xg_posture_summary()
+        facial82_summary = self._read_json(self._persistent_model_path('facial-state', 'aihub82_facial_emotion_summary.json'), default={}) or {}
+        driver173_summary = self._read_json(self._persistent_model_path('facial-state', 'aihub173_driver_state_summary.json'), default={}) or {}
+        occlusion_summary = self._read_json(self._xg_posture_occlusion_aux_summary_path(), default={}) or {}
+        continuous_aihub82 = self.continuous_training_status('aihub82')
+        continuous_aihub82_version = self._continuous_training_version_summary(continuous_aihub82)
+
+        def _count(summary):
+            if self._model_summary_is_emergency_recovery(summary):
+                return 0
+            return int(
+                summary.get('training_samples', 0)
+                or summary.get('n_windows', 0)
+                or (int(summary.get('train_rows', 0) or 0) + int(summary.get('val_rows', 0) or 0))
+                or sum((summary.get('class_distribution', {}) or {}).values())
+                or 0
+            )
+
+        def _metric(summary, *keys):
+            if self._model_summary_is_emergency_recovery(summary):
+                return None
+            return self._summary_metric(summary, *keys)
+
+        def _feature_count(summary, *keys):
+            if self._model_summary_is_emergency_recovery(summary):
+                return 0
+            for key in keys:
+                try:
+                    value = int(summary.get(key, 0) or 0)
+                except Exception:
+                    value = 0
+                if value:
+                    return value
+            return 0
+
+        rf_fall_v2_model_path = self._rf_fall_v2_model_path()
+        xg_posture_model_path = self._xg_posture_model_path()
+        occlusion_model_path = self._xg_posture_occlusion_aux_model_path()
+        facial82_model_path = self._facial_aihub82_model_path()
+        driver173_model_path = self._facial_driver_state_model_path()
+
+        rf_display_summary = rf_fall_v2_summary
+        rf_display_model_path = rf_fall_v2_model_path
+        rf_display_label = 'RF-Fall v2'
+        applied_rf_job = self._latest_applied_dashboard_rf_job()
+        applied_rf_summary = self._dashboard_rf_training_summary_from_job(applied_rf_job)
+        if applied_rf_summary:
+            active_f1 = self._finite_float(rf_fall_v2_summary.get('f1'), 0.0)
+            applied_f1 = self._finite_float(applied_rf_summary.get('f1'), 0.0)
+            if applied_f1 >= active_f1:
+                rf_display_summary = applied_rf_summary
+                rf_display_model_path = applied_rf_summary.get('model_path') or rf_fall_v2_model_path
+                rf_display_label = 'RF-Fall 운영 모델'
+
+        rf_version = self._summary_version_info(rf_display_summary, rf_display_model_path, rf_display_label)
+        if applied_rf_summary and rf_display_summary is applied_rf_summary:
+            badge = str(applied_rf_job.get('version_badge') or rf_version.get('version_badge') or '').strip()
+            if badge:
+                rf_version['version_badge'] = badge
+                rf_version['training_run_label'] = '운영 적용 ' + badge
+            metric_text = ''
+            if self._finite_float(rf_display_summary.get('f1'), 0.0) > 0:
+                metric_text = 'CV F1 {:.1f}%'.format(self._finite_float(rf_display_summary.get('f1'), 0.0) * 100.0)
+            rf_version['version_text'] = ' · '.join([
+                bit for bit in [metric_text, str(applied_rf_job.get('applied_at') or applied_rf_job.get('updated_at') or '').strip()]
+                if bit
+            ]) or rf_version.get('version_text') or '-'
+        xg_version = self._summary_version_info(xg_posture_summary, xg_posture_model_path, 'XG-Posture')
+        occlusion_version = self._summary_version_info(occlusion_summary, occlusion_model_path, 'XG-Posture 가림 보조')
+        facial82_version = self._summary_version_info(facial82_summary, facial82_model_path, 'AI-Hub 82')
+        driver173_version = self._summary_version_info(driver173_summary, driver173_model_path, 'AI-Hub 173')
+
+        stats = [
+            {
+                'key': 'rf-fall-v2',
+                'label': rf_display_label,
+                'sample_count': _count(rf_display_summary),
+                'feature_count': _feature_count(rf_display_summary, 'feature_count'),
+                'accuracy': _metric(rf_display_summary, 'accuracy'),
+                'precision': _metric(rf_display_summary, 'precision'),
+                'recall': _metric(rf_display_summary, 'recall'),
+                'f1': _metric(rf_display_summary, 'f1'),
+                'updated_at': rf_display_summary.get('created_at') or rf_display_summary.get('updated_at') or '',
+                'model_path': rf_display_model_path,
+                'ready': self._model_summary_ready(rf_display_summary),
+                'recovery_only': self._model_summary_is_emergency_recovery(rf_display_summary),
+                'summary_snapshot': rf_display_summary,
+                **rf_version,
+            },
+            {
+                'key': 'xg-posture',
+                'label': 'XG-Posture',
+                'sample_count': _count(xg_posture_summary),
+                'feature_count': _feature_count(xg_posture_summary, 'feature_count', 'n_features'),
+                'algorithm': xg_posture_summary.get('active_algorithm') or xg_posture_summary.get('algorithm') or '',
+                'accuracy': _metric(xg_posture_summary, 'accuracy'),
+                'macro_f1': _metric(xg_posture_summary, 'f1_macro', 'macro_f1'),
+                'updated_at': xg_posture_summary.get('updated_at') or xg_posture_summary.get('trained_at') or '',
+                'model_path': xg_posture_model_path,
+                'ready': self._model_summary_ready(xg_posture_summary),
+                'recovery_only': self._model_summary_is_emergency_recovery(xg_posture_summary),
+                'summary_snapshot': xg_posture_summary,
+                **xg_version,
+            },
+            {
+                'key': 'xg-posture-occlusion-aux',
+                'label': 'XG-Posture 가림 보조',
+                'sample_count': _count(occlusion_summary),
+                'feature_count': _feature_count(occlusion_summary, 'feature_count', 'n_features'),
+                'algorithm': occlusion_summary.get('active_algorithm') or occlusion_summary.get('algorithm') or '',
+                'accuracy': _metric(occlusion_summary, 'accuracy'),
+                'macro_f1': _metric(occlusion_summary, 'f1_macro', 'macro_f1'),
+                'updated_at': occlusion_summary.get('updated_at') or occlusion_summary.get('trained_at') or '',
+                'model_path': occlusion_model_path,
+                'ready': self._model_summary_ready(occlusion_summary),
+                'recovery_only': self._model_summary_is_emergency_recovery(occlusion_summary),
+                'summary_snapshot': occlusion_summary,
+                **occlusion_version,
+            },
+            {
+                'key': 'facial-aihub82',
+                'label': 'AI-Hub 82 표정',
+                'sample_count': _count(facial82_summary),
+                'feature_count': _feature_count(facial82_summary, 'feature_count'),
+                'accuracy': _metric(facial82_summary, 'accuracy'),
+                'macro_f1': _metric(facial82_summary, 'macro_f1', 'f1_macro'),
+                'updated_at': facial82_summary.get('updated_at') or facial82_summary.get('created_at') or '',
+                'model_path': facial82_model_path,
+                'continuous_training_version_text': continuous_aihub82.get('training_version_text') or '',
+                'continuous_training_stage': continuous_aihub82.get('stage') or '',
+                'ready': self._model_summary_ready(facial82_summary),
+                'recovery_only': self._model_summary_is_emergency_recovery(facial82_summary),
+                'summary_snapshot': facial82_summary,
+                **continuous_aihub82_version,
+                **facial82_version,
+            },
+            {
+                'key': 'driver-aihub173',
+                'label': 'AI-Hub 173 상태',
+                'sample_count': _count(driver173_summary),
+                'feature_count': _feature_count(driver173_summary, 'feature_count'),
+                'accuracy': _metric(driver173_summary, 'accuracy'),
+                'macro_f1': _metric(driver173_summary, 'macro_f1', 'f1_macro'),
+                'updated_at': driver173_summary.get('updated_at') or driver173_summary.get('created_at') or '',
+                'model_path': driver173_model_path,
+                'ready': self._model_summary_ready(driver173_summary),
+                'recovery_only': self._model_summary_is_emergency_recovery(driver173_summary),
+                'summary_snapshot': driver173_summary,
+                **driver173_version,
+            },
+        ]
+        for item in stats:
+            base_label = str(item.get('label') or '').strip()
+            item['base_label'] = base_label
+            version_bits = []
+            if item.get('recovery_only'):
+                version_bits.append('실모델 없음')
+            active_label = str(item.get('training_run_label') or '').strip()
+            running_label = str(item.get('current_training_badge') or '').strip()
+            if active_label:
+                version_bits.append(active_label)
+            if running_label and running_label not in version_bits:
+                version_bits.append(running_label)
+            if base_label and version_bits:
+                item['label'] = f"{base_label} · {' · '.join(version_bits)}"
+        return stats
+
     def _routing_checklist(self):
         return [
             '로그인 제거 또는 최소화',
@@ -7786,7 +10415,7 @@ class VideoAnalysis:
 
     def _intake_summary(self):
         root = self._training_dir()
-        summary = {'Y': 0, 'N': 0, 'total': 0, 'latest': [], 'by_date': {}, 'by_source': {'feedback': 0, 'manual': 0, 'other': 0}, 'since_last_train': 0}
+        summary = {'Y': 0, 'N': 0, 'total': 0, 'latest': [], 'by_date': {}, 'by_source': {'feedback': 0, 'manual': 0, 'other': 0}, 'by_target_model': {}, 'since_last_train': 0}
         latest = []
         # FN-20260406-0001: 마지막 RF-Pose 재학습 시각 로드
         rf_pose_summary = self._read_json(
@@ -7808,6 +10437,7 @@ class VideoAnalysis:
                     'label': label,
                     'uploaded_at': uploaded_at,
                     'note': meta.get('note', ''),
+                    'target_model': self._normalize_training_target_model(meta.get('target_model') or ((meta.get('metadata', {}) or {}).get('target_model')) or ((meta.get('metadata', {}) or {}).get('training_target_model')) or 'rf-dual'),
                 })
                 # 날짜별 통계
                 date_key = uploaded_at[:10] if len(uploaded_at) >= 10 else 'unknown'
@@ -7821,6 +10451,13 @@ class VideoAnalysis:
                     summary['by_source']['manual'] += 1
                 else:
                     summary['by_source']['other'] += 1
+                target_model = self._normalize_training_target_model(
+                    meta.get('target_model')
+                    or ((meta.get('metadata', {}) or {}).get('target_model'))
+                    or ((meta.get('metadata', {}) or {}).get('training_target_model'))
+                    or 'rf-dual'
+                )
+                summary['by_target_model'][target_model] = summary['by_target_model'].get(target_model, 0) + 1
                 # 마지막 재학습 이후 누적 건수
                 if last_train_at and uploaded_at > last_train_at:
                     since_last_train += 1
@@ -7828,6 +10465,7 @@ class VideoAnalysis:
         summary['latest'] = latest[:5]
         summary['since_last_train'] = since_last_train
         summary['last_train_at'] = last_train_at
+        summary['target_model_total'] = sum(summary.get('by_target_model', {}).values())
         # FN-0013: Posture-class intake 통계 + hard-case 통계
         posture_stats = {}
         posture_total = 0
@@ -7888,90 +10526,93 @@ class VideoAnalysis:
     def warmup_models(self, model_type='rf-dual'):
         """Pre-load realtime models so the first live chunk does not pay cold-start cost."""
         import time as _time
+        selection = self._resolve_runtime_model_selection(model_type)
+        previous_selection = getattr(self, '_runtime_model_selection', None)
+        self._runtime_model_selection = selection
+        model_type = str(selection.get('runtime_model_type') or model_type or 'rf-dual').strip().lower()
         _t = _time.time()
         loaded = []
         errors = []
         try:
-            yolo = self._get_rf_yolo_model()
-            loaded.append('yolo-pose')
             try:
-                import numpy as _np
-                blank = _np.zeros((self._RF_REALTIME_YOLO_IMGSZ, self._RF_REALTIME_YOLO_IMGSZ, 3), dtype=_np.uint8)
-                yolo.predict(
-                    blank,
-                    imgsz=self._RF_REALTIME_YOLO_IMGSZ,
-                    conf=self._RF_REALTIME_CONF_THRES,
-                    device=self._get_yolo_device(),
-                    verbose=False,
-                )
-                loaded.append('yolo-pose-infer')
-            except Exception as infer_e:
-                errors.append({'stage': 'yolo-pose-infer', 'message': str(infer_e)})
-        except Exception as e:
-            errors.append({'stage': 'yolo-pose', 'message': str(e)})
-        if model_type in ('rf-pose', 'auto', ''):
-            try:
-                if self._rf_pose_pipeline_available():
-                    self._get_rf_pose_model()
-                    loaded.append('rf-pose')
+                yolo = self._get_rf_yolo_model()
+                loaded.append('yolo-pose')
+                try:
+                    import numpy as _np
+                    blank = _np.zeros((self._RF_REALTIME_YOLO_IMGSZ, self._RF_REALTIME_YOLO_IMGSZ, 3), dtype=_np.uint8)
+                    yolo.predict(
+                        blank,
+                        imgsz=self._RF_REALTIME_YOLO_IMGSZ,
+                        conf=self._RF_REALTIME_CONF_THRES,
+                        device=self._get_yolo_device(),
+                        verbose=False,
+                    )
+                    loaded.append('yolo-pose-infer')
+                except Exception as infer_e:
+                    errors.append({'stage': 'yolo-pose-infer', 'message': str(infer_e)})
             except Exception as e:
-                errors.append({'stage': 'rf-pose', 'message': str(e)})
-        if model_type in ('rf-pipeline', 'rf-dual', 'auto', ''):
-            try:
-                if self._rf_pipeline_available():
-                    self._get_rf_model()
-                    loaded.append('rf-pipeline')
-            except Exception as e:
-                errors.append({'stage': 'rf-pipeline', 'message': str(e)})
-        if model_type in ('rf-dual', 'auto', ''):
-            try:
-                if self._rf_fall_v2_available():
-                    self._get_rf_fall_v2_model()
-                    loaded.append('rf-fall-v2')
-            except Exception as e:
-                errors.append({'stage': 'rf-fall-v2', 'message': str(e)})
-            try:
-                if self._xg_posture_available():
-                    self._get_xg_posture_model()
-                    loaded.append('xg-posture')
-            except Exception as e:
-                errors.append({'stage': 'xg-posture', 'message': str(e)})
-            # Warm the conditional lower-body occlusion helper before the first realtime chunk.
-            try:
-                if self._xg_posture_occlusion_aux_available():
-                    self._get_xg_posture_occlusion_aux_model()
-                    loaded.append('xg-posture-occlusion-aux')
-            except Exception as e:
-                errors.append({'stage': 'xg-posture-occlusion-aux', 'message': str(e)})
-            try:
-                if self._facial_aux_available():
-                    self._get_facial_cascade('haarcascade_eye.xml')
-                    self._get_facial_cascade('haarcascade_smile.xml')
-                    warm_emotion = os.environ.get('FACIAL_AUX_WARM_EMOTION', 'true').lower() not in ('0', 'false', 'no')
-                    warm_driver = os.environ.get('FACIAL_AUX_WARM_DRIVER', 'true').lower() not in ('0', 'false', 'no')
-                    if warm_emotion and self._get_facial_aihub82_model() is not None:
-                        loaded.append('facial-state-aihub82')
-                    elif warm_emotion and self._get_facial_emotion_session() is not None:
-                        loaded.append('facial-state-ferplus')
-                    else:
-                        loaded.append('facial-state-face-only')
-                    if warm_driver and self._get_facial_driver_state_model() is not None:
-                        loaded.append('facial-state-aihub173-driver')
-            except Exception as e:
-                errors.append({'stage': 'facial-state-aux', 'message': str(e)})
-        return {
-            'warmed_up': loaded,
-            'elapsed_ms': round((_time.time() - _t) * 1000),
-            'errors': errors,
-            'posture_occlusion_aux_available': self._xg_posture_occlusion_aux_available(),
-            'facial_state_aux_available': self._facial_aux_available(),
-            'facial_emotion_model_path': self._facial_emotion_model_path(),
-            'facial_aihub82_model_path': self._facial_aihub82_model_path(),
-            'facial_driver_state_model_path': self._facial_driver_state_model_path(),
-            'facial_aihub82_model_available': os.path.isfile(self._facial_aihub82_model_path()),
-            'facial_driver_state_model_available': os.path.isfile(self._facial_driver_state_model_path()),
-            'facial_emotion_model_available': os.path.isfile(self._facial_emotion_model_path()),
-        }
+                errors.append({'stage': 'yolo-pose', 'message': str(e)})
+            if model_type in ('rf-pose', 'auto', ''):
+                try:
+                    if self._rf_pose_pipeline_available():
+                        self._get_rf_pose_model()
+                        loaded.append('rf-pose')
+                except Exception as e:
+                    errors.append({'stage': 'rf-pose', 'message': str(e)})
+            if model_type in ('rf-pipeline', 'rf-dual', 'auto', ''):
+                try:
+                    if self._rf_pipeline_available():
+                        self._get_rf_model()
+                        loaded.append('rf-pipeline')
+                except Exception as e:
+                    errors.append({'stage': 'rf-pipeline', 'message': str(e)})
+            if model_type in ('rf-dual', 'auto', ''):
+                try:
+                    if self._rf_fall_v2_available():
+                        self._get_rf_fall_v2_model()
+                        loaded.append('rf-fall-v2')
+                except Exception as e:
+                    errors.append({'stage': 'rf-fall-v2', 'message': str(e)})
+                try:
+                    if self._xg_posture_available():
+                        self._get_xg_posture_model()
+                        loaded.append('xg-posture')
+                except Exception as e:
+                    errors.append({'stage': 'xg-posture', 'message': str(e)})
+                # Warm the conditional lower-body occlusion helper before the first realtime chunk.
+                try:
+                    if self._xg_posture_occlusion_aux_available():
+                        self._get_xg_posture_occlusion_aux_model()
+                        loaded.append('xg-posture-occlusion-aux')
+                except Exception as e:
+                    errors.append({'stage': 'xg-posture-occlusion-aux', 'message': str(e)})
+                try:
+                    if self._facial_aux_available():
+                        self._get_facial_cascade('haarcascade_eye.xml')
+                        self._get_facial_cascade('haarcascade_smile.xml')
+                        warm_emotion = os.environ.get('FACIAL_AUX_WARM_EMOTION', 'true').lower() not in ('0', 'false', 'no')
+                        warm_driver = os.environ.get('FACIAL_AUX_WARM_DRIVER', 'true').lower() not in ('0', 'false', 'no')
+                        if warm_emotion and self._get_facial_aihub82_model() is not None:
+                            loaded.append('facial-state-aihub82')
+                        elif warm_emotion and self._get_facial_emotion_session() is not None:
+                            loaded.append('facial-state-ferplus')
+                        else:
+                            loaded.append('facial-state-face-only')
+                        if warm_driver and self._get_facial_driver_state_model() is not None:
+                            loaded.append('facial-state-aihub173-driver')
+                except Exception as e:
+                    errors.append({'stage': 'facial-state-aux', 'message': str(e)})
+            return {
+                'warmed_up': loaded,
+                'elapsed_ms': round((_time.time() - _t) * 1000),
+                'errors': errors,
+                'selected_model_version': selection if selection.get('model_id') else {},
+                'posture_occlusion_aux_available': self._xg_posture_occlusion_aux_available(),
+                'facial_state_aux_available': self._facial_aux_available(),
+                'facial_emotion_model_path': self._facial_emotion_model_path(),
+            }
+        finally:
+            self._runtime_model_selection = previous_selection
 
     def _rt_cache_file(self, session_id):
         safe = ''.join(ch for ch in str(session_id or 'default') if ch.isalnum() or ch in ['-', '_'])[:80] or 'default'
@@ -8045,21 +10686,24 @@ class VideoAnalysis:
         rf_training_samples = int(rf_summary.get('training_samples', 0) or 0)
         rf_validation_samples = int(rf_summary.get('validation_samples', 0) or 0)
         rf_fall_v2_summary = self._rf_fall_v2_summary()
-        rf_fall_v2_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_raw_thresholds = rf_fall_v2_summary.get('thresholds', {}) or {}
+        rf_fall_v2_thresholds = self._rf_fall_v2_thresholds(summary=rf_fall_v2_summary)
         rf_fall_v2_metrics = (
             (rf_fall_v2_summary.get('operational_validation', {}) or {})
             or (rf_fall_v2_summary.get('validation', {}) or {})
-            or (rf_fall_v2_thresholds.get('best_f1', {}) or {})
-            or (rf_fall_v2_thresholds.get('confirm', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('best_f1', {}) or {})
+            or (rf_fall_v2_raw_thresholds.get('confirm', {}) or {})
         )
         rf_fall_v2_samples = int(rf_fall_v2_summary.get('training_samples', 0) or 0)
         rf_fall_v2_ready = self._rf_fall_v2_available()
-        rf_fall_v2_confirm = float(((rf_fall_v2_thresholds.get('confirm', {}) or {}).get('threshold', self._rf_confirm_threshold())) or self._rf_confirm_threshold())
+        rf_fall_v2_confirm = float(rf_fall_v2_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold())
         xg_posture_summary = self._xg_posture_summary()
         posture_class_label = self._xg_posture_class_label(xg_posture_summary)
+        posture_algorithm = str(xg_posture_summary.get('active_algorithm') or xg_posture_summary.get('algorithm') or 'tree_model')
         posture_cv_accuracy = self._xg_posture_cv_accuracy(xg_posture_summary)
+        posture_sequence_cv = xg_posture_summary.get('sequence_group_cv', {}) or {}
         posture_group_cv = xg_posture_summary.get('group_cv', {}) or {}
-        posture_cv_f1 = float(posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0)) or 0.0)
+        posture_cv_f1 = float(posture_sequence_cv.get('f1_macro', posture_group_cv.get('f1_macro', xg_posture_summary.get('f1_macro', 0.0))) or 0.0)
         posture_windows = int(
             xg_posture_summary.get('n_windows', 0)
             or xg_posture_summary.get('training_samples', 0)
@@ -8067,6 +10711,23 @@ class VideoAnalysis:
             or 0
         )
         posture_feature_count = int(xg_posture_summary.get('feature_count', 0) or 0)
+        model_training_stats = self._latest_model_training_stats(rf_fall_v2_summary, xg_posture_summary)
+        continuous_items = self.continuous_training_status_list()
+        stats_by_key = {item.get('key'): item for item in model_training_stats}
+        total_training_samples = sum(int(item.get('sample_count', 0) or 0) for item in model_training_stats)
+        rf_stat = stats_by_key.get('rf-fall-v2', {}) or {}
+        rf_display_samples = int(rf_stat.get('sample_count', 0) or (rf_fall_v2_samples if rf_fall_v2_ready else rf_training_samples) or 0)
+        rf_display_f1 = self._finite_float(rf_stat.get('f1'), self._finite_float(rf_fall_v2_metrics.get('f1'), 0.0))
+        rf_display_recall = self._finite_float(rf_stat.get('recall'), self._finite_float(rf_fall_v2_metrics.get('recall'), 0.0))
+        rf_display_precision = self._finite_float(rf_stat.get('precision'), self._finite_float(rf_fall_v2_metrics.get('precision'), 0.0))
+        rf_display_badge = str(rf_stat.get('version_badge') or '').strip()
+        rf_display_label = str(rf_stat.get('base_label') or rf_stat.get('label') or 'RF-Fall v2').strip()
+        rf_display_title = (rf_display_label + (' ' + rf_display_badge if rf_display_badge and rf_display_badge not in rf_display_label else '')).strip()
+        if rf_display_label == 'RF-Fall 운영 모델' and rf_display_badge:
+            rf_display_title = 'RF-Fall ' + rf_display_badge
+        facial82_stat = stats_by_key.get('facial-aihub82', {}) or {}
+        driver173_stat = stats_by_key.get('driver-aihub173', {}) or {}
+        model_registry = self.model_registry()
         info = {
             'supported_formats': self.allowed_extensions,
             'max_upload_mb': self.max_upload_mb,
@@ -8083,19 +10744,27 @@ class VideoAnalysis:
             ],
             'analysis_profiles': self._analysis_profiles(),
             'model_options': self._model_options(baseline_state),
+            'model_registry': model_registry,
+            'occlusion_aux_policy': model_registry.get('occlusion_policy') or self._occlusion_aux_policy_info(),
             'webcam_mode': self._webcam_mode_info(),
             'realtime_readiness': self._realtime_readiness(),
             'dataset_summary': {
-                'fall_sample_count': rf_fall_v2_samples if rf_fall_v2_ready else rf_training_samples,
+                'total_training_samples': total_training_samples,
+                'fall_sample_count': rf_display_samples,
                 'fall_sample_note': (
-                    f'현재 운영 RF-Fall v2 학습 {rf_fall_v2_samples}건 (F1 {round(float(rf_fall_v2_metrics.get("f1", 0.0) or 0.0) * 100, 1)}%, Recall {round(float(rf_fall_v2_metrics.get("recall", 0.0) or 0.0) * 100, 1)}%, Precision {round(float(rf_fall_v2_metrics.get("precision", 0.0) or 0.0) * 100, 1)}%)'
+                    f'현재 운영 {rf_display_title} 학습 {rf_display_samples}건 (F1 {round(rf_display_f1 * 100, 1)}%, Recall {round(rf_display_recall * 100, 1)}%, Precision {round(rf_display_precision * 100, 1)}%)'
                     if rf_fall_v2_ready
                     else f'현재 운영 RF-Dual 낙상 모델 학습 {rf_training_samples}건 / 검증 {rf_validation_samples}건 (F1 {round(float(rf_metrics.get("f1", 0.0) or 0.0) * 100, 1)}%)'
                 ),
-                'fall_model_label': 'RF-Fall v2 occlusion-aware + XG-Posture' if rf_fall_v2_ready else 'RF-Dual 운영 파이프라인 (RandomForest + XG-Posture)',
+                'fall_model_label': f'{rf_display_title} + XG-Posture' if rf_fall_v2_ready else 'RF-Dual 운영 파이프라인 (RandomForest + XG-Posture)',
                 'behavior_sample_count': posture_windows,
-                'behavior_sample_note': f'XG-Posture {posture_class_label} 학습 {posture_windows}건 · {posture_feature_count}개 feature · Group CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%',
+                'behavior_sample_note': f'XG-Posture {posture_algorithm} · {posture_class_label} 학습 {posture_windows}건 · {posture_feature_count}개 feature · sequence CV accuracy {round(posture_cv_accuracy * 100, 1)}%, macro F1 {round(posture_cv_f1 * 100, 1)}%',
                 'behavior_model_label': 'XG-Posture 5-class 행동분류 레이어',
+                'facial82_sample_count': int(facial82_stat.get('sample_count', 0) or 0),
+                'facial82_sample_note': f"AI-Hub 82 표정 {int(facial82_stat.get('sample_count', 0) or 0)}건 · macro F1 {round(float(facial82_stat.get('macro_f1', 0.0) or 0.0) * 100, 1)}%",
+                'driver173_sample_count': int(driver173_stat.get('sample_count', 0) or 0),
+                'driver173_sample_note': f"AI-Hub 173 상태 {int(driver173_stat.get('sample_count', 0) or 0)}건 · macro F1 {round(float(driver173_stat.get('macro_f1', 0.0) or 0.0) * 100, 1)}%",
+                'model_training_stats': model_training_stats,
                 'analysis_archive_count': archive_summary.get('total', 0),
                 'realtime_chunk_sec': self._REALTIME_STEADY_CHUNK_SEC,
                 'chunk_policy_label': 'Realtime contiguous chunks (4초 청크 · 무삭제 큐)',
@@ -8159,6 +10828,7 @@ class VideoAnalysis:
                 '관리자 페이지에서 학습/운영 상태를 별도 관리',
             ],
             'training_data_requirements': self._training_data_requirements(),
+            'training_target_options': self._training_target_options(),
             'decision_thresholds': {
                 'fall_detected': rf_fall_v2_confirm if rf_fall_v2_ready else self._rf_confirm_threshold(),
                 'medium_risk': rf_fall_v2_confirm if rf_fall_v2_ready else self._rf_confirm_threshold(),
@@ -8171,6 +10841,7 @@ class VideoAnalysis:
             'continuous_training': {
                 'aihub82': self.continuous_training_status('aihub82'),
             },
+            'continuous_training_items': continuous_items,
             'intake_summary': intake_summary,
             'alert_policy': self._alert_policy(),
             'emergency_protocol': self._emergency_protocol(),
@@ -8206,10 +10877,11 @@ class VideoAnalysis:
                 'rollback_target': self._LEGACY_CHUNK_POLICY_VERSION,
             }
         headline = (
-            '실시간 입력은 4초 청크를 끊김 없이 순차 분석합니다. RTT가 튀어도 브라우저 큐에서 청크를 버리지 않습니다.'
+            '실시간 입력은 4초 창을 2초 간격으로 중첩 분석합니다. 경계 이벤트 누락을 줄이고 RTT가 튀어도 브라우저 큐에서 청크를 버리지 않습니다.'
             if is_realtime
-            else '업로드 영상도 실시간과 같은 4초 청크로 다시 분석해 행동 변화 전후를 분할 로그에 표시합니다.'
+            else '업로드 영상은 4초 창을 2초 stride로 중첩 분석해 청크 경계에 걸친 낙상 근거를 놓치지 않도록 분할 로그에 표시합니다.'
         )
+        overlap_sec = max(0.0, float(self._REALTIME_STEADY_CHUNK_SEC) - float(self._REALTIME_STRIDE_SEC))
         return {
             'enabled': True,
             'version': version,
@@ -8218,6 +10890,7 @@ class VideoAnalysis:
             'dense_intro': [],
             'steady_sec': self._REALTIME_STEADY_CHUNK_SEC,
             'stride_sec': self._REALTIME_STRIDE_SEC,
+            'overlap_sec': overlap_sec,
             'spawn_ms': int(self._REALTIME_STRIDE_SEC * 1000),
             'max_slots': 2 if is_realtime else 1,
             'max_queue': 120,
@@ -8227,7 +10900,7 @@ class VideoAnalysis:
                 'posture_fps': self._POSTURE_REALTIME_TARGET_FPS,
                 'steady_extract_frames': int(self._REALTIME_STEADY_CHUNK_SEC * self._POSTURE_REALTIME_TARGET_FPS),
                 'steady_rf_frames': int(self._REALTIME_STEADY_CHUNK_SEC * self._RF_TARGET_FPS),
-                'note': '실시간 RTT 안정화를 위해 서버는 3fps/320px 경량 추론을 쓰고 RF 낙상 모델은 학습 분포에 맞춰 2fps로 다운샘플합니다.',
+                'note': '실시간 RTT 안정화를 위해 서버는 4fps/320px 경량 추론을 쓰고 RF 낙상 모델은 학습 분포에 맞춰 3fps로 다운샘플합니다.',
             },
             'rollback_target': self._LEGACY_CHUNK_POLICY_VERSION,
         }
@@ -8273,9 +10946,12 @@ class VideoAnalysis:
         stride_sec = float(policy.get('stride_sec', steady_sec) or steady_sec)
         if duration > steady_sec:
             start_sec = 0.0
-            while start_sec < duration - 0.01:
-                _append(start_sec, min(duration, start_sec + steady_sec), 'steady')
+            while start_sec + steady_sec <= duration + 0.01:
+                _append(start_sec, start_sec + steady_sec, 'steady')
                 start_sec += stride_sec
+            last_end = max([float(item.get('end_sec', 0.0) or 0.0) for item in windows] or [0.0])
+            if last_end < duration - 0.01:
+                _append(max(0.0, duration - steady_sec), duration, 'tail-overlap')
 
         if len(windows) == 0:
             _append(0.0, duration, 'single')
@@ -8376,6 +11052,113 @@ class VideoAnalysis:
                     item['description'] = (ctx + ' · ' + desc).strip(' ·')
             elif changes_to_next:
                 item['next_behavior_hint'] = (cur.get('label', '') + ' → ' + nxt.get('label', '')).strip(' →')
+        return logs
+
+    def _risk_level_rank(self, level):
+        level = str(level or '').strip().lower()
+        if level == 'high':
+            return 3
+        if level == 'medium':
+            return 2
+        return 1
+
+    def _rank_to_risk_level(self, rank):
+        try:
+            rank = int(rank)
+        except Exception:
+            rank = 1
+        if rank >= 3:
+            return 'high'
+        if rank == 2:
+            return 'medium'
+        return 'low'
+
+    def _annotate_chunk_overlap_context(self, logs):
+        logs = list(logs or [])
+        for item in logs:
+            raw_level = item.get('risk_level', 'low')
+            item['raw_risk_level'] = raw_level
+            item['display_risk_level'] = raw_level
+            result = item.get('result', {}) or {}
+            result['raw_risk_level'] = raw_level
+            result['display_risk_level'] = raw_level
+            item['result'] = result
+
+        for idx, item in enumerate(logs):
+            window = item.get('window', {}) or {}
+            start = self._metadata_to_number(window.get('start_sec', 0.0), 0.0)
+            end = self._metadata_to_number(window.get('end_sec', start), start)
+            if end <= start:
+                continue
+            current_rank = self._risk_level_rank(item.get('risk_level', 'low'))
+            overlap_items = []
+            strongest_neighbor_rank = 1
+            for other_idx, other in enumerate(logs):
+                if other_idx == idx:
+                    continue
+                other_rank = self._risk_level_rank(other.get('risk_level', 'low'))
+                if other_rank < 2:
+                    continue
+                other_window = other.get('window', {}) or {}
+                other_start = self._metadata_to_number(other_window.get('start_sec', 0.0), 0.0)
+                other_end = self._metadata_to_number(other_window.get('end_sec', other_start), other_start)
+                overlap_sec = max(0.0, min(end, other_end) - max(start, other_start))
+                if overlap_sec <= 0.0:
+                    continue
+                strongest_neighbor_rank = max(strongest_neighbor_rank, other_rank)
+                overlap_items.append({
+                    'chunk_id': other.get('chunk_id'),
+                    'chunk_label': other.get('chunk_label', ''),
+                    'risk_level': other.get('risk_level', 'low'),
+                    'risk_score': other.get('risk_score', 0.0),
+                    'overlap_sec': round(overlap_sec, 3),
+                    'overlap_range': {
+                        'start_sec': round(max(start, other_start), 3),
+                        'end_sec': round(min(end, other_end), 3),
+                    },
+                })
+            if not overlap_items:
+                continue
+
+            display_rank = current_rank
+            if current_rank < strongest_neighbor_rank:
+                display_rank = max(current_rank, 2)
+            display_level = self._rank_to_risk_level(display_rank)
+            total_overlap = round(sum(float(o.get('overlap_sec', 0.0) or 0.0) for o in overlap_items), 3)
+            context = {
+                'has_neighbor_risk_overlap': True,
+                'raw_risk_level': item.get('risk_level', 'low'),
+                'display_risk_level': display_level,
+                'neighbor_count': len(overlap_items),
+                'total_overlap_sec': total_overlap,
+                'neighbors': overlap_items,
+                'display_reason': '인접 의심 구간과 겹치는 경계 구간입니다.',
+            }
+            item['overlap_context'] = context
+            item['display_risk_level'] = display_level
+            item['display_risk_label'] = {'low': '안정', 'medium': '경계 주의', 'high': '고위험'}.get(display_level, display_level)
+            notice = f"경계 주의: 인접 의심 구간과 {total_overlap:g}초 겹침"
+            one_line = str(item.get('one_line', '') or '')
+            if display_level != item.get('risk_level', 'low') and notice not in one_line:
+                item['one_line'] = (notice + ' · ' + one_line).strip(' ·')
+            desc = str(item.get('description', '') or '')
+            if notice not in desc:
+                item['description'] = (notice + ' · ' + desc).strip(' ·')
+            result = item.get('result', {}) or {}
+            result['overlap_context'] = context
+            result['raw_risk_level'] = item.get('risk_level', 'low')
+            result['display_risk_level'] = display_level
+            result['display_risk_label'] = item['display_risk_label']
+            if isinstance(result.get('log_summary'), dict):
+                log_summary = dict(result.get('log_summary') or {})
+                line = str(log_summary.get('line', '') or '')
+                if display_level != item.get('risk_level', 'low') and notice not in line:
+                    log_summary['line'] = (notice + ' · ' + line).strip(' ·')
+                desc2 = str(log_summary.get('description', '') or '')
+                if notice not in desc2:
+                    log_summary['description'] = (notice + ' · ' + desc2).strip(' ·')
+                result['log_summary'] = log_summary
+            item['result'] = result
         return logs
 
     def _chunk_behavior_sequence_summary(self, logs):
@@ -8490,7 +11273,7 @@ class VideoAnalysis:
             return {'clip_path': '', 'message': '클립을 생성하지 못했습니다.'}
         return {'clip_path': out_path, 'message': '임시 청크 클립 생성 완료'}
 
-    def _run_chunk_analysis(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0):
+    def _run_chunk_analysis(self, video_path, filename='', analysis_profile='balanced', model_type='rf-dual', input_source='upload', duration_hint=0, shared_ts_result=None):
         from concurrent.futures import ThreadPoolExecutor
         import time as _time
 
@@ -8551,58 +11334,173 @@ class VideoAnalysis:
             )
             return idx, window, clip_info
 
-        extractor = ThreadPoolExecutor(max_workers=1)
-        future = None
-        try:
-            if len(windows) > 0:
-                future = extractor.submit(_extract_window_clip, (1, windows[0]))
+        requested_model = str(model_type or 'rf-dual').strip().lower()
+        shared_chunk_perf = {
+            'enabled': False,
+            'mode': 'temp_clip_per_window',
+        }
+        if shared_ts_result is not None:
+            shared_sampling = dict((shared_ts_result.get('frame_sampling') or {}))
+            shared_chunk_perf = {
+                'enabled': True,
+                'mode': 'shared_main_timeseries',
+                'extract_sec': 0.0,
+                'sampled_frames': int(shared_ts_result.get('total_sampled', 0) or 0),
+                'detected_frames': len(shared_ts_result.get('timeseries', []) or []),
+                'window_count': len(windows),
+                'target_fps': shared_sampling.get('target_fps'),
+                'yolo_imgsz': shared_sampling.get('yolo_imgsz'),
+            }
+        elif len(windows) > 0 and requested_model in ['', 'rf-dual', 'rf-dual-runtime']:
+            try:
+                _t_shared = _time.time()
+                _shared_target_fps = self._finite_float(os.environ.get('FALLAI_UPLOAD_CHUNK_SHARED_FPS'), self._RF_TARGET_FPS)
+                _shared_target_fps = max(2.0, min(float(_shared_target_fps or self._RF_TARGET_FPS), float(self._POSTURE_REALTIME_TARGET_FPS)))
+                shared_ts_result = self._extract_unified_timeseries(
+                    video_path,
+                    input_source=chunk_input_source,
+                    duration_hint=duration,
+                    target_fps_override=_shared_target_fps,
+                    max_frames_override=0,
+                )
+                shared_chunk_perf = {
+                    'enabled': True,
+                    'mode': 'shared_full_video_timeseries',
+                    'extract_sec': round(_time.time() - _t_shared, 3),
+                    'sampled_frames': int(shared_ts_result.get('total_sampled', 0) or 0),
+                    'detected_frames': len(shared_ts_result.get('timeseries', []) or []),
+                    'window_count': len(windows),
+                    'target_fps': round(float(_shared_target_fps), 3),
+                }
+            except Exception as shared_e:
+                shared_ts_result = None
+                shared_chunk_perf = {
+                    'enabled': False,
+                    'mode': 'temp_clip_per_window',
+                    'shared_extract_error': str(shared_e),
+                }
 
-            for index in range(len(windows)):
-                if future is None:
-                    break
-                idx, window, clip_info = future.result()
-                next_index = index + 1
-                future = extractor.submit(_extract_window_clip, (next_index + 1, windows[next_index])) if next_index < len(windows) else None
+        def _chunk_realtime_context(idx, shared=False):
+            ctx = {
+                'chunk_id': idx,
+                'session_id': chunk_session_id,
+                'upload_chunk': True,
+                'force_facial_refresh': shared is False,
+            }
+            if shared:
+                ctx['shared_timeseries_reuse'] = True
+                ctx['skip_facial_aux'] = True
+                ctx['skip_posture_occlusion_aux'] = True
+            return ctx
 
-                clip_path = clip_info.get('clip_path', '')
-                if len(clip_path) == 0:
-                    continue
-                started = _time.time()
+        def _infer_window_from_temp(idx, window, clip_info=None):
+            clip_info = clip_info or self._extract_temp_clip(
+                video_path,
+                window.get('start_sec', 0.0),
+                window.get('end_sec', 0.0),
+                suffix='chunk_' + str(idx),
+            )
+            clip_path = clip_info.get('clip_path', '')
+            if len(clip_path) == 0:
+                return None
+            try:
+                return self._infer_with_trained_model(
+                    clip_path,
+                    filename=filename,
+                    analysis_profile=analysis_profile,
+                    model_type=model_type,
+                    input_source=chunk_input_source,
+                    duration_hint=window.get('duration_sec', 0.0),
+                    realtime_context=_chunk_realtime_context(idx, shared=False),
+                )
+            except Exception as e:
+                chunk_result = self._heuristic_result(
+                    filename,
+                    window.get('duration_sec', 0.0),
+                    meta.get('width', 0),
+                    meta.get('height', 0),
+                    meta.get('fps', 0.0),
+                    analysis_profile,
+                )
+                chunk_result['runtime_warning'] = {
+                    'severity': 'warn',
+                    'title': '분할 청크 추론 실패 → fallback',
+                    'description': str(e),
+                }
+                return chunk_result
+            finally:
                 try:
-                    chunk_result = self._infer_with_trained_model(
-                        clip_path,
-                        filename=filename,
-                        analysis_profile=analysis_profile,
-                        model_type=model_type,
-                        input_source=chunk_input_source,
-                        duration_hint=window.get('duration_sec', 0.0),
-                        realtime_context={
-                            'chunk_id': idx,
-                            'session_id': chunk_session_id,
-                            'upload_chunk': True,
-                            'force_facial_refresh': True,
-                        },
-                    )
-                except Exception as e:
-                    chunk_result = self._heuristic_result(
-                        filename,
-                        window.get('duration_sec', 0.0),
-                        meta.get('width', 0),
-                        meta.get('height', 0),
-                        meta.get('fps', 0.0),
-                        analysis_profile,
-                    )
-                    chunk_result['runtime_warning'] = {
-                        'severity': 'warn',
-                        'title': '분할 청크 추론 실패 → fallback',
-                        'description': str(e),
-                    }
-                finally:
-                    try:
-                        os.unlink(clip_path)
-                    except Exception:
-                        pass
+                    os.unlink(clip_path)
+                except Exception:
+                    pass
 
+        def _infer_window_from_shared(idx, window):
+            window_ts = self._slice_unified_timeseries_result(shared_ts_result, window)
+            if len(window_ts.get('timeseries') or []) < 1:
+                raise Exception('공유 timeseries에서 해당 청크의 사람 검출 프레임이 부족합니다.')
+            chunk_result = self._infer_rf_dual(
+                video_path,
+                filename=filename,
+                analysis_profile=analysis_profile,
+                input_source=chunk_input_source,
+                duration_hint=window.get('duration_sec', 0.0),
+                realtime_context=_chunk_realtime_context(idx, shared=True),
+                precomputed_ts_result=window_ts,
+                skip_multi_person=True,
+            )
+            chunk_ri = dict(chunk_result.get('runtime_inference') or {})
+            chunk_perf = dict(chunk_ri.get('perf') or {})
+            chunk_perf['shared_extract_sec'] = shared_chunk_perf.get('extract_sec', 0.0)
+            chunk_perf['shared_window_count'] = shared_chunk_perf.get('window_count', 0)
+            chunk_ri['perf'] = chunk_perf
+            chunk_ri['shared_timeseries_reuse'] = True
+            chunk_result['runtime_inference'] = chunk_ri
+            chunk_mr = dict(chunk_result.get('model_runtime') or {})
+            chunk_mr['shared_timeseries_reuse'] = True
+            chunk_result['model_runtime'] = chunk_mr
+            return chunk_result
+
+        def _iter_chunk_results():
+            if shared_ts_result is not None:
+                for index, window in enumerate(windows):
+                    idx = index + 1
+                    started = _time.time()
+                    try:
+                        chunk_result = _infer_window_from_shared(idx, window)
+                    except Exception as shared_e:
+                        chunk_result = _infer_window_from_temp(idx, window)
+                        if chunk_result is not None:
+                            chunk_ri = dict(chunk_result.get('runtime_inference') or {})
+                            chunk_perf = dict(chunk_ri.get('perf') or {})
+                            chunk_perf['shared_timeseries_fallback_error'] = str(shared_e)
+                            chunk_ri['perf'] = chunk_perf
+                            chunk_result['runtime_inference'] = chunk_ri
+                    if chunk_result is not None:
+                        yield idx, window, started, chunk_result
+                return
+
+            extractor = ThreadPoolExecutor(max_workers=1)
+            future = None
+            try:
+                if len(windows) > 0:
+                    future = extractor.submit(_extract_window_clip, (1, windows[0]))
+
+                for index in range(len(windows)):
+                    if future is None:
+                        break
+                    idx, window, clip_info = future.result()
+                    next_index = index + 1
+                    future = extractor.submit(_extract_window_clip, (next_index + 1, windows[next_index])) if next_index < len(windows) else None
+
+                    started = _time.time()
+                    chunk_result = _infer_window_from_temp(idx, window, clip_info=clip_info)
+                    if chunk_result is not None:
+                        yield idx, window, started, chunk_result
+            finally:
+                extractor.shutdown(wait=False)
+
+        try:
+            for idx, window, started, chunk_result in _iter_chunk_results():
                 chunk_result['log_summary'] = self._build_log_summary(chunk_result, window)
                 _chunk_ri = dict((chunk_result.get('runtime_inference') or {}))
                 _chunk_mr = dict((chunk_result.get('model_runtime') or {}))
@@ -8613,6 +11511,8 @@ class VideoAnalysis:
                     'risk_score': chunk_result.get('risk_score', 0.0),
                     'risk_level': chunk_result.get('risk_level', ''),
                     'risk_label': chunk_result.get('risk_label', ''),
+                    'raw_risk_level': chunk_result.get('risk_level', ''),
+                    'display_risk_level': chunk_result.get('risk_level', ''),
                     'summary': chunk_result.get('summary', ''),
                     'runtime_key': chunk_result.get('runtime_key', ''),
                     'runtime_label': chunk_result.get('runtime_label', ''),
@@ -8676,12 +11576,13 @@ class VideoAnalysis:
                     'result': chunk_result_lite,
                 })
         finally:
-            extractor.shutdown(wait=False)
+            pass
 
         if len(logs) == 0:
-            return {'enabled': False, 'policy': policy, 'logs': [], 'summary': None}
+            return {'enabled': False, 'policy': policy, 'logs': [], 'summary': None, 'perf': shared_chunk_perf}
 
         logs = self._annotate_chunk_behavior_transitions(logs)
+        logs = self._annotate_chunk_overlap_context(logs)
         ranked_source = [item for item in logs if item.get('log_type') != 'fallback-warning']
         if len(ranked_source) == 0:
             ranked_source = list(logs)
@@ -8722,9 +11623,12 @@ class VideoAnalysis:
             'max_end_sec': max([self._metadata_to_number(((item.get('window', {}) or {}).get('end_sec', 0.0)), 0.0) for item in logs] or [0.0]),
             'behavior_sequence': behavior_summary.get('sequence', []),
             'behavior_transition_count': behavior_summary.get('transition_count', 0),
+            'overlap_context_count': len([item for item in logs if (item.get('overlap_context') or {}).get('has_neighbor_risk_overlap')]),
             'behavior_transition_line': behavior_summary.get('transition_line', ''),
             'facial_state': facial_summary,
             'facial_state_line': facial_summary.get('line', ''),
+            'perf': shared_chunk_perf,
+            'shared_timeseries_reuse': bool(shared_chunk_perf.get('enabled')),
             'line': '분할 로그 ' + str(len(logs)) + '건 · 최고 위험 ' + str(peak.get('chunk_label', '-')) + ' · ' + str(round(float(peak.get('risk_score', 0.0) or 0.0) * 100, 1)) + '%',
         }
         if summary.get('behavior_transition_line'):
@@ -8736,6 +11640,7 @@ class VideoAnalysis:
             'policy': policy,
             'logs': logs,
             'summary': summary,
+            'perf': shared_chunk_perf,
         }
 
     def _persist_upload_analysis_record(self, saved_name, result, chunk_analysis=None):
@@ -8952,6 +11857,7 @@ class VideoAnalysis:
                 if runtime_warning:
                     result['runtime_warning'] = {'severity': 'warn', 'title': 'Realtime 추론 실패 → fallback', 'description': runtime_warning}
             _st['inference_sec'] = round(_time.time() - _t_inf, 3)
+            _st['runtime_perf'] = dict((result.get('runtime_inference') or {}).get('perf') or {}) if isinstance(result, dict) else {}
 
             _st['result_build_sec'] = 0
             _st['alert_dispatch_sec'] = 0
@@ -8994,9 +11900,20 @@ class VideoAnalysis:
 
         runtime_warning = None
         result = None
+        shared_ts_result = None
         _t_inf = _time.time()
         try:
-            result = self._infer_with_trained_model(saved_path, filename, analysis_profile, model_type=model_type, input_source=input_source, duration_hint=duration, realtime_context=realtime_context)
+            result = self._infer_with_trained_model(
+                saved_path,
+                filename,
+                analysis_profile,
+                model_type=model_type,
+                input_source=input_source,
+                duration_hint=duration,
+                realtime_context=realtime_context,
+                include_timeseries_result=True,
+            )
+            shared_ts_result = result.pop('_shared_ts_result', None) if isinstance(result, dict) else None
             inferred_meta = (result.get('video_meta', {}) or {})
             duration = self._metadata_to_number(inferred_meta.get('duration', duration), duration)
             width = int(self._metadata_to_number(inferred_meta.get('width', width), width))
@@ -9016,6 +11933,7 @@ class VideoAnalysis:
         if runtime_warning is None and quality_warning:
             runtime_warning = quality_warning
         _st['inference_sec'] = round(_time.time() - _t_inf, 3)
+        _st['runtime_perf'] = dict((result.get('runtime_inference') or {}).get('perf') or {}) if isinstance(result, dict) else {}
         _t_build = _time.time()
         result['analysis_profile'] = analysis_profile
         result['schema_version'] = 2
@@ -9134,6 +12052,7 @@ class VideoAnalysis:
         result['analysis_basis'] = self._sort_analysis_basis(existing_basis)
         result['log_summary'] = self._build_log_summary(result)
 
+        _t_chunk = _time.time()
         chunk_analysis = self._run_chunk_analysis(
             saved_path,
             filename=filename,
@@ -9141,7 +12060,10 @@ class VideoAnalysis:
             model_type=model_type,
             input_source='upload',
             duration_hint=duration,
+            shared_ts_result=shared_ts_result,
         )
+        _st['chunk_analysis_sec'] = round(_time.time() - _t_chunk, 3)
+        _st['chunk_analysis_perf'] = dict((chunk_analysis or {}).get('perf') or {})
         result['chunk_analysis'] = chunk_analysis
         chunk_summary = ((chunk_analysis or {}).get('summary') or {})
         if chunk_summary.get('line'):
@@ -9257,9 +12179,13 @@ class VideoAnalysis:
         saved_name = timestamp + '-' + file_hash + '-' + filename
         target = os.path.join(label_dir, saved_name)
         posture_class = str(metadata.get('posture_class') or metadata.get('posture') or '').strip().lower()
+        target_model = self._normalize_training_target_model(
+            metadata.get('target_model') or metadata.get('training_target_model') or metadata.get('model_target') or metadata.get('model_type') or 'rf-dual'
+        )
         meta_payload = {
             'label': label,
             'posture_class': posture_class,
+            'target_model': target_model,
             'original_name': filename,
             'saved_name': saved_name,
             'uploaded_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -9283,10 +12209,18 @@ class VideoAnalysis:
             posture_meta['intake_view'] = 'posture_class'
             posture_meta['linked_l1_path'] = target
             self._write_json(posture_target + '.json', posture_meta)
+        target_index_dir = os.path.join(self._training_dir(), '_targets', target_model)
+        os.makedirs(target_index_dir, exist_ok=True)
+        target_index = dict(meta_payload)
+        target_index['intake_view'] = 'target_model'
+        target_index['linked_l1_path'] = target
+        target_index['linked_posture_path'] = posture_target
+        self._write_json(os.path.join(target_index_dir, saved_name + '.json'), target_index)
         self._invalidate_prototype_info_cache()
         return {
             'label': label,
             'posture_class': posture_class,
+            'target_model': target_model,
             'saved_name': saved_name,
             'posture_intake_saved': bool(posture_target),
             'archive_source': archive_source,
@@ -9302,6 +12236,9 @@ class VideoAnalysis:
         posture_class = str(metadata.get('posture_class') or metadata.get('posture') or '').strip().lower()
         if posture_class and posture_class not in self._LABEL_L2_CLASSES:
             raise Exception('행동 라벨은 stand/walk/run/sit/lie/fall 중 하나여야 합니다.')
+        target_model = self._normalize_training_target_model(
+            metadata.get('target_model') or metadata.get('training_target_model') or metadata.get('model_target') or metadata.get('model_type') or 'rf-dual'
+        )
 
         filename = self._sanitize_filename(getattr(uploaded_file, 'filename', 'training-video'))
         content = uploaded_file.read()
@@ -9330,6 +12267,7 @@ class VideoAnalysis:
             return {
                 'label': label,
                 'posture_class': posture_class,
+                'target_model': target_model,
                 'saved_name': first.get('saved_name', ''),
                 'posture_intake_saved': any(bool(item.get('posture_intake_saved')) for item in saved_items),
                 'archive': True,
@@ -9363,11 +12301,739 @@ class VideoAnalysis:
     def _training_latest_job_id_path(self):
         return os.path.join(self._training_jobs_dir(), 'latest_job_id.txt')
 
+    def _next_dashboard_training_version(self, target_model='rf-dual'):
+        target_model = self._normalize_training_target_model(target_model)
+        stat_key = {
+            'rf-dual': 'rf-fall-v2',
+            'rf-fall-v2': 'rf-fall-v2',
+            'xg-posture': 'xg-posture',
+        }.get(target_model, target_model)
+        current_idx = 0
+        try:
+            stats = {item.get('key'): item for item in self._latest_model_training_stats()}
+            badge = str((stats.get(stat_key) or {}).get('version_badge') or '').strip()
+            match = re.match(r'^v([0-9]+)$', badge, re.IGNORECASE)
+            if match:
+                current_idx = max(current_idx, int(match.group(1)))
+        except Exception:
+            pass
+        try:
+            for name in os.listdir(self._training_jobs_dir()):
+                if not name.endswith('.json'):
+                    continue
+                data = self._read_json(os.path.join(self._training_jobs_dir(), name), {}) or {}
+                if self._normalize_training_target_model(data.get('target_model') or data.get('job_type') or '') != target_model:
+                    continue
+                badge = str(data.get('version_badge') or '').strip()
+                match = re.match(r'^v([0-9]+)$', badge, re.IGNORECASE)
+                if match:
+                    current_idx = max(current_idx, int(match.group(1)))
+        except Exception:
+            pass
+        next_idx = max(1, current_idx + 1)
+        return {
+            'version_badge': f"v{next_idx}",
+            'training_run_index': next_idx,
+            'training_run_label': f"학습 후보 v{next_idx}",
+        }
+
     def _continuous_training_status_path(self, name='aihub82'):
         safe_name = self._sanitize_filename(name or 'aihub82') or 'aihub82'
-        return self._project_abspath('outputs', 'continuous_training', safe_name + '_status.json')
+        relative = os.path.join('continuous_training', safe_name + '_status.json')
+        preferred = self._project_abspath('outputs', 'continuous_training', safe_name + '_status.json')
+        for candidate in [
+            preferred,
+            os.path.join('/mnt/data/wiz/project/main/outputs', relative),
+            os.path.join('/opt/app/project/main/outputs', relative),
+            os.path.join('/mnt/data/wiz/storage/project-main/outputs', relative),
+        ]:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return preferred
+
+    def _latest_file_by_prefix(self, root, prefix, suffix):
+        try:
+            candidates = []
+            for name in os.listdir(root):
+                if not name.startswith(prefix) or not name.endswith(suffix):
+                    continue
+                path = os.path.join(root, name)
+                if os.path.isfile(path):
+                    candidates.append((os.path.getmtime(path), path))
+            if not candidates:
+                return ''
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+        except Exception:
+            return ''
+
+    def _command_processes(self, needle):
+        try:
+            out = subprocess.check_output(
+                ['ps', '-eo', 'pid,etime,pcpu,pmem,cmd'],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return []
+        rows = []
+        for line in out.splitlines()[1:]:
+            if needle not in line or 'grep' in line:
+                continue
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            rows.append({
+                'pid': parts[0],
+                'elapsed': parts[1],
+                'cpu': parts[2],
+                'mem': parts[3],
+                'cmd': parts[4],
+            })
+        return rows
+
+    def _pid_process_state(self, value):
+        try:
+            pid = int(value or 0)
+            if pid <= 0:
+                return ''
+            with open(f'/proc/{pid}/stat', 'r', encoding='utf-8', errors='replace') as file:
+                raw = file.read()
+            return raw.rsplit(')', 1)[1].strip().split()[0]
+        except Exception:
+            return ''
+
+    def _pid_running(self, value):
+        try:
+            pid = int(value or 0)
+            if pid <= 0:
+                return False
+            os.kill(pid, 0)
+            return self._pid_process_state(pid) != 'Z'
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _elapsed_text_to_seconds(self, value):
+        raw = str(value or '').strip()
+        if not raw:
+            return 0.0
+        days = 0
+        if '-' in raw:
+            day_text, raw = raw.split('-', 1)
+            try:
+                days = int(day_text)
+            except Exception:
+                days = 0
+        parts = raw.split(':')
+        try:
+            nums = [int(part) for part in parts]
+        except Exception:
+            return 0.0
+        if len(nums) == 3:
+            hours, minutes, seconds = nums
+        elif len(nums) == 2:
+            hours, minutes, seconds = 0, nums[0], nums[1]
+        elif len(nums) == 1:
+            hours, minutes, seconds = 0, 0, nums[0]
+        else:
+            return 0.0
+        return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+
+    def _format_eta_text(self, seconds):
+        eta_sec = max(0.0, self._finite_float(seconds, 0.0))
+        if eta_sec < 60:
+            return f"{round(eta_sec)}초"
+        if eta_sec < 3600:
+            return f"{int(eta_sec // 60)}분 {round(eta_sec % 60)}초"
+        return f"{int(eta_sec // 3600)}시간 {int((eta_sec % 3600) // 60)}분"
+
+    def _latest_training_progress_line(self, log_path):
+        path = str(log_path or '').strip()
+        if not path or not os.path.isfile(path):
+            return ''
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as file:
+                lines = file.read().splitlines()[-240:]
+            for line in reversed(lines):
+                if re.search(r'epoch=\d+/\d+\s+step=\d+/\d+', line):
+                    return line.strip()
+            for line in reversed(lines):
+                if line.strip():
+                    return line.strip()
+        except Exception:
+            return ''
+        return ''
+
+    def _posture_occlusion_training_status(self):
+        summary_path = self._persistent_model_path('xg-posture-occlusion-aux', 'training_summary.json')
+        summary = self._read_json(summary_path, {}) or {}
+        log_root = self._project_abspath('outputs', 'model_optimization')
+        log_candidates = []
+        for prefix in [
+            'xg_posture_occlusion_aux_saved_v3',
+            'xg_posture_occlusion_retrain_v2_setsid',
+            'xg_posture_occlusion_retrain_v2',
+            'xg_posture_occlusion_randomized_retrain',
+        ]:
+            candidate = self._latest_file_by_prefix(log_root, prefix, '.log')
+            if candidate:
+                try:
+                    log_candidates.append((os.path.getmtime(candidate), candidate))
+                except Exception:
+                    log_candidates.append((0, candidate))
+        log_candidates.sort(reverse=True)
+        log_path = log_candidates[0][1] if log_candidates else ''
+        processes = self._command_processes('retrain_xg_posture_sequence.py')
+        supervisor_status = self._read_json('/mnt/data/wiz/storage/training/fall-detection/continuous-model-supervisor/status.json', {}) or {}
+        supervisor_occlusion = {}
+        for action in reversed(supervisor_status.get('actions') or []):
+            if isinstance(action, dict) and isinstance(action.get('occlusion_aux'), dict):
+                supervisor_occlusion = action.get('occlusion_aux') or {}
+                break
+        if not supervisor_occlusion:
+            for item in reversed(supervisor_status.get('bottlenecks') or []):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get('name') or '') == 'occlusion_aux' and isinstance(item.get('details'), dict):
+                    supervisor_occlusion = item.get('details') or {}
+                    break
+        latest_log = ''
+        if log_path:
+            try:
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as file:
+                    lines = [line.strip() for line in file.read().splitlines() if line.strip()]
+                    for line in reversed(lines[-80:]):
+                        if line.startswith('[') or 'window_f1=' in line or 'sequence_f1=' in line:
+                            latest_log = line
+                            break
+                    if not latest_log and lines:
+                        latest_log = lines[-1]
+            except Exception:
+                latest_log = ''
+        group_cv = summary.get('group_cv') or {}
+        seq_cv = summary.get('sequence_group_cv') or {}
+        recovery_only = self._model_summary_is_emergency_recovery(summary)
+        retrain_recovery = summary.get('retrain_recovery') or {}
+        retrain_status = str(retrain_recovery.get('status') or '').strip().lower()
+        supervisor_stage = ''
+        supervisor_message = ''
+        if supervisor_occlusion and not processes:
+            supervisor_message = str(supervisor_occlusion.get('message') or '').strip()
+            if str(supervisor_occlusion.get('status') or '').strip() == 'waiting_for_source' or int(supervisor_occlusion.get('usable_source_count') or 0) == 0:
+                supervisor_stage = 'blocked'
+                supervisor_message = supervisor_message or '가림 보조 학습에 사용할 수 있는 2D 자세 JSON/HITL 자세 라벨이 없습니다.'
+            elif supervisor_occlusion.get('ok') is False:
+                supervisor_stage = 'failed'
+                supervisor_message = supervisor_message or '가림 보조 학습이 실패했습니다. 로그를 확인하세요.'
+        upstream_eta = ''
+        upstream_posture_status = self._read_json(self._continuous_training_status_path('xg-posture'), {}) or {}
+        upstream_stage = str(upstream_posture_status.get('stage') or upstream_posture_status.get('status') or '').strip()
+        upstream_bottleneck = upstream_posture_status.get('bottleneck') if isinstance(upstream_posture_status.get('bottleneck'), dict) else {}
+        upstream_label_count = int(
+            upstream_bottleneck.get('aihub71461_pose_label_count')
+            or upstream_bottleneck.get('usable_posture_label_count')
+            or upstream_posture_status.get('aihub71461_pose_label_count')
+            or 0
+        )
+        upstream_running = str(upstream_posture_status.get('stage') or upstream_posture_status.get('status') or '').strip() == 'running'
+        if processes and upstream_posture_status:
+            upstream_eta = str(upstream_posture_status.get('eta_text') or '').strip()
+            supervisor_message = str(upstream_posture_status.get('message') or supervisor_message or '').strip()
+            latest_log = str(upstream_posture_status.get('latest_log') or latest_log or '').strip()
+        def status_pid_alive(value):
+            return self._pid_running(value)
+
+        upstream_supervisor_running = bool(
+            upstream_running
+            and (
+                status_pid_alive(upstream_posture_status.get('pid'))
+                or status_pid_alive(upstream_posture_status.get('supervisor_pid'))
+            )
+        )
+        if not processes and upstream_label_count > 0 and upstream_stage in ('waiting_label_balance', 'running', 'completed', 'queued'):
+            if supervisor_stage in ('', 'blocked', 'failed') or upstream_stage == 'waiting_label_balance':
+                supervisor_stage = 'running' if upstream_supervisor_running else ('waiting_label_balance' if upstream_stage == 'waiting_label_balance' else 'queued')
+                upstream_eta = str(upstream_posture_status.get('eta_text') or '').strip()
+                supervisor_message = (
+                    str(upstream_posture_status.get('message') or '').strip()
+                    or f'71461 라벨 {upstream_label_count:,}개는 확보됐습니다. 현재 병목은 데이터 유실이 아니라 자세 라벨 분포와 목표 성능 미달입니다.'
+                )
+                latest_log = str(upstream_posture_status.get('latest_log') or latest_log or '').strip()
+        if supervisor_stage == 'blocked' and upstream_running:
+            supervisor_stage = 'queued'
+            upstream_eta = str(upstream_posture_status.get('eta_text') or '').strip()
+            upstream_log = str(upstream_posture_status.get('latest_log') or '').strip()
+            current = int(upstream_posture_status.get('redownload_current') or 0)
+            total = int(upstream_posture_status.get('redownload_total') or 0)
+            received = int(upstream_posture_status.get('redownload_current_size_bytes') or 0)
+            progress = self._finite_float(upstream_posture_status.get('redownload_current_progress'), 0.0)
+            speed = self._finite_float(upstream_posture_status.get('redownload_current_speed_mbps'), 0.0)
+            target_kind = str(upstream_posture_status.get('redownload_target_kind') or '').strip()
+            eta_sec = upstream_posture_status.get('redownload_current_eta_sec')
+            if (
+                upstream_eta
+                and progress >= 0.995
+                and not eta_sec
+                and target_kind == '추정'
+                and str(upstream_posture_status.get('redownload_current_phase') or '') == '다운로드 중'
+            ):
+                received_text = self._format_bytes(received) if hasattr(self, '_format_bytes') else f"{round(received / (1024 ** 3), 1)}GB"
+                queue_text = f"{current}/{total}" if total else (f"{current}/?" if current else "-")
+                speed_text = f"{speed:.1f}MB/s" if speed > 0 else "속도 계산 중"
+                upstream_eta = f"선행 71461 다운로드 중 · {received_text} 수신 · 전체 크기 확인 중 · {speed_text} · 파일 {queue_text}"
+            supervisor_message = (
+                '가림 보조는 별도 데이터가 사라진 상태가 아니라, '
+                'XG-Posture/71461/61 자세 라벨 확보가 끝난 뒤 이어서 재학습합니다.'
+            )
+            latest_log = upstream_log or latest_log
+        compatibility_waiting = (
+            bool(summary)
+            and not recovery_only
+            and str(summary.get('operational_status') or '').startswith('compatibility_artifact_active')
+            and retrain_status
+            and retrain_status not in ('complete', 'completed', 'done', 'applied')
+        )
+        active_window_f1 = 0.0 if recovery_only else self._finite_float(group_cv.get('f1_macro'), 0.0)
+        active_window_acc = 0.0 if recovery_only else self._finite_float(group_cv.get('accuracy'), 0.0)
+        active_sequence_f1 = 0.0 if recovery_only else self._finite_float(seq_cv.get('f1_macro'), 0.0)
+        active_sequence_acc = 0.0 if recovery_only else self._finite_float(seq_cv.get('accuracy'), 0.0)
+        upstream_best_sequence_f1 = self._finite_float(upstream_posture_status.get('best_sequence_macro_f1'), 0.0)
+        upstream_best_window_f1 = self._finite_float(upstream_posture_status.get('best_macro_f1'), 0.0)
+        upstream_target_f1 = max(
+            self._finite_float(upstream_posture_status.get('stretch_macro_f1'), 0.95),
+            self._finite_float(upstream_posture_status.get('target_macro_f1'), 0.95),
+            0.95,
+        )
+        target_met_metric = max(active_sequence_f1, active_window_f1, upstream_best_sequence_f1, upstream_best_window_f1)
+        upstream_completed = upstream_stage in ('completed', 'completed-max-runs', 'target-met', 'finished')
+        target_met_completed = bool(upstream_completed and target_met_metric >= upstream_target_f1 and not recovery_only)
+        if target_met_completed:
+            supervisor_stage = 'completed'
+            upstream_eta = str(upstream_posture_status.get('eta_text') or '최종 목표 달성 · 타 모델 우선 학습으로 전환').strip()
+            supervisor_message = (
+                str(upstream_posture_status.get('message') or '').strip()
+                or '가림 보조 sequence/window 기준 목표 달성. 반복 학습을 종료하고 AI-Hub 82/173 등 다른 모델 학습을 우선합니다.'
+            )
+            latest_log = str(upstream_posture_status.get('latest_log') or latest_log or '').strip()
+        stage = 'running' if processes else (supervisor_stage or ('missing-real-model' if recovery_only else ('completed' if summary else 'not-started')))
+        updated_at = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') if processes else (summary.get('updated_at') or summary.get('trained_at') or '')
+        if supervisor_status.get('updated_at') and supervisor_stage:
+            updated_at = supervisor_status.get('updated_at')
+        occlusion_target = self._finite_float(
+            upstream_posture_status.get('occlusion_priority_target_macro_f1')
+            or os.environ.get('POSTURE_OCC_PRIORITY_TARGET')
+            or 0.90,
+            0.90,
+        )
+        summary_version_label = (
+            summary.get('training_run_label')
+            or summary.get('model_version')
+            or summary.get('version_badge')
+            or 'best-recorded'
+        )
+        upstream_active_version = str(upstream_posture_status.get('active_version_text') or summary_version_label or '').strip()
+        upstream_candidate_text = str(upstream_posture_status.get('candidate_version_text') or '').strip()
+        allow_candidate_text = bool(not target_met_completed and upstream_stage not in ('completed', 'completed-max-runs', 'target-met', 'finished'))
+        if not allow_candidate_text:
+            upstream_candidate_text = ''
+        if not upstream_candidate_text and allow_candidate_text:
+            try:
+                upstream_cycle = int(upstream_posture_status.get('current_cycle') or 0)
+            except Exception:
+                upstream_cycle = 0
+            upstream_experiment = str(upstream_posture_status.get('experiment') or '').strip()
+            if upstream_cycle > 0 and upstream_experiment:
+                upstream_candidate_text = f"cycle #{upstream_cycle:04d} {upstream_experiment}"
+            elif upstream_cycle > 0:
+                upstream_candidate_text = f"cycle #{upstream_cycle:04d}"
+            elif upstream_experiment:
+                upstream_candidate_text = upstream_experiment
+        last_training_result = upstream_posture_status.get('last_training_result') if isinstance(upstream_posture_status.get('last_training_result'), dict) else {}
+        best_training_result = upstream_posture_status.get('best_training_result') if isinstance(upstream_posture_status.get('best_training_result'), dict) else {}
+        candidate_macro_f1 = self._finite_float(
+            upstream_posture_status.get('candidate_macro_f1'),
+            self._finite_float(last_training_result.get('candidate_macro_f1'), 0.0),
+        )
+        candidate_sequence_f1 = self._finite_float(
+            upstream_posture_status.get('candidate_sequence_macro_f1'),
+            self._finite_float(last_training_result.get('candidate_sequence_macro_f1'), 0.0),
+        )
+        candidate_saved = bool(upstream_posture_status.get('candidate_saved') or last_training_result.get('saved'))
+        no_promotion_reason = str(upstream_posture_status.get('no_promotion_reason') or last_training_result.get('skip_reason') or '').strip()
+        if target_met_completed:
+            candidate_macro_f1 = 0.0
+            candidate_sequence_f1 = 0.0
+            candidate_saved = False
+            no_promotion_reason = ''
+        version_text = '실제 학습 모델 없음' if recovery_only else (
+            f"active {upstream_active_version} · 목표 {round(upstream_target_f1 * 100)}% 달성"
+            if target_met_completed else (
+                f"진행 {upstream_candidate_text} · active {upstream_active_version}"
+                if upstream_candidate_text and (processes or upstream_running or upstream_stage == 'running') else (
+                    f"{summary_version_label} · active 목표 충족"
+                    if compatibility_waiting else f"{summary_version_label} · 랜덤 하체/수직 가림 보조 active"
+                )
+            )
+        )
+        candidate_text = 'real model missing' if recovery_only else (upstream_candidate_text if upstream_candidate_text else '')
+        promotion_message = ''
+        if target_met_completed:
+            promotion_message = (
+                '가림 보조 목표 달성: sequence F1 {:.1f}% / window F1 {:.1f}%. '
+                '반복 학습을 멈추고 미달 모델을 우선합니다.'
+            ).format(max(active_sequence_f1, upstream_best_sequence_f1) * 100.0, max(active_window_f1, upstream_best_window_f1) * 100.0)
+        elif last_training_result and not candidate_saved:
+            metric_text = ''
+            if candidate_macro_f1 > 0 or candidate_sequence_f1 > 0:
+                metric_text = '최근 후보 window F1 {:.1f}% / sequence F1 {:.1f}%'.format(
+                    candidate_macro_f1 * 100.0,
+                    candidate_sequence_f1 * 100.0,
+                )
+            reason_text = no_promotion_reason or '운영 active보다 낮거나 저장 기준을 넘지 못했습니다.'
+            promotion_message = f"active {upstream_active_version} 유지: {metric_text or '최근 후보 미승격'} · {reason_text}"
+        elif upstream_candidate_text and upstream_active_version:
+            promotion_message = f"현재 후보 {upstream_candidate_text} 학습 중, 운영 active는 {upstream_active_version}입니다."
+        return {
+            'ok': bool(summary or processes or log_path),
+            'name': 'xg-posture-occlusion-aux',
+            'label': 'XG-Posture 가림 보조',
+            'stage': stage,
+            'status': stage,
+            'model_family': 'posture-occlusion',
+            'training_version_text': version_text,
+            'candidate_version_text': candidate_text,
+            'active_version_text': upstream_active_version,
+            'updated_at': updated_at,
+            'active_macro_f1': active_window_f1,
+            'active_accuracy': active_window_acc,
+            'sequence_macro_f1': active_sequence_f1,
+            'sequence_accuracy': active_sequence_acc,
+            'candidate_macro_f1': candidate_macro_f1,
+            'candidate_sequence_macro_f1': candidate_sequence_f1,
+            'candidate_saved': candidate_saved,
+            'no_promotion_reason': no_promotion_reason,
+            'best_macro_f1': self._finite_float(best_training_result.get('candidate_macro_f1'), self._finite_float(upstream_posture_status.get('best_macro_f1'), 0.0)),
+            'best_sequence_macro_f1': self._finite_float(best_training_result.get('candidate_sequence_macro_f1'), self._finite_float(upstream_posture_status.get('best_sequence_macro_f1'), 0.0)),
+            'target_macro_f1': occlusion_target,
+            'stretch_macro_f1': max(occlusion_target, self._finite_float(upstream_posture_status.get('stretch_macro_f1'), occlusion_target)),
+            'n_windows': 0 if recovery_only else int(summary.get('n_windows', 0) or 0),
+            'occlusion_training_windows': 0 if recovery_only else int(summary.get('occlusion_training_windows', 0) or 0),
+            'algorithm': summary.get('algorithm') or '',
+            'feature_set': summary.get('feature_set') or '',
+            'log_path': log_path,
+            'latest_log': latest_log,
+            'processes': processes[:4],
+            'pid': processes[0].get('pid') if processes else str(upstream_posture_status.get('pid') or upstream_posture_status.get('supervisor_pid') or ''),
+            'eta_text': (upstream_eta or '계산 중') if processes else (
+                upstream_eta if supervisor_stage in ('queued', 'waiting_label_balance', 'running', 'completed') and upstream_eta else
+                ('데이터 필요' if supervisor_stage == 'blocked' else ('실패' if supervisor_stage == 'failed' else ('실모델 없음' if recovery_only else ('완료' if summary else '-'))))
+            ),
+            'message': promotion_message or supervisor_message or latest_log or ('가림 보조모델 실제 학습 산출물이 없습니다.' if recovery_only else ('가림 보조 active 모델은 현재 사용 가능 상태입니다. 추가 데이터 학습은 별도 개선 작업으로 관리합니다.' if compatibility_waiting else ('가림 보조모델 재학습 완료' if summary else '가림 보조모델 학습 상태 없음'))),
+            'recovery_only': recovery_only,
+            'ready': False if recovery_only else bool(summary),
+            'supervisor_status': supervisor_occlusion,
+            'upstream_status': upstream_posture_status if upstream_running else {},
+        }
+
+    def _planned_model_retraining_status(self, name, label, family, summary_path, model_path, target_macro_f1=0.95, message=''):
+        status_name = 'xg-posture-base' if str(name or '').strip().lower() == 'xg-posture' else name
+        status = self._read_json(self._continuous_training_status_path(status_name), {}) or {}
+        if not status and status_name != name:
+            status = self._read_json(self._continuous_training_status_path(name), {}) or {}
+        status_text = ' '.join(
+            str(status.get(key) or '')
+            for key in (
+                'training_version_text',
+                'active_version_text',
+                'candidate_version_text',
+                'message',
+                'latest_log',
+                'log_path',
+            )
+        ).lower()
+        status_is_occlusion_aux = bool(
+            str(name or '').strip().lower() == 'xg-posture'
+            and ('가림 보조' in status_text or 'occlusion' in status_text or 'lie_recall' in status_text)
+        )
+        model_status = {} if status_is_occlusion_aux else status
+        summary = self._read_json(summary_path, {}) or {}
+        recovery_only = self._model_summary_is_emergency_recovery(summary)
+        operational_status = str(summary.get('operational_status') or '').strip()
+        compatibility_waiting = operational_status.startswith('compatibility_artifact_active')
+        summary_active_f1 = self._summary_metric(summary, 'f1', 'f1_macro', 'macro_f1') or 0.0
+        status_active_f1 = self._finite_float(model_status.get('active_macro_f1'), 0.0)
+        active_f1 = max(summary_active_f1, status_active_f1)
+        active_acc = max(
+            self._summary_metric(summary, 'accuracy') or 0.0,
+            self._finite_float(model_status.get('active_accuracy'), 0.0),
+        )
+        summary_preferred = bool(summary_active_f1 > 0 and summary_active_f1 + 0.0005 >= status_active_f1)
+        sample_count = int(
+            summary.get('training_samples', 0)
+            or summary.get('n_windows', 0)
+            or (int(summary.get('train_rows', 0) or 0) + int(summary.get('val_rows', 0) or 0))
+            or 0
+        )
+        stage = str(model_status.get('stage') or model_status.get('status') or '').strip()
+        if not stage:
+            if active_f1 and active_f1 >= target_macro_f1 and not recovery_only:
+                stage = 'completed'
+            elif recovery_only or compatibility_waiting or (active_f1 and active_f1 < target_macro_f1):
+                stage = 'queued'
+            else:
+                stage = 'completed'
+        has_active_training = bool(model_status.get('pid') or model_status.get('log_path') or model_status.get('started_at'))
+        if stage == 'queued' and recovery_only and not has_active_training:
+            stage = 'blocked'
+        if stage in ('queued', 'blocked') and compatibility_waiting and active_f1 >= target_macro_f1 and not has_active_training:
+            stage = 'completed'
+        version = self._summary_version_info(summary, model_path, label)
+        active_version_text = (
+            (version.get('training_run_label') or version.get('version_text') or '')
+            if summary_preferred else
+            (model_status.get('active_version_text') or version.get('training_run_label') or version.get('version_text') or '')
+        )
+        active_goal_met = bool(active_f1 and active_f1 >= target_macro_f1 and not recovery_only)
+        if stage in ('queued', 'completed') and active_f1 > 0 and active_f1 < target_macro_f1 and not recovery_only:
+            stage = 'queued'
+            model_status['message'] = f'{label} active 모델은 현재 {round(active_f1 * 100, 1)}%로 최종 목표 {round(target_macro_f1 * 100, 1)}% 미만입니다. 추가 학습 대기 중입니다.'
+            model_status['eta_text'] = '추가 학습 대기'
+        if active_goal_met and stage == 'completed':
+            status_eta_text = '완료'
+            status_message = f'{label} active 모델은 현재 {round(active_f1 * 100, 1)}%로 최종 목표 {round(target_macro_f1 * 100, 1)}%를 충족합니다.'
+        else:
+            status_eta_text = model_status.get('eta_text')
+            status_message = model_status.get('message')
+        if stage in ('blocked', 'failed', 'preparing') and str(status_eta_text or '').strip() in ('완료', 'completed'):
+            status_eta_text = '입력 데이터 필요'
+        elif stage == 'queued' and str(status_eta_text or '').strip() in ('완료', 'completed'):
+            status_eta_text = '추가 학습 대기'
+        return {
+            'ok': bool(summary or status),
+            'name': name,
+            'label': label,
+            'stage': stage,
+            'status': stage,
+            'model_family': family,
+            'training_version_text': model_status.get('training_version_text') or active_version_text or '-',
+            'candidate_version_text': model_status.get('candidate_version_text') or model_status.get('experiment') or '',
+            'active_version_text': active_version_text,
+            'updated_at': model_status.get('updated_at') or summary.get('updated_at') or summary.get('trained_at') or '',
+            'active_macro_f1': active_f1,
+            'active_accuracy': active_acc,
+            'target_macro_f1': max(self._finite_float(model_status.get('target_macro_f1'), target_macro_f1), target_macro_f1),
+            'stretch_macro_f1': max(self._finite_float(model_status.get('stretch_macro_f1'), target_macro_f1), target_macro_f1),
+            'sample_count': sample_count,
+            'n_windows': int(summary.get('n_windows', 0) or sample_count or 0),
+            'model_path': model_path,
+            'log_path': model_status.get('log_path') or '',
+            'latest_log': model_status.get('latest_log') or model_status.get('message') or '',
+            'eta_text': status_eta_text or ('다운로드 완료 후 자동 재학습' if stage == 'queued' else ('입력 데이터 준비 필요' if stage in ('preparing', 'blocked') else ('완료' if stage == 'completed' else '-'))),
+            'message': status_message or message or ('실모델 재학습 대기' if stage == 'queued' else ('입력 데이터가 준비되면 재학습합니다.' if stage in ('preparing', 'blocked') else '목표 성능 충족')),
+            'ready': self._model_summary_ready(summary),
+            'recovery_only': recovery_only,
+            'compatibility_waiting': compatibility_waiting,
+            'data_purpose': status.get('data_purpose') or '',
+            'required_files': status.get('required_files'),
+            'completed_files': status.get('completed_files'),
+            'redownload_current': status.get('redownload_current'),
+            'redownload_total': status.get('redownload_total'),
+            'redownload_current_filekey': status.get('redownload_current_filekey'),
+            'redownload_current_label': status.get('redownload_current_label'),
+            'redownload_current_phase': status.get('redownload_current_phase'),
+            'redownload_current_size_bytes': status.get('redownload_current_size_bytes'),
+            'redownload_current_target_bytes_estimate': status.get('redownload_current_target_bytes_estimate'),
+            'redownload_current_progress': status.get('redownload_current_progress'),
+            'redownload_current_eta_sec': status.get('redownload_current_eta_sec'),
+            'redownload_current_speed_mbps': status.get('redownload_current_speed_mbps'),
+            'redownload_target_kind': status.get('redownload_target_kind'),
+            'redownload_log_path': status.get('redownload_log_path') or '',
+        }
+
+    def _dashboard_training_status_items(self):
+        items = []
+        try:
+            for name in os.listdir(self._training_jobs_dir()):
+                if not name.endswith('.json'):
+                    continue
+                path = os.path.join(self._training_jobs_dir(), name)
+                data = self._read_json(path, {}) or {}
+                raw_status = str(data.get('status') or '')
+                if raw_status not in ('queued', 'running', 'completed_pending_apply', 'blocked', 'failed'):
+                    continue
+                data = self.training_job_status(data.get('job_id') or name[:-5])
+                target = self._normalize_training_target_model(data.get('target_model') or data.get('job_type') or 'rf-dual')
+                label = {
+                    'rf-dual': 'RF-Dual 통합 학습',
+                    'rf-fall-v2': 'RF-Fall 학습',
+                    'xg-posture': 'XG-Posture 학습',
+                }.get(target, target)
+                result = data.get('result') if isinstance(data.get('result'), dict) else {}
+                rf_training = result.get('rf_pipeline_training') if isinstance(result.get('rf_pipeline_training'), dict) else {}
+                if not rf_training:
+                    for step in data.get('steps') or []:
+                        if str(step.get('name') or '') != 'rf_pipeline':
+                            continue
+                        step_result = step.get('result') if isinstance(step.get('result'), dict) else {}
+                        summary = step_result.get('summary') if isinstance(step_result.get('summary'), dict) else {}
+                        if summary:
+                            rf_training = summary
+                            break
+                model_comparison = result.get('model_comparison') if isinstance(result.get('model_comparison'), dict) else {}
+                rf_model = {}
+                try:
+                    rf_model = (model_comparison.get('models') or {}).get('rf-pipeline') or {}
+                except Exception:
+                    rf_model = {}
+                cv = rf_training.get('cv') if isinstance(rf_training.get('cv'), dict) else {}
+                candidate_f1 = self._finite_float(
+                    cv.get('f1') if cv else None,
+                    self._finite_float(((rf_model.get('f1') or {}).get('cv') if isinstance(rf_model.get('f1'), dict) else None), self._finite_float(model_comparison.get('best_cv_f1'), 0.0))
+                )
+                candidate_accuracy = self._finite_float(
+                    cv.get('accuracy') if cv else None,
+                    self._finite_float((rf_model.get('accuracy') or {}).get('cv') if isinstance(rf_model.get('accuracy'), dict) else None, 0.0)
+                )
+                candidate_recall = self._finite_float(
+                    cv.get('recall') if cv else None,
+                    self._finite_float((rf_model.get('recall') or {}).get('cv') if isinstance(rf_model.get('recall'), dict) else None, 0.0)
+                )
+                class_distribution = rf_training.get('class_distribution') if isinstance(rf_training.get('class_distribution'), dict) else {}
+                if not class_distribution:
+                    summary = data.get('intake_summary') if isinstance(data.get('intake_summary'), dict) else {}
+                    class_distribution = {key: int(summary.get(key, 0) or 0) for key in ('Y', 'N')}
+                training_samples = int(rf_training.get('training_samples', 0) or data.get('processed', 0) or data.get('total', 0) or 0)
+                metric_bits = []
+                if candidate_f1 > 0:
+                    metric_bits.append('CV F1 {:.1f}%'.format(candidate_f1 * 100.0))
+                if candidate_accuracy > 0:
+                    metric_bits.append('Acc {:.1f}%'.format(candidate_accuracy * 100.0))
+                if candidate_recall > 0:
+                    metric_bits.append('Recall {:.1f}%'.format(candidate_recall * 100.0))
+                if raw_status in ('completed_pending_apply', 'completed', 'applied') and training_samples <= 0 and candidate_f1 <= 0:
+                    continue
+                display_status = str(data.get('status') or '')
+                version_badge = str(data.get('version_badge') or '').strip()
+                training_version_text = data.get('training_run_label') or data.get('version_badge') or data.get('job_id') or ''
+                if display_status == 'applied' and version_badge:
+                    training_version_text = '운영 적용 ' + version_badge
+                elif display_status in ('completed_pending_apply', 'completed') and version_badge:
+                    training_version_text = '학습 결과 ' + version_badge
+                elif display_status in ('queued', 'running') and version_badge:
+                    training_version_text = '학습 중 ' + version_badge
+                active_ref_f1 = 0.0
+                if target in ('rf-dual', 'rf-fall-v2') and display_status in ('completed_pending_apply', 'completed'):
+                    active_ref_f1 = max(
+                        self._dashboard_rf_job_f1(self._latest_applied_dashboard_rf_job(exclude_job_id=data.get('job_id') or '')),
+                        self._finite_float((self._rf_fall_v2_summary() or {}).get('f1'), 0.0),
+                    )
+                lower_than_active = bool(active_ref_f1 > 0 and candidate_f1 > 0 and candidate_f1 + 0.0005 < active_ref_f1)
+                display_message = data.get('message') or ''
+                if lower_than_active:
+                    if display_status == 'completed_pending_apply':
+                        display_status = 'completed'
+                    display_message = '운영 모델보다 성능이 낮아 적용하지 않습니다. 후보 CV F1 {:.1f}% / 운영 CV F1 {:.1f}%'.format(
+                        candidate_f1 * 100.0,
+                        active_ref_f1 * 100.0,
+                    )
+                    metric_bits.append('운영보다 낮음')
+                items.append({
+                    'ok': True,
+                    'name': 'dashboard-' + str(data.get('job_id') or name[:-5]),
+                    'label': label,
+                    'stage': display_status or data.get('stage') or data.get('status') or '',
+                    'status': display_status,
+                    'model_family': 'dashboard-job',
+                    'training_version_text': training_version_text,
+                    'candidate_version_text': data.get('version_badge') or '',
+                    'updated_at': data.get('updated_at') or data.get('created_at') or '',
+                    'progress': self._finite_float(data.get('progress'), 0.0),
+                    'processed': int(data.get('processed', 0) or 0),
+                    'total': int(data.get('total', 0) or 0),
+                    'eta_sec': data.get('eta_sec'),
+                    'log_path': data.get('log_path') or '',
+                    'latest_log': display_message or data.get('stage') or '',
+                    'job_id': data.get('job_id') or '',
+                    'message': display_message,
+                    'candidate_f1': candidate_f1,
+                    'candidate_accuracy': candidate_accuracy,
+                    'candidate_recall': candidate_recall,
+                    'training_samples': training_samples,
+                    'class_distribution': class_distribution,
+                    'result_summary_text': ' · '.join(metric_bits),
+                    'result': result,
+                })
+        except Exception:
+            return items
+        items.sort(key=lambda item: str(item.get('updated_at') or ''), reverse=True)
+        return items[:6]
+
+    def continuous_training_status_list(self):
+        items = []
+        preferred_rf = self._preferred_rf_pipeline_active_item()
+        rf_summary_path = preferred_rf.get('summary_path') if preferred_rf else self._persistent_model_path('rf-fall-v2', 'training_summary.json')
+        rf_model_path = preferred_rf.get('primary_model_path') if preferred_rf else self._rf_fall_v2_model_path()
+        for item in [
+            self._planned_model_retraining_status(
+                'rf-fall-v2',
+                'RF-Fall 운영 모델',
+                'fall-detection',
+                rf_summary_path,
+                rf_model_path,
+                0.95,
+                'AI-Hub 71641 원천 영상 완료 후 RF-Fall v2를 실제 데이터로 재학습합니다.',
+            ),
+            self._planned_model_retraining_status(
+                'xg-posture',
+                'XG-Posture 재학습',
+                'posture',
+                self._persistent_model_path('xg-posture', 'training_summary.json'),
+                self._xg_posture_model_path(),
+                0.95,
+                '현재 active posture 모델은 목표 성능을 충족합니다. 추가 데이터 학습은 별도 개선 작업으로 관리합니다.',
+            ),
+        ]:
+            if item.get('ok'):
+                items.append(item)
+        for name, label, family in [
+            ('aihub82', 'AI-Hub 82 표정', 'facial-emotion'),
+            ('aihub173', 'AI-Hub 173 상태', 'driver-state'),
+        ]:
+            item = self.continuous_training_status(name)
+            if name != 'aihub82' and not item.get('ok'):
+                continue
+            item.update({
+                'name': name,
+                'label': label,
+                'model_family': family,
+            })
+            items.append(item)
+        occlusion = self._posture_occlusion_training_status()
+        if occlusion.get('ok'):
+            items.append(occlusion)
+        items.extend(self._dashboard_training_status_items())
+        return items
 
     def continuous_training_status(self, name='aihub82'):
+        normalized_name = str(name or '').strip().lower()
+        if normalized_name in ('xg-posture-occlusion-aux', 'occlusion', 'xg-occlusion', 'posture-occlusion'):
+            return self._posture_occlusion_training_status()
+        if normalized_name in ('all', 'list', '*'):
+            items = self.continuous_training_status_list()
+            running = [item for item in items if str(item.get('stage') or item.get('status') or '') in ('queued', 'running')]
+            blocked = [item for item in items if str(item.get('stage') or item.get('status') or '') in ('blocked', 'failed', 'stale', 'preparing')]
+            return {
+                'ok': True,
+                'name': 'all',
+                'stage': 'running' if running else ('blocked' if blocked else 'completed'),
+                'items': items,
+                'running_count': len(running),
+                'blocked_count': len(blocked),
+                'total_count': len(items),
+                'message': f"학습 상태 {len(items)}개 확인",
+            }
         path = self._continuous_training_status_path(name)
         data = self._read_json(path, {})
         if not data:
@@ -9380,8 +13046,444 @@ class VideoAnalysis:
             }
         data.setdefault('ok', True)
         data.setdefault('status_path', path)
+        all_supervisor_status = self._read_json('/mnt/data/wiz/storage/training/fall-detection/continuous-model-supervisor/status.json', {}) or {}
+        target_floor = 0.95
+        data['target_macro_f1'] = max(self._finite_float(data.get('target_macro_f1'), target_floor), target_floor)
+        data['stretch_macro_f1'] = max(self._finite_float(data.get('stretch_macro_f1'), target_floor), data['target_macro_f1'])
+        def pid_alive(value):
+            return self._pid_running(value)
+
+        raw_stage = str(data.get('stage') or data.get('status') or '').strip()
+        if data.get('blocked_reason'):
+            has_pid = bool(data.get('pid') or data.get('supervisor_pid'))
+            still_alive = has_pid and (pid_alive(data.get('pid')) or pid_alive(data.get('supervisor_pid')))
+            if raw_stage != 'running' or not still_alive:
+                data['stage'] = 'blocked'
+                data['status'] = 'blocked'
+                data.setdefault('eta_text', '데이터 재수신 필요')
+                data.setdefault('message', data.get('latest_log') or '입력 데이터 문제로 학습을 시작할 수 없습니다.')
+
+        if str(name or '').strip().lower() == 'aihub82' and str(data.get('blocked_reason') or '') == 'aihub82_source_split_zip_incomplete':
+            download_process_count = (
+                len(self._command_processes('aihubshell'))
+                + len(self._command_processes('aihub_recovery_queue.sh'))
+                + len(self._command_processes('aihub_resumable_download_one.sh'))
+                + len(self._command_processes('redownload_aihub82_sources.sh'))
+            )
+            data['download_process_count'] = download_process_count
+            if download_process_count > 0:
+                data['stage'] = 'running'
+                data['status'] = 'running'
+                data['eta_text'] = data.get('eta_text') if str(data.get('eta_text') or '').strip() != 'AIHUB_API_KEY 필요' else '재수신 진행 중'
+                data['message'] = data.get('message') or 'AI-Hub 82 원천 데이터 재수신 프로세스가 실행 중입니다.'
+                data['latest_log'] = data.get('latest_log') or 'AI-Hub 82 재수신 진행 중'
+            elif not os.environ.get('AIHUB_API_KEY'):
+                data['eta_text'] = 'AIHUB_API_KEY 필요'
+                data['message'] = 'AI-Hub 82 원천 데이터 재수신이 필요하지만 현재 서버 환경에 AIHUB_API_KEY가 없어 다운로드를 시작하지 못했습니다.'
+                data['latest_log'] = '재수신 차단: AIHUB_API_KEY 환경변수 없음 · 활성 다운로드 프로세스 0개'
+            elif download_process_count <= 0:
+                data['eta_text'] = '재수신 미실행'
+                data['message'] = 'AI-Hub 82 원천 데이터 재수신 키는 감지됐지만 현재 다운로드 프로세스가 없습니다. 재수신 큐 실행이 필요합니다.'
+                data['latest_log'] = data.get('latest_log') or '재수신 대기: 활성 다운로드 프로세스 0개'
+
+        active_redownload = bool(
+            str(name or '').strip().lower() == 'aihub82'
+            and int(data.get('download_process_count') or 0) > 0
+            and data.get('redownload_pid')
+        )
+        if str(data.get('stage') or data.get('status') or '') == 'running' and not active_redownload:
+            has_pid = bool(data.get('pid') or data.get('supervisor_pid'))
+            if has_pid and not (pid_alive(data.get('pid')) or pid_alive(data.get('supervisor_pid'))):
+                if str(name or '').strip().lower() == 'aihub173':
+                    running_driver = self._command_processes('train_driver_state_aihub173.py')
+                    if running_driver:
+                        current_log = ''
+                        if str(all_supervisor_status.get('current_command') or '') == 'aihub173-driver-train':
+                            current_log = str(all_supervisor_status.get('current_command_log') or '')
+                        if not current_log:
+                            cmd = running_driver[0].get('cmd') or ''
+                            match_log = re.search(r'--output-dir\s+(\S+)', cmd)
+                            if match_log:
+                                output_base = os.path.basename(match_log.group(1).rstrip('/'))
+                                current_log = self._latest_file_by_prefix(
+                                    '/mnt/data/wiz/storage/training/fall-detection/continuous-model-supervisor',
+                                    'aihub173-driver-train-',
+                                    '.log',
+                                )
+                        data['stage'] = 'running'
+                        data['status'] = 'running'
+                        data['pid'] = running_driver[0].get('pid')
+                        data['log_path'] = current_log or data.get('log_path') or ''
+                        elapsed_sec = self._finite_float(
+                            all_supervisor_status.get('current_command_elapsed_sec'),
+                            self._elapsed_text_to_seconds(running_driver[0].get('elapsed')),
+                        )
+                        if elapsed_sec > 0:
+                            data['elapsed_sec'] = round(elapsed_sec, 1)
+                            data['elapsed_min'] = round(elapsed_sec / 60.0, 2)
+                        progress_line = self._latest_training_progress_line(data.get('log_path'))
+                        if progress_line:
+                            data['latest_log'] = progress_line
+                        data['eta_text'] = ''
+                        data['message'] = 'AI-Hub 173 상태 모델 95% 목표 재학습 중입니다.'
+                        data['processes'] = running_driver[:3]
+                        has_pid = False
+                if not has_pid:
+                    pass
+                elif has_pid:
+                    output_dir = str(data.get('output_dir') or '').strip()
+                    candidate_summary_path = ''
+                    candidate_summary = {}
+                    if output_dir and os.path.isdir(output_dir):
+                        for filename in (
+                            'aihub173_driver_state_summary.json',
+                            'aihub82_facial_emotion_summary.json',
+                            'training_summary.json',
+                        ):
+                            path_candidate = os.path.join(output_dir, filename)
+                            if os.path.isfile(path_candidate):
+                                candidate_summary_path = path_candidate
+                                candidate_summary = self._read_json(path_candidate, {}) or {}
+                                break
+                    if candidate_summary:
+                        metrics = candidate_summary.get('best_metrics', {}) or candidate_summary
+                        candidate_macro = self._finite_float(
+                            metrics.get('macro_f1', metrics.get('f1_macro', metrics.get('f1', 0.0))),
+                            0.0,
+                        )
+                        candidate_acc = self._finite_float(metrics.get('accuracy'), 0.0)
+                        active_summary_path = str(data.get('active_summary') or '')
+                        if not active_summary_path:
+                            if str(name or '').strip().lower() == 'aihub173':
+                                active_summary_path = self._persistent_model_path('facial-state', 'aihub173_driver_state_summary.json')
+                            else:
+                                active_summary_path = self._persistent_model_path('facial-state', 'aihub82_facial_emotion_summary.json')
+                        active_summary_for_cmp = self._read_json(active_summary_path, {}) or {}
+                        active_metrics = active_summary_for_cmp.get('best_metrics', {}) or active_summary_for_cmp
+                        active_macro = max(
+                            self._finite_float(data.get('active_macro_f1'), 0.0),
+                            self._finite_float(active_metrics.get('macro_f1'), 0.0),
+                            self._finite_float(active_metrics.get('f1_macro'), 0.0),
+                            self._finite_float(active_metrics.get('f1'), 0.0),
+                            self._finite_float(active_summary_for_cmp.get('macro_f1'), 0.0),
+                            self._finite_float(active_summary_for_cmp.get('f1_macro'), 0.0),
+                        )
+                        data['stage'] = 'completed'
+                        data['status'] = 'completed'
+                        data['progress'] = 1.0
+                        data['eta_sec'] = 0
+                        data['eta_text'] = '완료'
+                        data['candidate_summary'] = candidate_summary_path
+                        if candidate_macro > 0:
+                            data['candidate_macro_f1'] = round(candidate_macro, 4)
+                        if candidate_acc > 0:
+                            data['candidate_accuracy'] = round(candidate_acc, 4)
+                        if active_macro > 0:
+                            data['active_macro_f1'] = round(active_macro, 4)
+                        data['promoted'] = bool(candidate_macro > 0 and active_macro > 0 and candidate_macro > active_macro)
+                        data['message'] = (
+                            f"학습 프로세스가 종료되어 후보 summary를 확인했습니다. "
+                            f"candidate macro F1 {candidate_macro:.4f}"
+                            + (f", active macro F1 {active_macro:.4f}" if active_macro > 0 else '')
+                        )
+                    else:
+                        data['stage'] = 'stale'
+                        data['status'] = 'stale'
+                        data.setdefault('eta_text', '중단')
+                        data['message'] = data.get('latest_log') or '상태 파일은 running이지만 학습 PID가 종료되었습니다.'
+                    has_pid = False
+        def parse_experiment_label(label):
+            raw = os.path.basename(str(label or '').strip().rstrip('/'))
+            match = re.match(r'^(\d+)_([A-Za-z0-9_.-]+?)(?:_\d{8}_\d{6})?$', raw)
+            if not match:
+                return {'label': raw, 'index': None, 'name': raw, 'text': raw or '-'}
+            idx = int(match.group(1))
+            name_part = match.group(2).replace('_', ' ')
+            return {
+                'label': raw,
+                'index': idx,
+                'name': name_part,
+                'text': f"#{idx:04d} {name_part}",
+            }
+
+        experiment_label = (
+            data.get('experiment')
+            or os.path.basename(str(data.get('output_dir') or '').strip().rstrip('/'))
+        )
+        candidate_version = parse_experiment_label(experiment_label)
+        active_summary_path = str(data.get('active_summary') or self._persistent_model_path('facial-state', 'aihub82_facial_emotion_summary.json'))
+        active_summary = self._read_json(active_summary_path, {}) or {}
+        active_output_model = str(active_summary.get('output_model') or '')
+        active_label = os.path.basename(os.path.dirname(active_output_model)) if active_output_model else ''
+        active_version = parse_experiment_label(active_label)
+        experiment_root = self._persistent_model_path('facial-state', 'experiments', 'aihub82_continuous')
+        try:
+            total_candidates = len([
+                item for item in os.listdir(experiment_root)
+                if os.path.isdir(os.path.join(experiment_root, item))
+            ])
+        except Exception:
+            total_candidates = 0
+        if candidate_version.get('label'):
+            data.setdefault('candidate_version', candidate_version)
+            data.setdefault('candidate_version_text', candidate_version.get('text'))
+        if active_version.get('label'):
+            data.setdefault('active_version', active_version)
+            data.setdefault('active_version_text', active_version.get('text'))
+        if total_candidates > 0:
+            data.setdefault('total_candidate_versions', total_candidates)
+        version_bits = []
+        if data.get('candidate_version_text'):
+            version_bits.append('진행 ' + str(data.get('candidate_version_text')))
+        if data.get('active_version_text'):
+            version_bits.append('active ' + str(data.get('active_version_text')))
+        if total_candidates > 0:
+            version_bits.append(f"누적 후보 {total_candidates}개")
+        data.setdefault('training_version_text', ' · '.join(version_bits) if version_bits else '-')
+        if str(name or '').strip().lower() == 'aihub173':
+            running_driver = self._command_processes('train_driver_state_aihub173.py')
+            if running_driver:
+                current_log = str(data.get('log_path') or '')
+                if str(all_supervisor_status.get('current_command') or '') == 'aihub173-driver-train':
+                    current_log = str(all_supervisor_status.get('current_command_log') or current_log)
+                    current_pid = str(all_supervisor_status.get('current_command_pid') or '')
+                    if current_pid:
+                        data['pid'] = current_pid
+                if current_log:
+                    data['log_path'] = current_log
+                elapsed_sec = self._finite_float(
+                    all_supervisor_status.get('current_command_elapsed_sec'),
+                    self._elapsed_text_to_seconds(running_driver[0].get('elapsed')),
+                )
+                if elapsed_sec > 0:
+                    data['elapsed_sec'] = round(elapsed_sec, 1)
+                    data['elapsed_min'] = round(elapsed_sec / 60.0, 2)
+                progress_line = self._latest_training_progress_line(data.get('log_path'))
+                if progress_line:
+                    data['latest_log'] = progress_line
+                data['stage'] = 'running'
+                data['status'] = 'running'
+                data['processes'] = running_driver[:3]
+        latest_log = str(data.get('latest_log') or '')
+        if str(data.get('stage') or data.get('status') or '') == 'running':
+            progress_line = self._latest_training_progress_line(data.get('log_path'))
+            if progress_line:
+                data['latest_log'] = progress_line
+                data['progress_source_log'] = progress_line
+                latest_log = progress_line
+        elapsed_min = self._finite_float(data.get('elapsed_min'), 0.0)
+        match = re.search(r'epoch=(\d+)/(\d+)\s+step=(\d+)/(\d+)', latest_log)
+        if not match:
+            try:
+                log_path = str(data.get('log_path') or '')
+                with open(log_path, 'r', encoding='utf-8', errors='replace') as file:
+                    for line in reversed(file.read().splitlines()[-200:]):
+                        match = re.search(r'epoch=(\d+)/(\d+)\s+step=(\d+)/(\d+)', line)
+                        if match:
+                            data.setdefault('progress_source_log', line)
+                            break
+            except Exception:
+                match = None
+        if match and elapsed_min > 0:
+            epoch = max(1, int(match.group(1)))
+            epochs = max(1, int(match.group(2)))
+            step = max(0, int(match.group(3)))
+            steps = max(1, int(match.group(4)))
+            progress = max(0.0, min(0.995, ((epoch - 1) + min(step / steps, 1.0)) / epochs))
+            data.setdefault('progress', round(progress, 4))
+            if progress > 0:
+                eta_sec = max(0.0, (elapsed_min * 60.0) * (1.0 - progress) / progress)
+                eta_text = self._format_eta_text(eta_sec)
+                data['eta_sec'] = round(eta_sec, 1)
+                if str(data.get('eta_text') or '').strip() in ('', '-', '학습 중', '계산 중'):
+                    data['eta_text'] = eta_text
+            data['progress_text'] = f"epoch {epoch}/{epochs} · step {step}/{steps}"
+        elif str(data.get('stage')) == 'completed':
+            data.setdefault('progress', 1.0)
+            data.setdefault('eta_sec', 0)
+            data.setdefault('eta_text', '완료')
+        active_macro = self._finite_float(data.get('active_macro_f1'), self._finite_float(data.get('macro_f1'), 0.0))
+        target_macro = self._finite_float(data.get('target_macro_f1'), target_floor)
+        final_stage = str(data.get('stage') or data.get('status') or '').strip()
+        if final_stage and not str(data.get('status') or '').strip():
+            data['status'] = final_stage
+        if final_stage == 'running' and not str(data.get('eta_text') or '').strip():
+            if str(name or '').strip().lower() == 'aihub82':
+                source_text = ' '.join([
+                    str(data.get('latest_log') or ''),
+                    str(data.get('progress_source_log') or ''),
+                    str(data.get('message') or ''),
+                    str(data.get('log_path') or ''),
+                ]).lower()
+                has_train_progress = bool(re.search(r'epoch=\d+/\d+\s+step=\d+/\d+', source_text))
+                data['eta_text'] = '학습 중' if has_train_progress else (
+                    '재수신 진행 중' if ('재수신' in source_text or 'download' in source_text or '다운로드' in source_text or 'split zip' in source_text) else '학습 중'
+                )
+            else:
+                data['eta_text'] = '학습 중'
+        if final_stage == 'completed' and active_macro > 0 and active_macro + 1e-6 < target_macro:
+            data['stage'] = 'queued'
+            data['status'] = 'queued'
+            data['eta_text'] = '추가 학습 대기'
+            data['message'] = '현재 active macro F1 {:.1f}%로 최종 목표 {:.1f}% 미만입니다. 추가 학습 대기 중입니다.'.format(
+                active_macro * 100.0,
+                target_macro * 100.0,
+            )
         data.setdefault('message', data.get('latest_log') or data.get('stage') or 'AI-Hub 82 연속 학습 상태를 확인했습니다.')
         return data
+
+    def _pid_alive(self, value):
+        return self._pid_running(value)
+
+    def _spawn_background_command(self, command, log_path, env=None):
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+        for key in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS']:
+            merged_env.setdefault(key, '1')
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'ab') as log:
+            proc = subprocess.Popen(
+                command,
+                cwd=self._project_root(),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=merged_env,
+                start_new_session=True,
+            )
+        return proc.pid
+
+    def _resume_all_model_supervisor(self):
+        run_dir = '/mnt/data/wiz/storage/training/fall-detection/continuous-model-supervisor'
+        pid_path = os.path.join(run_dir, 'supervisor.pid')
+        existing_pid = 0
+        try:
+            with open(pid_path, 'r', encoding='utf-8') as file:
+                existing_pid = int(file.read().strip() or '0')
+        except Exception:
+            existing_pid = 0
+        if self._pid_alive(existing_pid):
+            return {
+                'ok': True,
+                'status': 'already-running',
+                'pid': existing_pid,
+                'message': '전체 모델 연속 학습 supervisor가 이미 실행 중입니다.',
+            }
+        script = self._project_abspath('scripts', 'continuous_all_model_training_supervisor.py')
+        pid = self._spawn_background_command(
+            [sys.executable, script],
+            os.path.join(run_dir, 'manual_resume.out'),
+            env={
+                'FALLAI_ALL_MODEL_FINAL_TARGET_F1': '0.95',
+                'FALLAI_ALL_MODEL_TARGET_LADDER': '0.90,0.93,0.95',
+            },
+        )
+        try:
+            with open(pid_path, 'w', encoding='utf-8') as file:
+                file.write(str(pid))
+        except Exception:
+            pass
+        return {
+            'ok': True,
+            'status': 'started',
+            'pid': pid,
+            'message': '전체 모델 연속 학습 supervisor를 재개했습니다.',
+        }
+
+    def _resume_aihub82_supervisor(self):
+        status_path = self._continuous_training_status_path('aihub82')
+        status = self._read_json(status_path, {}) or {}
+        supervisor_pid = int(status.get('supervisor_pid') or 0)
+        train_running = self._command_processes('train_facial_emotion_aihub82.py')
+        if self._pid_alive(supervisor_pid) or train_running:
+            status.update({
+                'ok': True,
+                'stage': 'running',
+                'status': 'running',
+                'target_macro_f1': 0.95,
+                'stretch_macro_f1': 0.95,
+                'message': status.get('message') or 'AI-Hub 82 표정 모델 95% 목표 연속 학습 중입니다.',
+                'updated_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            })
+            self._write_json(status_path, status)
+            return {
+                'ok': True,
+                'status': 'already-running',
+                'pid': supervisor_pid or (train_running[0].get('pid') if train_running else ''),
+                'message': 'AI-Hub 82 표정 학습이 이미 실행 중입니다.',
+            }
+        script = self._project_abspath('scripts', 'continuous_aihub82_training_supervisor.py')
+        pid = self._spawn_background_command(
+            [sys.executable, script],
+            self._project_abspath('outputs', 'continuous_training', 'aihub82_manual_resume.out'),
+            env={
+                'FALLAI_AIHUB82_TARGET_MACRO_F1': '0.95',
+                'FALLAI_AIHUB82_STRETCH_MACRO_F1': '0.95',
+                'FALLAI_AIHUB82_MAX_RUNS': '0',
+                'FALLAI_AIHUB82_SLEEP_BETWEEN_RUNS_SEC': '15',
+            },
+        )
+        self._write_json(status_path, {
+            **status,
+            'ok': True,
+            'stage': 'running',
+            'status': 'running',
+            'supervisor_pid': pid,
+            'target_macro_f1': 0.95,
+            'stretch_macro_f1': 0.95,
+            'message': 'AI-Hub 82 표정 연속 학습 supervisor를 재개했습니다.',
+            'updated_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        })
+        return {
+            'ok': True,
+            'status': 'started',
+            'pid': pid,
+            'message': 'AI-Hub 82 표정 연속 학습 supervisor를 재개했습니다.',
+        }
+
+    def resume_continuous_training(self, target='all'):
+        raw_target = str(target or 'all').strip().lower()
+        if raw_target in ('all', 'list', '*'):
+            target_model = 'all'
+        elif raw_target in ('xg-posture-occlusion-aux', 'occlusion', 'xg-occlusion'):
+            target_model = 'xg-posture-occlusion-aux'
+        elif raw_target in ('aihub82', 'facial', 'facial-aihub82'):
+            target_model = 'facial-aihub82'
+        elif raw_target in ('aihub173', 'driver-state', 'driver-aihub173'):
+            target_model = 'driver-aihub173'
+        elif raw_target in ('xg-posture', 'posture'):
+            target_model = 'xg-posture'
+        else:
+            target_model = self._normalize_training_target_model(raw_target)
+        actions = []
+        if target_model in ('all', 'facial-aihub82') or raw_target in ('aihub82', 'facial'):
+            actions.append({'aihub82': self._resume_aihub82_supervisor()})
+        if target_model in ('all', 'driver-aihub173', 'xg-posture-occlusion-aux') or raw_target in ('aihub173', 'driver-state', 'occlusion'):
+            actions.append({'all_model_supervisor': self._resume_all_model_supervisor()})
+        if target_model in ('rf-dual', 'rf-fall-v2', 'rf-pipeline'):
+            actions.append({'dashboard_rf_training': self.start_training_job(
+                job_type='rf',
+                note='manual resume from learning mode',
+                apply_mode='manual',
+                target_model='rf-fall-v2',
+            )})
+        if target_model == 'xg-posture':
+            actions.append({'all_model_supervisor': self._resume_all_model_supervisor()})
+            actions.append({'dashboard_posture_training': self.start_training_job(
+                job_type='posture',
+                note='manual resume from learning mode',
+                apply_mode='manual',
+                target_model='xg-posture',
+            )})
+        if target_model == 'all' and not any('all_model_supervisor' in action for action in actions):
+            actions.append({'all_model_supervisor': self._resume_all_model_supervisor()})
+        return {
+            'ok': True,
+            'target': raw_target,
+            'actions': actions,
+            'status': {'ok': True, 'items': []},
+            'message': '학습 재개/재점검 요청을 처리했습니다.',
+        }
 
     def _read_training_job(self, job_id):
         if not job_id or str(job_id).strip() == 'latest':
@@ -9407,11 +13509,63 @@ class VideoAnalysis:
             }
         return data
 
-    def start_training_job(self, job_type='full', note='', apply_mode='manual'):
+    def start_training_job(self, job_type='full', note='', apply_mode='manual', target_model='rf-dual', max_per_class=''):
+        target_model = self._normalize_training_target_model(target_model)
         job_type = str(job_type or 'full').strip().lower()
+        if job_type in ('aihub82', 'facial-aihub82', 'aihub173', 'driver-aihub173'):
+            return {
+                'ok': True,
+                'status': 'delegated',
+                'stage': 'continuous-training',
+                'target_model': target_model,
+                'message': '선택한 보조 모델은 대시보드 HITL job이 아니라 전용/연속 학습 파이프라인으로 관리됩니다.',
+                'continuous_training': self.continuous_training_status('aihub82') if target_model == 'facial-aihub82' else {},
+            }
         if job_type not in ('full', 'rf', 'posture'):
             job_type = 'full'
         apply_mode = str(apply_mode or 'manual').strip().lower()
+        try:
+            max_per_class_int = int(float(str(max_per_class or '').strip() or 0))
+        except Exception:
+            max_per_class_int = 0
+        max_per_class_int = max(0, max_per_class_int)
+        intake = self._intake_summary()
+        y_count = int(intake.get('Y', 0) or 0)
+        n_count = int(intake.get('N', 0) or 0)
+        posture_counts = intake.get('posture_intake') or {}
+        usable_posture = {
+            str(label): int(count or 0)
+            for label, count in posture_counts.items()
+            if int(count or 0) >= 2
+        }
+        blocking_requirements = []
+        if job_type in ('full', 'rf') and target_model in ('rf-dual', 'rf-fall-v2'):
+            if y_count < 2 or n_count < 2:
+                blocking_requirements.append({
+                    'type': 'binary_fall_labels',
+                    'required': 'Y/N 각각 최소 2건 이상',
+                    'current': {'Y': y_count, 'N': n_count},
+                    'message': f"RF 낙상 학습을 시작하려면 낙상 Y와 비낙상 N이 모두 필요합니다. 현재 Y={y_count}, N={n_count}입니다.",
+                })
+        if job_type == 'posture':
+            if len(usable_posture) < 2:
+                blocking_requirements.append({
+                    'type': 'posture_labels',
+                    'required': '서로 다른 자세 라벨 2종 이상, 각 2건 이상',
+                    'current': posture_counts,
+                    'message': 'XG-Posture 학습을 시작하려면 stand/walk/run/sit/lie/fall 중 최소 2개 자세에 각 2건 이상 필요합니다.',
+                })
+        if blocking_requirements:
+            return {
+                'ok': False,
+                'status': 'blocked',
+                'stage': 'blocked',
+                'target_model': target_model,
+                'job_type': job_type,
+                'intake_summary': intake,
+                'blocking_requirements': blocking_requirements,
+                'message': ' / '.join(item.get('message', '') for item in blocking_requirements if item.get('message')) or '학습 시작 조건을 만족하지 못했습니다.',
+            }
         job_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '-' + hashlib.sha1(
             f"{job_type}|{time.time()}".encode('utf-8')
         ).hexdigest()[:8]
@@ -9420,7 +13574,6 @@ class VideoAnalysis:
         runner = self._project_abspath('scripts', 'dashboard_training_job.py')
         if not os.path.isfile(runner):
             raise Exception('백그라운드 학습 runner를 찾지 못했습니다.')
-        intake = self._intake_summary()
         total_items = int(
             (intake.get('fall_sample_count', 0) or 0)
             + (intake.get('posture_sample_count', 0) or 0)
@@ -9428,11 +13581,15 @@ class VideoAnalysis:
             + (intake.get('N', 0) or 0)
             + (intake.get('posture_intake_total', 0) or 0)
         )
+        version_info = self._next_dashboard_training_version(target_model)
         status = {
             'ok': True,
             'job_id': job_id,
             'job_type': job_type,
+            'target_model': target_model,
+            **version_info,
             'apply_mode': apply_mode,
+            'max_per_class': max_per_class_int,
             'status': 'queued',
             'stage': 'queued',
             'progress': 0.0,
@@ -9449,12 +13606,23 @@ class VideoAnalysis:
         self._write_json(job_path, status)
         with open(self._training_latest_job_id_path(), 'w', encoding='utf-8') as file:
             file.write(job_id)
+        env = os.environ.copy()
+        for key in ['OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS']:
+            env.setdefault(key, '1')
+        env.setdefault('FALLAI_DASHBOARD_TRAINING', '1')
+        if max_per_class_int > 0 and target_model in ('rf-dual', 'rf-fall-v2'):
+            env['FALLAI_RF_TRAIN_MAX_PER_CLASS'] = str(max_per_class_int)
+            env.setdefault('FALLAI_RF_TRAIN_SAMPLE_STRATEGY', 'spread')
+        command = [sys.executable, runner, '--job-id', job_id, '--job-file', job_path, '--job-type', job_type, '--target-model', target_model]
+        if os.name != 'nt':
+            command = ['nice', '-n', '10'] + command
         with open(log_path, 'ab') as log:
             subprocess.Popen(
-                [sys.executable, runner, '--job-id', job_id, '--job-file', job_path, '--job-type', job_type],
+                command,
                 cwd=self._project_root(),
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=env,
                 start_new_session=True,
             )
         return self._read_training_job(job_id)
@@ -9475,6 +13643,39 @@ class VideoAnalysis:
         data = self._read_training_job(job_id)
         if data.get('status') not in ('completed', 'completed_pending_apply'):
             raise Exception('완료된 학습 job만 적용할 수 있습니다.')
+        target = self._normalize_training_target_model(data.get('target_model') or data.get('job_type') or 'rf-dual')
+        if target in ('rf-dual', 'rf-fall-v2'):
+            candidate_summary = self._dashboard_rf_training_summary_from_job(data)
+            candidate_f1 = self._finite_float(candidate_summary.get('f1'), 0.0) if candidate_summary else 0.0
+            applied_job = self._latest_applied_dashboard_rf_job(exclude_job_id=data.get('job_id') or '')
+            applied_f1 = self._dashboard_rf_job_f1(applied_job)
+            current_summary_f1 = self._finite_float((self._rf_fall_v2_summary() or {}).get('f1'), 0.0)
+            current_f1 = max(applied_f1, current_summary_f1)
+            if current_f1 > 0 and candidate_f1 > 0 and candidate_f1 + 0.0005 < current_f1:
+                raise Exception(
+                    '후보 성능이 현재 운영 모델보다 낮아 적용하지 않았습니다. '
+                    f'후보 CV F1 {round(candidate_f1 * 100, 1)}%, 운영 CV F1 {round(current_f1 * 100, 1)}%입니다.'
+                )
+            candidate_model_path = str(candidate_summary.get('candidate_model_path') or '').strip() if candidate_summary else ''
+            candidate_summary_path = str(candidate_summary.get('candidate_summary_path') or '').strip() if candidate_summary else ''
+            if candidate_model_path and os.path.isfile(candidate_model_path):
+                active_model_path = self._rf_project_model_path()
+                os.makedirs(os.path.dirname(active_model_path), exist_ok=True)
+                shutil.copy2(candidate_model_path, active_model_path)
+                try:
+                    shutil.copy2(candidate_model_path, self._RF_MODEL_PATH)
+                except Exception:
+                    pass
+                active_summary = dict(candidate_summary)
+                active_summary.update({
+                    'candidate_model_path': candidate_model_path,
+                    'candidate_summary_path': candidate_summary_path,
+                    'model_path': active_model_path,
+                    'applied_job_id': data.get('job_id') or '',
+                    'applied_at': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'apply_required': False,
+                })
+                self._write_json(self._rf_project_summary_path(), active_summary)
         data['status'] = 'applied'
         data['applied_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         data['message'] = '학습 결과를 운영 캐시에 반영했습니다.'
@@ -9642,13 +13843,50 @@ class VideoAnalysis:
         rows = []
         skipped = []
         intake_root = self._training_dir()
+        try:
+            max_per_class = int(float(os.environ.get('FALLAI_RF_TRAIN_MAX_PER_CLASS', '0') or 0))
+        except Exception:
+            max_per_class = 0
+        max_per_class = max(0, max_per_class)
+        sample_strategy = str(os.environ.get('FALLAI_RF_TRAIN_SAMPLE_STRATEGY', 'spread') or 'spread').strip().lower()
+        selected_by_class = {}
+        available_by_class = {}
+
+        def _select_rf_training_names(names):
+            names = sorted([str(name) for name in names])
+            if max_per_class <= 0 or len(names) <= max_per_class:
+                return names
+            if sample_strategy == 'latest':
+                return names[-max_per_class:]
+            if max_per_class == 1:
+                return [names[-1]]
+            # Deterministic spread sampling keeps early/middle/latest scenes represented
+            # while avoiding the full video scan during urgent retraining.
+            selected = []
+            last = len(names) - 1
+            for idx in range(max_per_class):
+                pos = round(idx * last / (max_per_class - 1))
+                selected.append(names[int(pos)])
+            return selected
+
+        dashboard_job_id = self._sanitize_filename(os.environ.get('FALLAI_DASHBOARD_JOB_ID', '') or '')
+        candidate_mode = bool(os.environ.get('FALLAI_DASHBOARD_TRAINING') == '1' and dashboard_job_id)
+        candidate_dir = self._persistent_model_path('rf-pipeline', 'candidates', dashboard_job_id) if candidate_mode else ''
+        candidate_model_path = os.path.join(candidate_dir, 'rf_hitl_model.pkl') if candidate_mode else ''
+        candidate_summary_path = os.path.join(candidate_dir, 'training_summary.json') if candidate_mode else ''
+        summary_output_path = candidate_summary_path if candidate_mode else self._rf_project_summary_path()
         for label in ['Y', 'N']:
             label_dir = os.path.join(intake_root, label)
             if os.path.isdir(label_dir) is False:
                 continue
-            for name in sorted(os.listdir(label_dir)):
-                if name.startswith('.') or name.endswith('.json'):
-                    continue
+            names = [
+                name for name in sorted(os.listdir(label_dir))
+                if not name.startswith('.') and not name.endswith('.json')
+            ]
+            available_by_class[label] = len(names)
+            selected_names = _select_rf_training_names(names)
+            selected_by_class[label] = len(selected_names)
+            for name in selected_names:
                 video_path = os.path.join(label_dir, name)
                 try:
                     extracted = self._extract_rf_pipeline_features(video_path)
@@ -9668,13 +13906,19 @@ class VideoAnalysis:
             },
             'features': list(self._RF_FEATURE_COLUMNS),
             'source': 'hitl-intake-rf-pipeline',
+            'sampling': {
+                'max_per_class': max_per_class,
+                'strategy': sample_strategy,
+                'available_by_class': available_by_class,
+                'selected_by_class': selected_by_class,
+            },
             'skipped': skipped,
             'ready': False,
         }
         errors = []
         if summary['class_distribution']['Y'] < 2 or summary['class_distribution']['N'] < 2:
             summary['message'] = 'RF HITL 재학습은 클래스별 최소 2건 이상 필요합니다.'
-            self._write_json(self._rf_project_summary_path(), summary)
+            self._write_json(summary_output_path, summary)
             return {'summary': summary, 'errors': errors}
 
         df = pd.DataFrame(rows)
@@ -9688,7 +13932,7 @@ class VideoAnalysis:
         cv_results = cross_validate(model, X, y, cv=cv, scoring=scoring, return_train_score=False)
         model.fit(X, y)
 
-        model_path = self._rf_project_model_path()
+        model_path = candidate_model_path if candidate_mode else self._rf_project_model_path()
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         # ── atomic write: temp → rename (읽기 중 손상 방지) ──
         import tempfile
@@ -9702,25 +13946,29 @@ class VideoAnalysis:
             if os.path.exists(_tmp_path):
                 os.unlink(_tmp_path)
             raise
-        # ── 서버 fallback 모델 동기화 ──
-        try:
-            _srv = self._RF_MODEL_PATH
-            _srv_tmp_fd, _srv_tmp = tempfile.mkstemp(
-                suffix='.pkl.tmp', dir=os.path.dirname(_srv))
-            os.close(_srv_tmp_fd)
-            joblib.dump(model, _srv_tmp)
-            os.replace(_srv_tmp, _srv)
-        except Exception:
-            pass  # 서버 경로 쓰기 실패는 치명적이지 않음
-        self.__class__._rf_model_cache = None
-        self.__class__._rf_model_mtime = None
-        self.__class__._rf_model_path_cache = None
+        if not candidate_mode:
+            # ── 서버 fallback 모델 동기화 ──
+            try:
+                _srv = self._RF_MODEL_PATH
+                _srv_tmp_fd, _srv_tmp = tempfile.mkstemp(
+                    suffix='.pkl.tmp', dir=os.path.dirname(_srv))
+                os.close(_srv_tmp_fd)
+                joblib.dump(model, _srv_tmp)
+                os.replace(_srv_tmp, _srv)
+            except Exception:
+                pass  # 서버 경로 쓰기 실패는 치명적이지 않음
+            self.__class__._rf_model_cache = None
+            self.__class__._rf_model_mtime = None
+            self.__class__._rf_model_path_cache = None
 
         y_pred = model.predict(X)
         y_proba = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else None
         summary.update({
             'ready': True,
             'model_path': self._project_relative_path(model_path),
+            'candidate_model_path': model_path if candidate_mode else '',
+            'candidate_summary_path': candidate_summary_path if candidate_mode else '',
+            'apply_required': bool(candidate_mode),
             'n_estimators': int(getattr(model, 'n_estimators', 0) or 0),
             'cv': {
                 'folds': n_splits,
@@ -9739,7 +13987,7 @@ class VideoAnalysis:
             },
             'feature_importance': {col: round(float(imp), 4) for col, imp in zip(self._RF_FEATURE_COLUMNS, getattr(model, 'feature_importances_', []))},
         })
-        self._write_json(self._rf_project_summary_path(), summary)
+        self._write_json(summary_output_path, summary)
         return {'summary': summary, 'errors': errors}
 
     def retrain_rf_pose_pipeline(self):
@@ -10679,7 +14927,8 @@ class VideoAnalysis:
     # ── RF-Dual: RF-Pipeline (binary fall) + XG-Posture behavior classifier ──
 
     def _infer_rf_dual(self, video_path, filename='', analysis_profile='balanced', input_source='upload',
-                        duration_hint=0, realtime_context=None):
+                        duration_hint=0, realtime_context=None, precomputed_ts_result=None,
+                        include_timeseries_result=False, skip_multi_person=False):
         """Dual-model inference: RF-Pipeline (binary fall) + XG-Posture behavior classifier.
 
         Uses RF for fast fall detection (13 statistical bbox features) and
@@ -10703,21 +14952,41 @@ class VideoAnalysis:
         # RF fall model. RF features are downsampled after the shared extraction,
         # while allowing XG-Posture to see gait/sit/lie windows at higher fps.
         _rf_target_fps = self._RF_TARGET_FPS
-        _posture_target_fps = self._POSTURE_REALTIME_TARGET_FPS if _is_realtime else self._POSTURE_UPLOAD_TARGET_FPS
+        _profile_key = str(analysis_profile or 'balanced').strip().lower()
+        _yolo_imgsz_override = None
+        if _is_realtime:
+            _posture_target_fps = self._POSTURE_REALTIME_TARGET_FPS
+        elif _profile_key in ('fast', 'quick', 'lite'):
+            _posture_target_fps = min(self._POSTURE_UPLOAD_TARGET_FPS, 4)
+            _yolo_imgsz_override = 416
+        elif _profile_key in ('full', 'precise', 'precision'):
+            _posture_target_fps = self._POSTURE_UPLOAD_TARGET_FPS
+            _yolo_imgsz_override = self._RF_YOLO_IMGSZ
+        else:
+            _posture_target_fps = self._POSTURE_UPLOAD_TARGET_FPS
+            _yolo_imgsz_override = self._RF_YOLO_IMGSZ
         _extract_target_fps = max(_rf_target_fps, _posture_target_fps)
         _rt_duration_hint = float(duration_hint or 0.0)
         _rt_expected_frames = int((_rt_duration_hint * _extract_target_fps) + 0.999) if _rt_duration_hint > 0 else 30
         _rt_cap_frames = int(self._REALTIME_STEADY_CHUNK_SEC * _extract_target_fps)
         _rf_max_frames = min(max(_rt_expected_frames, 8), max(_rt_cap_frames, 16)) if _is_realtime else None
         _t = _time.time()
-        ts_result = self._extract_unified_timeseries(
-            video_path, input_source=input_source,
-            duration_hint=duration_hint,
-            target_fps_override=_extract_target_fps,
-            max_frames_override=_rf_max_frames,
-        )
-        _perf.update(ts_result.get('perf', {}))
-        _perf['single_pass_extract'] = round(_time.time() - _t, 3)
+        if precomputed_ts_result is not None:
+            ts_result = precomputed_ts_result
+            _perf.update(ts_result.get('perf', {}))
+            _perf['single_pass_extract'] = 0.0
+            _perf['precomputed_timeseries_load'] = round(_time.time() - _t, 3)
+            _perf['shared_timeseries_reuse'] = True
+        else:
+            ts_result = self._extract_unified_timeseries(
+                video_path, input_source=input_source,
+                duration_hint=duration_hint,
+                target_fps_override=_extract_target_fps,
+                max_frames_override=_rf_max_frames,
+                yolo_imgsz_override=_yolo_imgsz_override,
+            )
+            _perf.update(ts_result.get('perf', {}))
+            _perf['single_pass_extract'] = round(_time.time() - _t, 3)
 
         timeseries = ts_result['timeseries']
         vid_meta = ts_result['vid_meta']
@@ -10731,7 +15000,7 @@ class VideoAnalysis:
 
         # ── FN-0004: Rolling memory — stitch previous chunk's tail ──
         _stitched_count = 0
-        if _is_realtime and timeseries:
+        if _is_realtime and timeseries and not skip_multi_person:
             import re as _re
             cache_map = self.__class__._rt_rolling_cache if isinstance(self.__class__._rt_rolling_cache, dict) else {}
             now_ts = _time.time()
@@ -10826,12 +15095,13 @@ class VideoAnalysis:
         }
         _v2_confirm_threshold = None
         _v2_suspect_threshold = None
-        if self._rf_fall_v2_available():
+        _explicit_rf_pipeline_selected = self._selected_registry_item_for_family('rf-pipeline') is not None
+        if self._rf_fall_v2_available() and not _explicit_rf_pipeline_selected:
             try:
                 _v2_bundle = self._get_rf_fall_v2_model()
                 _v2_model = _v2_bundle.get('model') if isinstance(_v2_bundle, dict) else _v2_bundle
                 _v2_cols = _v2_bundle.get('feature_cols', self._RF_FALL_V2_FEATURE_COLUMNS) if isinstance(_v2_bundle, dict) else self._RF_FALL_V2_FEATURE_COLUMNS
-                _v2_thresholds = _v2_bundle.get('thresholds', {}) if isinstance(_v2_bundle, dict) else {}
+                _v2_thresholds = self._rf_fall_v2_thresholds(bundle=_v2_bundle if isinstance(_v2_bundle, dict) else {})
                 _v2_confirm_threshold = float(_v2_thresholds.get('confirm', self._rf_confirm_threshold()) or self._rf_confirm_threshold())
                 _v2_suspect_threshold = float(_v2_thresholds.get('suspect', max(0.10, _v2_confirm_threshold - 0.12)) or max(0.10, _v2_confirm_threshold - 0.12))
                 _v2_derived = self._compute_rf_fall_v2_features_from_timeseries(timeseries, vid_meta, total_sampled)
@@ -10857,6 +15127,8 @@ class VideoAnalysis:
                     'thresholds': {
                         'confirm': round(_v2_confirm_threshold, 4),
                         'suspect': round(_v2_suspect_threshold, 4),
+                        'sensitivity_level': int(_v2_thresholds.get('sensitivity_level', 50) or 50),
+                        'sensitivity_delta': round(float(_v2_thresholds.get('sensitivity_delta', 0.0) or 0.0), 4),
                     },
                     'features': {
                         'fall_kinematic_score': round(float(_v2_feat.get('fall_kinematic_score', 0.0) or 0.0), 4),
@@ -11126,7 +15398,16 @@ class VideoAnalysis:
             except Exception as _pe:
                 _perf['posture_error'] = str(_pe)
 
-        if len(posture_windows) > 0 and self._xg_posture_occlusion_aux_available():
+        _skip_posture_occlusion_aux = bool((realtime_context or {}).get('skip_posture_occlusion_aux'))
+        if _skip_posture_occlusion_aux:
+            _posture_occlusion_aux.update({
+                'triggered': False,
+                'used': False,
+                'skipped': True,
+                'reason': 'fast_chunk_skip',
+            })
+        if len(posture_windows) > 0 and self._xg_posture_occlusion_aux_available() and not _skip_posture_occlusion_aux:
+            _occ_policy = self._occlusion_aux_thresholds()
             _safe_aux_classes = ('stand', 'walk', 'run', 'sit', 'lie')
             _current_ranked_for_aux = sorted(
                 [(k, float(posture_raw_probs.get(k, 0.0) or 0.0)) for k in _safe_aux_classes],
@@ -11140,13 +15421,14 @@ class VideoAnalysis:
             _aux_trigger = (
                 not _posture_available
                 or posture_raw_label == 'unknown'
-                or _posture_avg_conf < 0.38
-                or _posture_lower_body_visibility < 0.42
+                or _posture_avg_conf < float(_occ_policy.get('avg_conf_lt', 0.38))
+                or _posture_lower_body_visibility < float(_occ_policy.get('lower_body_visibility_lt', 0.42))
                 or _posture_vertical_occlusion_risk
-                or _current_margin_for_aux < 0.07
+                or _current_margin_for_aux < float(_occ_policy.get('posture_margin_lt', 0.07))
             )
             _posture_occlusion_aux.update({
                 'triggered': bool(_aux_trigger),
+                'policy': {k: round(float(v or 0.0), 4) for k, v in (_occ_policy or {}).items()},
                 'current_label': posture_raw_label,
                 'current_score': round(float(posture_raw_score or 0.0), 4),
                 'current_margin': round(float(_current_margin_for_aux or 0.0), 4),
@@ -11190,14 +15472,16 @@ class VideoAnalysis:
                     _avg_center_span = float(np.mean([float(w.get('center_x_span', 0.0) or 0.0) for w in posture_windows]))
                     _avg_center_dx = float(np.mean([float(w.get('center_dx_abs_mean', 0.0) or 0.0) for w in posture_windows]))
                     _reject_reason = ''
+                    _severe_lower_visibility = min(0.30, float(_occ_policy.get('lower_body_visibility_lt', 0.42)) * 0.72)
+                    _weak_margin = float(_occ_policy.get('posture_margin_lt', 0.07))
                     _aux_accept = (
                         aux_label in _safe_aux_classes
                         and (
                             not _posture_available
                             or posture_raw_label == 'unknown'
                             or aux_score >= float(posture_raw_score or 0.0) + 0.06
-                            or (_current_margin_for_aux < 0.07 and aux_score >= 0.28)
-                            or (_posture_lower_body_visibility < 0.30 and aux_score >= 0.24 and aux_margin >= 0.02)
+                            or (_current_margin_for_aux < _weak_margin and aux_score >= 0.28)
+                            or (_posture_lower_body_visibility < _severe_lower_visibility and aux_score >= 0.24 and aux_margin >= 0.02)
                             or (_posture_vertical_occlusion_risk and aux_score >= 0.24 and aux_margin >= 0.02)
                         )
                     )
@@ -11215,7 +15499,7 @@ class VideoAnalysis:
                         current_total = sum(current_safe.values())
                         if current_total > 0:
                             current_safe = {k: v / current_total for k, v in current_safe.items()}
-                        blend_aux_weight = 0.72 if (not _posture_available or posture_raw_label == 'unknown' or _posture_lower_body_visibility < 0.30 or _posture_vertical_occlusion_risk) else 0.58
+                        blend_aux_weight = 0.72 if (not _posture_available or posture_raw_label == 'unknown' or _posture_lower_body_visibility < _severe_lower_visibility or _posture_vertical_occlusion_risk) else 0.58
                         blended = {
                             c: (current_safe.get(c, 0.0) * (1.0 - blend_aux_weight) + aux_avg_probs.get(c, 0.0) * blend_aux_weight)
                             for c in _safe_aux_classes
@@ -11548,6 +15832,8 @@ class VideoAnalysis:
         _facial_state = self._facial_aux_default('not_triggered', '실시간에서는 표정 상태를 주기적으로 분석하고, 낙상 의심 구간에서는 정밀 표정 보조 분석을 실행합니다.')
         try:
             _t = _time.time()
+            _facial_context = dict(realtime_context or {})
+            _facial_context['analysis_profile'] = _profile_key
             _facial_state = self._analyze_facial_state_aux(
                 ts_result.get('raw_frames', []),
                 timeseries,
@@ -11557,7 +15843,7 @@ class VideoAnalysis:
                 suspect_threshold=_v2_suspect_threshold,
                 effective_threshold=_effective_threshold,
                 is_realtime=_is_realtime,
-                realtime_context=realtime_context,
+                realtime_context=_facial_context,
             )
             _facial_support = float(_facial_state.get('support_score', 0.0) or 0.0)
             _facial_body_gate = (
@@ -11674,7 +15960,7 @@ class VideoAnalysis:
 
         _perf['total'] = round(_time.time() - _t_total, 3)
 
-        return {
+        _result = {
             'fall_detected': fall_detected,
             'behavior_class': behavior_class,
             'behavior_label': behavior_label,
@@ -11781,6 +16067,7 @@ class VideoAnalysis:
                 'posture_feature_frames': len(timeseries),
                 'rf_target_fps': _rf_target_fps,
                 'posture_target_fps': _posture_target_fps,
+                'analysis_profile_quality': 'speed_tradeoff' if _profile_key in ('fast', 'quick', 'lite') else 'default_precision',
                 'frame_sampling': _frame_sampling,
                 'input_quality_warning': _decode_warning,
             },
@@ -11817,6 +16104,7 @@ class VideoAnalysis:
                 'posture_feature_frames': len(timeseries),
                 'rf_target_fps': _rf_target_fps,
                 'posture_target_fps': _posture_target_fps,
+                'analysis_profile_quality': 'speed_tradeoff' if _profile_key in ('fast', 'quick', 'lite') else 'default_precision',
                 'frame_sampling': _frame_sampling,
                 'input_quality_warning': _decode_warning,
                 'detection_frames': ts_result.get('detection_frames', []),
@@ -11828,6 +16116,255 @@ class VideoAnalysis:
                 'fps': vid_meta.get('fps', orig_fps),
             },
         }
+        if not skip_multi_person:
+            try:
+                _multi_person = self._build_multi_person_analysis(
+                    ts_result,
+                    analysis_profile=analysis_profile,
+                    input_source=input_source,
+                    duration_hint=duration_hint or vid_meta.get('duration', vid_duration),
+                )
+                _result['multi_person'] = _multi_person
+                _tracked_count = int((_multi_person or {}).get('count', 0) or 0)
+                if isinstance(_result.get('runtime_inference'), dict):
+                    _result['runtime_inference']['tracked_persons'] = _tracked_count
+                if isinstance(_result.get('model_runtime'), dict):
+                    _result['model_runtime']['tracked_persons'] = _tracked_count
+            except Exception as _mp_e:
+                _result['multi_person'] = {
+                    'enabled': False,
+                    'count': 0,
+                    'analyzed_count': 0,
+                    'people': [],
+                    'error': str(_mp_e),
+                    'summary_line': '사람별 행동 분석 생성에 실패했습니다.',
+                }
+        if include_timeseries_result:
+            _result['_shared_ts_result'] = ts_result
+        return _result
+
+    def _build_multi_person_analysis(self, ts_result, analysis_profile='balanced', input_source='upload', duration_hint=0):
+        """Build RF-Dual summaries for each tracked person without another YOLO pass."""
+        tracks = (ts_result or {}).get('person_timeseries') or {}
+        if not isinstance(tracks, dict) or len(tracks) == 0:
+            return {
+                'enabled': False,
+                'count': 0,
+                'analyzed_count': 0,
+                'people': [],
+                'summary_line': '사람별 트랙 데이터가 없어 대표 인물만 분석했습니다.',
+            }
+        try:
+            max_people = max(1, int(os.environ.get('FALLAI_MAX_PERSON_ANALYSIS', '8') or 8))
+        except Exception:
+            max_people = 8
+
+        def _track_stats(track_id, entries):
+            clean_entries = [copy.deepcopy(e) for e in list(entries or []) if isinstance(e, dict)]
+            clean_entries.sort(key=lambda e: (float(e.get('time_sec', 0.0) or 0.0), int(e.get('frame_idx', 0) or 0)))
+            areas = [self._finite_float(((e.get('bbox') or {}).get('area')), 0.0) for e in clean_entries]
+            confs = [self._finite_float(((e.get('bbox') or {}).get('conf')), 0.0) for e in clean_entries]
+            return {
+                'track_id': str(track_id),
+                'entries': clean_entries,
+                'frame_count': len(clean_entries),
+                'max_area': max(areas) if areas else 0.0,
+                'avg_area': (sum(areas) / len(areas)) if areas else 0.0,
+                'avg_conf': (sum(confs) / len(confs)) if confs else 0.0,
+                'first_time_sec': float(clean_entries[0].get('time_sec', 0.0) or 0.0) if clean_entries else 0.0,
+                'last_time_sec': float(clean_entries[-1].get('time_sec', 0.0) or 0.0) if clean_entries else 0.0,
+                'is_primary': any(bool(e.get('is_primary')) for e in clean_entries),
+                'person_label': str((clean_entries[0].get('person_label') if clean_entries else '') or f'P{track_id}'),
+            }
+
+        ranked_tracks = [
+            _track_stats(track_id, entries)
+            for track_id, entries in tracks.items()
+        ]
+        ranked_tracks = [item for item in ranked_tracks if item.get('frame_count', 0) > 0]
+        ranked_tracks.sort(key=lambda item: (item.get('frame_count', 0), item.get('max_area', 0.0)), reverse=True)
+        ranked_tracks = ranked_tracks[:max_people]
+
+        source_frames = list((ts_result or {}).get('detection_frames') or [])
+
+        def _detection_frames_for_track(track_id):
+            tid = str(track_id)
+            filtered = []
+            for frame in source_frames:
+                dets = []
+                for det in list((frame or {}).get('detections') or []):
+                    if str((det or {}).get('track_id', '')) == tid:
+                        dets.append(copy.deepcopy(det))
+                if dets:
+                    frame_copy = copy.deepcopy(frame)
+                    frame_copy['detections'] = dets
+                    filtered.append(frame_copy)
+            return filtered
+
+        people = []
+        behavior_label_map = {
+            'fall': '낙상',
+            'stand': '서기',
+            'walk': '걷기',
+            'run': '뛰기',
+            'sit': '앉기',
+            'lie': '눕기',
+            'non-fall': '비낙상',
+            'unknown': '분석 불가',
+        }
+        vid_meta = dict((ts_result or {}).get('vid_meta') or {})
+        base_duration = self._finite_float(duration_hint, 0.0) or self._finite_float(vid_meta.get('duration'), 0.0)
+        base_sampling = dict((ts_result or {}).get('frame_sampling') or {})
+        base_perf = dict((ts_result or {}).get('perf') or {})
+
+        for rank, item in enumerate(ranked_tracks, start=1):
+            track_id = item.get('track_id')
+            person_label = item.get('person_label') or f'P{track_id}'
+            entries = item.get('entries') or []
+            track_frames = _detection_frames_for_track(track_id)
+            track_ts = {
+                'timeseries': entries,
+                'vid_meta': dict(vid_meta),
+                'detection_frames': track_frames,
+                'person_timeseries': {},
+                'perf': {
+                    'person_track_reuse': True,
+                    'source_extract_total': base_perf.get('total') or base_perf.get('single_pass_extract') or 0,
+                },
+                'raw_frames': list((ts_result or {}).get('raw_frames') or []),
+                'total_sampled': len(entries),
+                'frame_sampling': {
+                    **base_sampling,
+                    'source': 'person_track_reuse',
+                    'track_id': track_id,
+                    'track_frames': len(entries),
+                },
+                'decode_warning': (ts_result or {}).get('decode_warning'),
+            }
+            person_context = {
+                'person_track_analysis': True,
+                'skip_facial_aux': True,
+                'skip_posture_occlusion_aux': bool(os.environ.get('FALLAI_PERSON_SKIP_OCCLUSION_AUX', '0') == '1'),
+                'track_id': track_id,
+                'session_id': f"person_{track_id}",
+            }
+            try:
+                person_result = self._infer_rf_dual(
+                    '',
+                    filename=f'{person_label}-track',
+                    analysis_profile=analysis_profile,
+                    input_source=input_source,
+                    duration_hint=base_duration,
+                    realtime_context=person_context,
+                    precomputed_ts_result=track_ts,
+                    include_timeseries_result=False,
+                    skip_multi_person=True,
+                )
+                person_result.pop('multi_person', None)
+                person_result['runtime_key'] = 'rf-dual-person'
+                person_result['runtime_label'] = f'RF-Dual 사람별 분석 ({person_label})'
+                person_result['person_id'] = f'person-{track_id}'
+                person_result['track_id'] = track_id
+                person_result['person_label'] = person_label
+                person_result['summary'] = f"{person_label} · {person_result.get('summary', '')}".strip()
+                if isinstance(person_result.get('runtime_inference'), dict):
+                    person_result['runtime_inference']['person_track'] = True
+                    person_result['runtime_inference']['track_id'] = track_id
+                    person_result['runtime_inference']['person_label'] = person_label
+                if isinstance(person_result.get('model_runtime'), dict):
+                    person_result['model_runtime']['label'] = person_result['runtime_label']
+                    person_result['model_runtime']['person_track'] = True
+                    person_result['model_runtime']['track_id'] = track_id
+                    person_result['model_runtime']['person_label'] = person_label
+                    person_result['model_runtime']['detection_frames'] = track_frames
+                person_result['log_summary'] = self._build_log_summary(person_result)
+            except Exception as e:
+                person_result = {
+                    'fall_detected': False,
+                    'behavior_class': 'unknown',
+                    'behavior_label': '분석 불가',
+                    'risk_score': 0.0,
+                    'risk_level': 'low',
+                    'risk_label': '분석 불가',
+                    'summary': f'{person_label} 트랙 분석 실패: {e}',
+                    'events': [],
+                    'reference_matches': [],
+                    'analysis_basis': [],
+                    'runtime_key': 'rf-dual-person',
+                    'runtime_label': f'RF-Dual 사람별 분석 ({person_label})',
+                    'posture_label': 'unknown',
+                    'posture_score': 0.0,
+                    'posture_probs': {},
+                    'decision_state': 'safe',
+                    'explain': [str(e)],
+                    'runtime_inference': {
+                        'person_track': True,
+                        'track_id': track_id,
+                        'person_label': person_label,
+                        'error': str(e),
+                        'detected_person_frames': len(entries),
+                    },
+                    'behavior_inference': {'code': 'unknown', 'label': '분석 불가', 'source': 'rf-dual-person', 'fallback': True},
+                    'model_runtime': {
+                        'label': f'RF-Dual 사람별 분석 ({person_label})',
+                        'person_track': True,
+                        'track_id': track_id,
+                        'person_label': person_label,
+                        'detection_frames': track_frames,
+                        'detected_person_frames': len(entries),
+                        'extracted_frames': len(entries),
+                    },
+                    'video_meta': dict(vid_meta),
+                    'person_id': f'person-{track_id}',
+                    'track_id': track_id,
+                    'person_label': person_label,
+                }
+                person_result['log_summary'] = self._build_log_summary(person_result)
+
+            behavior_class = str(person_result.get('behavior_class') or person_result.get('posture_label') or 'unknown')
+            risk_score = self._finite_float(person_result.get('risk_score'), 0.0)
+            person_item = {
+                'id': f'person-{track_id}',
+                'track_id': track_id,
+                'person_label': person_label,
+                'rank': rank,
+                'is_primary': bool(item.get('is_primary')),
+                'frame_count': int(item.get('frame_count') or 0),
+                'first_time_sec': round(float(item.get('first_time_sec') or 0.0), 3),
+                'last_time_sec': round(float(item.get('last_time_sec') or 0.0), 3),
+                'avg_conf': round(float(item.get('avg_conf') or 0.0), 4),
+                'max_bbox_area': round(float(item.get('max_area') or 0.0), 5),
+                'risk_score': round(risk_score, 4),
+                'risk_level': person_result.get('risk_level', 'low'),
+                'risk_label': person_result.get('risk_label', ''),
+                'fall_detected': bool(person_result.get('fall_detected')),
+                'behavior_class': behavior_class,
+                'behavior_label': person_result.get('behavior_label') or behavior_label_map.get(behavior_class, behavior_class),
+                'posture_label': person_result.get('posture_label', ''),
+                'posture_score': person_result.get('posture_score', 0.0),
+                'decision_state': person_result.get('decision_state', ''),
+                'summary': person_result.get('summary', ''),
+                'result': self._sanitize_for_json(person_result),
+            }
+            people.append(person_item)
+
+        risk_rank = {'high': 3, 'medium': 2, 'low': 1}
+        people.sort(key=lambda p: (risk_rank.get(str(p.get('risk_level') or 'low'), 0), p.get('risk_score', 0), p.get('frame_count', 0)), reverse=True)
+        for idx, person in enumerate(people, start=1):
+            person['display_order'] = idx
+
+        caution_count = sum(1 for p in people if p.get('risk_level') in ('medium', 'high') or p.get('fall_detected'))
+        summary_line = f"{len(people)}명 사람별 행동 분석"
+        if caution_count > 0:
+            summary_line += f" · 주의 {caution_count}명"
+        return self._sanitize_for_json({
+            'enabled': True,
+            'count': len(people),
+            'analyzed_count': len(people),
+            'max_people': max_people,
+            'people': people,
+            'summary_line': summary_line,
+        })
 
     # ── FN-0014 Stage B: Shadow mode — RF-Pose vs XG-Posture comparison ──
 

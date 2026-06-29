@@ -12,7 +12,7 @@ export class Component implements OnInit {
     constructor(public service: Service) { }
 
     public async ngOnInit() {
-        await this.service.init();
+        await this.service.init(this);
         await this.loadPrototypeInfo();
     }
 
@@ -67,5 +67,44 @@ export class Component implements OnInit {
             default:
                 return 'bg-slate-50 text-slate-700 border border-slate-200';
         }
+    }
+
+    public modelTrainingStats(): any[] {
+        const stats = this.prototypeInfo?.dataset_summary?.model_training_stats;
+        return Array.isArray(stats) ? stats : [];
+    }
+
+    public modelTrainingStat(key: string): any {
+        return this.modelTrainingStats().find((item: any) => item?.key === key) || {};
+    }
+
+    public modelTrainingStatCards(): any[] {
+        return this.modelTrainingStats().slice(0, 6);
+    }
+
+    public totalTrainingSamples(): number {
+        const total = Number(this.prototypeInfo?.dataset_summary?.total_training_samples || 0);
+        if (Number.isFinite(total) && total > 0) return total;
+        return this.modelTrainingStats().reduce((sum: number, item: any) => sum + Number(item?.sample_count || 0), 0);
+    }
+
+    public percentText(value: any): string {
+        const num = Number(value || 0);
+        if (!Number.isFinite(num) || num <= 0) return '-';
+        return `${(num * 100).toFixed(1)}%`;
+    }
+
+    public modelMetricText(item: any): string {
+        const bits = [];
+        if (item?.algorithm) bits.push(String(item.algorithm));
+        const f1 = Number(item?.macro_f1 ?? item?.f1 ?? 0);
+        const acc = Number(item?.accuracy ?? 0);
+        const recall = Number(item?.recall ?? 0);
+        const precision = Number(item?.precision ?? 0);
+        if (Number.isFinite(f1) && f1 > 0) bits.push(`F1 ${(f1 * 100).toFixed(1)}%`);
+        if (Number.isFinite(acc) && acc > 0) bits.push(`Acc ${(acc * 100).toFixed(1)}%`);
+        if (Number.isFinite(recall) && recall > 0) bits.push(`Recall ${(recall * 100).toFixed(1)}%`);
+        if (Number.isFinite(precision) && precision > 0) bits.push(`Precision ${(precision * 100).toFixed(1)}%`);
+        return bits.join(' · ') || '-';
     }
 }

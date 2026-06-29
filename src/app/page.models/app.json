@@ -1,0 +1,11 @@
+{
+    "mode": "page",
+    "id": "page.models",
+    "title": "/models",
+    "namespace": "models",
+    "viewuri": "/models",
+    "category": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-models()"
+}

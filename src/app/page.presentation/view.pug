@@ -6,9 +6,13 @@ div(class="presentation-root")
             div(class="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600 text-white shrink-0")
                 svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                     path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 3.75h16.5M3.75 8.25h16.5m-16.5 4.5h7.5m-7.5 4.5h7.5")
-            span(class="text-[13px] font-semibold text-slate-900 truncate hidden sm:block") FallAI 표정·가림 보조 모델 발표
+            span(class="text-[13px] font-semibold text-slate-900 truncate hidden sm:block") FallAI 포트폴리오
         div(class="flex items-center gap-2")
             span(class="text-xs text-slate-400 tabular-nums") {{current + 1}} / {{total}}
+            button(type="button", class="pres-topbtn portfolio-export-btn", (click)="exportPortfolioPdf()", [title]="'포트폴리오 PDF 배포'")
+                svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
+                    path(stroke-linecap="round", stroke-linejoin="round", d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M7.5 10.5 12 15m0 0 4.5-4.5M12 15V3")
+                span(class="hidden sm:inline") PDF 배포
             button(type="button", class="pres-topbtn", (click)="toggleOverview()", [title]="'슬라이드 목록 (Tab)'")
                 svg(xmlns="http://www.w3.org/2000/svg", fill="none", viewBox="0 0 24 24", stroke-width="1.5", stroke="currentColor", class="size-4")
                     path(stroke-linecap="round", stroke-linejoin="round", d="M3.75 6h16.5M3.75 12h16.5m-16.5 6h16.5")
@@ -422,3 +426,46 @@ div(class="presentation-root")
                 span(class="overview-num") {{i + 1}}
                 span(class="overview-badge-sm") {{truncate(s.badge || s.title, 24)}}
                 p(class="overview-title-sm") {{truncate(s.title)}}
+
+    //- ── PDF EXPORT DOCUMENT ───────────────────────────────────────
+    section(class="portfolio-pdf-sheet", aria-hidden="true")
+        article(class="portfolio-pdf-cover")
+            div(class="portfolio-pdf-kicker") FallAI Portfolio
+            h1 FallAI 낙상 위험 영상 분석 포트폴리오
+            p RF-Dual, XG-Posture, 표정 보조, 가림 보조 모델의 목표·검증·운영 결론을 한눈에 볼 수 있도록 재구성한 PDF 문서입니다.
+            div(class="portfolio-pdf-cover-grid")
+                div(*ngFor="let stat of portfolioCoverStats()", class="portfolio-pdf-stat")
+                    span {{stat.label}}
+                    strong {{stat.value}}
+            div(class="portfolio-pdf-meta")
+                span {{portfolioExportDateText()}}
+                span /presentation
+        article(*ngFor="let s of slides; let i = index", class="portfolio-pdf-page")
+            header(class="portfolio-pdf-page-head")
+                span {{i + 1 | number:'2.0-0'}}
+                div
+                    p {{s.badge || 'Portfolio'}}
+                    h2 {{s.title}}
+            p(*ngIf="s.subtitle", class="portfolio-pdf-lead") {{s.subtitle}}
+            div(*ngIf="s.stats", class="portfolio-pdf-stat-grid")
+                div(*ngFor="let stat of s.stats", class="portfolio-pdf-stat")
+                    span {{stat.label}}
+                    strong {{stat.value}}
+            div(*ngIf="s.tables", class="portfolio-pdf-table-stack")
+                div(*ngFor="let tbl of s.tables", class="portfolio-pdf-table-wrap")
+                    h3(*ngIf="tbl.title") {{tbl.title}}
+                    table(class="portfolio-pdf-table")
+                        thead
+                            tr
+                                th(*ngFor="let h of tbl.headers") {{h}}
+                        tbody
+                            tr(*ngFor="let row of tbl.rows")
+                                td(*ngFor="let cell of row") {{cell}}
+            ul(*ngIf="s.bullets", class="portfolio-pdf-list")
+                li(*ngFor="let b of s.bullets") {{b}}
+            div(*ngIf="s.points", class="portfolio-pdf-point-grid")
+                div(*ngFor="let point of s.points", class="portfolio-pdf-point") {{point}}
+            figure(*ngIf="s.image", class="portfolio-pdf-figure")
+                img([src]="s.image", [alt]="s.title")
+                figcaption {{s.title}}
+            p(*ngIf="s.note", class="portfolio-pdf-note") {{s.note}}
