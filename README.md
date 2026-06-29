@@ -30,6 +30,8 @@ WIZ 프레임워크 기반 FallAI 운영 프로젝트입니다.
 
 교수님/검토자에게 코드 구조를 설명할 때는 [docs/professor-code-overview-20260629.md](docs/professor-code-overview-20260629.md)를 먼저 공유하면 됩니다. 다른 서버에서 프로젝트를 복구해야 할 때는 [docs/server-restore-guide-20260629.md](docs/server-restore-guide-20260629.md)를 따릅니다.
 
+코드 전체를 보면서 설명을 함께 확인해야 할 때는 [docs/code-explorer/index.html](docs/code-explorer/index.html)을 사용합니다. 이 페이지는 왼쪽에 원본 코드 전체, 오른쪽에 비전공자용 설명을 붙인 교수님 검토용 코드 탐색 문서입니다.
+
 ---
 
 ## 데모 계정
