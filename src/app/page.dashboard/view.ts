@@ -493,6 +493,19 @@ export class Component implements OnInit, OnDestroy {
         return `${frames}프레임 · 포즈 ${conf}%`;
     }
 
+    public personCardFacialText(item: any): string {
+        const result = item?.result || {};
+        const face = this.facialStateAux(result) || item?.facial_state || null;
+        if (!face) return '표정 대기';
+        const displayResult = this.facialStateAux(result) ? result : { facial_state: face };
+        const label = this.facialStateLabel(displayResult);
+        const percent = this.facialStatePercent(displayResult);
+        if (face?.reason === 'person_track_skip') return '표정 분석 꺼짐';
+        if (face?.reason === 'face_not_detected' || face?.face_visible === false) return '표정 얼굴 미검출';
+        if (face?.available && percent > 0) return `표정 ${label} ${percent}%`;
+        return `표정 ${label}`;
+    }
+
     public selectedPersonHeaderText(): string {
         if (this.selectedPersonAnalysisId === 'overall') return '인원 선택';
         const item = this.findPersonAnalysisItem(this.selectedPersonAnalysisId);

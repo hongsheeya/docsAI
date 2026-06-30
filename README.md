@@ -28,9 +28,9 @@ WIZ 프레임워크 기반 FallAI 운영 프로젝트입니다.
 
 상세 운영 문서는 [docs/2026-06-01-current-status-and-training-pipeline.md](docs/2026-06-01-current-status-and-training-pipeline.md), 전체 개요는 [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)를 참고합니다. [docs/xg-dual-architecture.md](docs/xg-dual-architecture.md)는 **레거시 설계 문서**이며, 현재 운영 기준은 RF-Dual입니다.
 
-교수님/검토자에게 코드 구조를 설명할 때는 [docs/professor-code-overview-20260629.md](docs/professor-code-overview-20260629.md)를 먼저 공유하면 됩니다. 다른 서버에서 프로젝트를 복구해야 할 때는 [docs/server-restore-guide-20260629.md](docs/server-restore-guide-20260629.md)를 따릅니다.
+교수님/검토자에게 코드 구조를 설명할 때는 [docs/professor-code-overview-20260629.md](docs/professor-code-overview-20260629.md)를 먼저 공유하면 됩니다. GitHub에서 어떤 순서로 읽어야 하는지는 [docs/github-code-reading-guide-20260630.md](docs/github-code-reading-guide-20260630.md)에 정리했습니다. 다른 서버에서 프로젝트를 복구해야 할 때는 [docs/server-restore-guide-20260629.md](docs/server-restore-guide-20260629.md)를 따릅니다.
 
-코드 전체를 보면서 설명을 함께 확인해야 할 때는 [docs/code-explorer/index.html](docs/code-explorer/index.html)을 사용합니다. 이 페이지는 왼쪽에 원본 코드 전체, 오른쪽에 비전공자용 설명을 붙인 교수님 검토용 코드 탐색 문서입니다.
+코드 전체를 보면서 설명을 함께 확인해야 할 때는 [docs/code-explorer/index.html](docs/code-explorer/index.html)을 사용합니다. 이 페이지는 왼쪽에 원본 코드 전체, 코드 옆에 줄별 쉬운 해석, 오른쪽에 비전공자용 설명을 붙인 교수님 검토용 코드 탐색 문서입니다.
 
 ---
 
@@ -54,7 +54,9 @@ src/
 │   ├── layout.sidebar/           # 사이드바 레이아웃 (h-screen, 회색 배경, 스크롤)
 │   ├── component.nav.sidebar/    # 사이드바 네비게이션 컴포넌트
 │   ├── page.access/              # 로그인 페이지
-│   ├── page.dashboard/           # 대시보드 (통계 + 최근 게시물)
+│   ├── page.dashboard/           # 메인 분석 화면 (영상 업로드/웹캠/사람별 분석)
+│   ├── page.models/              # 모델 관리와 백그라운드 학습 상태
+│   ├── page.pipeline/            # 분석 파이프라인과 성능 설명
 │   ├── page.posts/               # 게시물 목록 (라우팅 전용 → post 패키지)
 │   ├── page.posts.item/          # 게시물 상세 (라우팅 전용 → post 패키지)
 │   ├── page.members/             # 멤버 관리

@@ -16241,9 +16241,11 @@ class VideoAnalysis:
                 },
                 'decode_warning': (ts_result or {}).get('decode_warning'),
             }
+            _person_facial_aux_enabled = os.environ.get('FALLAI_PERSON_FACIAL_AUX', 'true').lower() not in ('0', 'false', 'no')
             person_context = {
                 'person_track_analysis': True,
-                'skip_facial_aux': True,
+                'skip_facial_aux': not _person_facial_aux_enabled,
+                'force_facial_refresh': True,
                 'skip_posture_occlusion_aux': bool(os.environ.get('FALLAI_PERSON_SKIP_OCCLUSION_AUX', '0') == '1'),
                 'track_id': track_id,
                 'session_id': f"person_{track_id}",
@@ -16323,6 +16325,7 @@ class VideoAnalysis:
 
             behavior_class = str(person_result.get('behavior_class') or person_result.get('posture_label') or 'unknown')
             risk_score = self._finite_float(person_result.get('risk_score'), 0.0)
+            facial_state = person_result.get('facial_state') or ((person_result.get('runtime_inference') or {}).get('facial_state')) or {}
             person_item = {
                 'id': f'person-{track_id}',
                 'track_id': track_id,
@@ -16342,6 +16345,7 @@ class VideoAnalysis:
                 'behavior_label': person_result.get('behavior_label') or behavior_label_map.get(behavior_class, behavior_class),
                 'posture_label': person_result.get('posture_label', ''),
                 'posture_score': person_result.get('posture_score', 0.0),
+                'facial_state': self._sanitize_for_json(facial_state) if isinstance(facial_state, dict) else {},
                 'decision_state': person_result.get('decision_state', ''),
                 'summary': person_result.get('summary', ''),
                 'result': self._sanitize_for_json(person_result),
@@ -16354,7 +16358,7 @@ class VideoAnalysis:
             person['display_order'] = idx
 
         caution_count = sum(1 for p in people if p.get('risk_level') in ('medium', 'high') or p.get('fall_detected'))
-        summary_line = f"{len(people)}명 사람별 행동 분석"
+        summary_line = f"{len(people)}명 사람별 행동·표정 분석"
         if caution_count > 0:
             summary_line += f" · 주의 {caution_count}명"
         return self._sanitize_for_json({

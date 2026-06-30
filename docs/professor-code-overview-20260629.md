@@ -10,6 +10,8 @@
 - 생성 스크립트: `scripts/generate_code_explorer.py`
 - 다시 생성 명령: `python scripts/generate_code_explorer.py`
 
+GitHub에서 어떤 순서로 눌러서 읽어야 하는지는 `docs/github-code-reading-guide-20260630.md`에 별도 안내문으로 정리했습니다. 교수님께 GitHub 주소와 함께 이 문서를 전달하면 됩니다.
+
 ## 1. 프로젝트를 한 문장으로 설명하면
 
 FallAI는 영상을 업로드하거나 웹캠을 연결하면 AI가 사람의 자세와 움직임을 분석하고, 낙상 위험, 행동 상태, 표정/상태 보조 판단, 학습 현황을 화면에 보여주는 웹 기반 프로토타입입니다.
@@ -141,7 +143,8 @@ src/model/libs/ 모델 보조 로직 + storage/model 파일
 | `page.mypage/` | 내 정보 | 프로필 수정, 비밀번호 변경을 담당합니다. |
 | `page.posts/` | 게시판 목록 | 게시글 목록으로 이동하는 라우팅 화면입니다. 실제 게시판 기능은 `portal/post`에 있습니다. |
 | `page.posts.item/` | 게시글 상세 | 게시글 하나를 보여주는 라우팅 화면입니다. |
-| `page.presentation/` | 발표자료 화면 | 프로젝트 발표자료나 발표용 내용을 사이트 안에서 보여줍니다. |
+
+참고: 기존 `page.presentation/` 포트폴리오/발표자료 화면은 별도 백업 후 사이트 라우트에서 제거했습니다.
 
 ## 10. 메인 분석 화면 상세 설명
 

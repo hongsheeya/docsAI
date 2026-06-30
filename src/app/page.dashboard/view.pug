@@ -26,8 +26,6 @@ nav(class="shrink-0 border-b border-zinc-200 bg-white z-30")
                 class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 모델 관리
             a(routerLink="/manual",
                 class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 설명서
-            a(routerLink="/presentation",
-                class="inline-flex h-9 min-w-[96px] items-center justify-center rounded-xl border border-orange-200 bg-orange-50 px-4 text-[13px] font-semibold text-orange-700 hover:bg-orange-100") 포트폴리오
             a(*ngIf="service.auth?.check?.role('admin') === true",
                 routerLink="/admin/analysis",
                 class="inline-flex h-9 min-w-[88px] items-center justify-center rounded-xl border border-zinc-300 bg-white px-4 text-[13px] font-medium text-zinc-700 hover:bg-zinc-50") 관리자
@@ -128,6 +126,7 @@ section(*ngIf="inputMode === 'webcam'",
                                             class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700") 대표
                                     span(class="shrink-0 text-[11px] font-semibold") {{ personCardRiskText(item) }}
                                 div(class="mt-1 truncate text-[11px] text-zinc-600") {{ item.behavior_label }}
+                                div(class="mt-0.5 truncate text-[10px] text-cyan-600") {{ personCardFacialText(item) }}
                                 div(class="mt-0.5 text-[10px] text-zinc-500") {{ personCardMetaText(item) }}
 
                 //- 실시간 오버레이 패널
@@ -719,6 +718,7 @@ div(*ngIf="analysisResult && inputMode !== 'webcam'",
                                 class="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[9px] font-bold text-emerald-700") 대표
                         span(class="shrink-0 text-[11px] font-semibold") {{ personCardRiskText(item) }}
                     div(class="mt-1 truncate text-[11px] text-zinc-600") {{ item.behavior_label }}
+                    div(class="mt-0.5 truncate text-[10px] text-cyan-600") {{ personCardFacialText(item) }}
                     div(class="mt-0.5 text-[10px] text-zinc-500") {{ personCardMetaText(item) }}
 
     //- ── 분석 결과 상세 ──

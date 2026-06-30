@@ -78,6 +78,11 @@ SKIP_SUFFIXES = {
     ".tar",
     ".gz",
 }
+SKIP_FILE_NAMES = {
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
 
 
 @dataclass
@@ -103,7 +108,6 @@ ROLE_RULES = [
     ("src/app/page.mypage/", "마이페이지", "내 프로필과 비밀번호 변경 기능을 담당합니다."),
     ("src/app/page.posts", "게시판 연결 화면", "게시판 목록과 상세 화면으로 연결하는 화면입니다."),
     ("src/app/page.manual/", "사용 설명서 화면", "사이트 안에서 사용 방법과 기능 설명을 보여줍니다."),
-    ("src/app/page.presentation/", "발표/포트폴리오 화면", "FallAI 발표자료와 프로젝트 설명 화면을 담당합니다."),
     ("src/app/component.nav.sidebar/", "사이드바 메뉴", "사용자가 각 화면으로 이동할 수 있는 왼쪽 메뉴입니다."),
     ("src/app/layout.sidebar/", "기본 레이아웃", "사이드바와 본문 영역이 있는 전체 화면 틀입니다."),
     ("src/app/layout.empty/", "빈 레이아웃", "로그인처럼 별도 메뉴가 필요 없는 화면 틀입니다."),
@@ -141,6 +145,8 @@ EXT_HINTS = {
 def should_include(path: Path) -> bool:
     rel = path.relative_to(PROJECT_ROOT).as_posix()
     rel_parts = Path(rel).parts
+    if path.name in SKIP_FILE_NAMES:
+        return False
     if any(part in SKIP_DIR_PARTS for part in rel_parts):
         return False
     if any(rel.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
@@ -271,6 +277,81 @@ def build_code_lines(content: str) -> str:
     return "\n".join(rows)
 
 
+def line_note_for(rel: str, line: str) -> str:
+    """Create a short non-technical note for a source line in the generated guide."""
+    suffix = Path(rel).suffix.lower()
+    stripped = line.strip()
+    if not stripped:
+        return ""
+
+    comment_prefixes = ("#", "//", "//-", "/*", "*", "<!--")
+    if stripped.startswith(comment_prefixes):
+        return "개발자가 사람에게 남긴 설명 또는 구분 표시입니다."
+    if stripped.startswith(("import ", "from ")) or re.match(r"import\s+.+\s+from\s+", stripped):
+        return "다른 파일이나 외부 라이브러리의 기능을 가져옵니다."
+    if stripped.startswith(("@", "@@")):
+        return "바로 아래 코드에 적용되는 설정 또는 장식입니다."
+    if stripped.startswith(("class ", "export class ")):
+        return "관련 데이터와 동작을 하나로 묶는 큰 코드 단위입니다."
+    if re.match(r"(async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*", stripped):
+        return "반복해서 호출되는 서버/AI 처리 절차입니다."
+    if re.match(r"(public|private|protected)?\s*(async\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(", stripped):
+        return "화면 안에서 반복해서 호출되는 동작 함수입니다."
+    if stripped.startswith(("if ", "if (", "*ngIf")) or "*ngIf" in stripped:
+        return "조건이 맞을 때만 다음 처리를 하거나 화면에 보여줍니다."
+    if stripped.startswith(("elif ", "else if", "else:")):
+        return "앞 조건이 맞지 않을 때의 다른 경우를 처리합니다."
+    if stripped.startswith(("for ", "while ", "*ngFor")) or "*ngFor" in stripped:
+        return "목록이나 반복 작업을 한 항목씩 처리합니다."
+    if stripped.startswith(("try:", "try {")):
+        return "실패할 수 있는 작업을 안전하게 시도합니다."
+    if stripped.startswith(("except", "catch")):
+        return "오류가 나도 화면이나 서버가 멈추지 않도록 처리합니다."
+    if stripped.startswith(("return ", "return;")):
+        return "계산하거나 만든 결과를 호출한 쪽으로 돌려줍니다."
+    if stripped.startswith(("raise ", "throw ")):
+        return "문제가 생겼음을 위쪽 처리 흐름에 알립니다."
+
+    if "wiz.call" in stripped or "fetch(" in stripped:
+        return "브라우저 화면에서 서버 API를 호출합니다."
+    if "wiz.response.status" in stripped or "wiz.response" in stripped:
+        return "서버 처리 결과를 브라우저로 돌려줍니다."
+    if "wiz.model" in stripped:
+        return "WIZ 모델 계층의 기능을 불러와 사용합니다."
+    if "routerLink" in stripped:
+        return "사용자가 클릭하면 이동할 사이트 안 주소입니다."
+    if "MediaRecorder" in stripped or "getUserMedia" in stripped:
+        return "브라우저 카메라/녹화 기능을 사용합니다."
+    if "localStorage" in stripped or "sessionStorage" in stripped:
+        return "브라우저 안에 최근 상태를 임시 저장합니다."
+    if "RandomForest" in stripped or "XGB" in stripped or "YOLO" in stripped or "torch" in stripped:
+        return "AI 모델 학습 또는 추론과 연결되는 부분입니다."
+    if "os.environ" in stripped:
+        return "서버 환경변수로 기능을 켜고 끄거나 값을 조정합니다."
+    if "json" in stripped.lower():
+        return "정해진 JSON 형식으로 데이터를 읽거나 씁니다."
+    if "Path(" in stripped or ".open(" in stripped or "read_text" in stripped or "write_text" in stripped:
+        return "서버 파일을 읽거나 저장하는 처리입니다."
+    if "subprocess" in stripped or "Popen" in stripped:
+        return "학습/평가 같은 별도 실행 작업을 시작합니다."
+    if "setInterval" in stripped or "setTimeout" in stripped:
+        return "일정 시간 뒤 또는 주기적으로 실행합니다."
+
+    if suffix == ".json" and stripped.startswith('"'):
+        return "WIZ나 앱이 읽는 설정값입니다."
+    if suffix == ".pug":
+        if stripped.startswith(("div", "section", "nav", "button", "a(", "span", "p(", "h1", "h2", "h3", "input", "video", "canvas")):
+            return "사용자 화면에 보이는 요소를 배치합니다."
+    if suffix == ".scss":
+        if stripped.endswith("{"):
+            return "아래 디자인 규칙이 적용될 화면 영역을 고릅니다."
+        if ":" in stripped and stripped.endswith(";"):
+            return "색상, 간격, 크기 같은 화면 스타일 값을 정합니다."
+    if suffix in {".ts", ".js", ".py"} and re.match(r"^[A-Za-z_][A-Za-z0-9_.$\[\]'\"-]*\s*[:=]", stripped):
+        return "나중에 쓰기 위해 값을 이름에 담아 둡니다."
+    return ""
+
+
 def collect_files() -> list[CodeFile]:
     paths = [p for p in PROJECT_ROOT.rglob("*") if p.is_file() and should_include(p)]
     files: list[CodeFile] = []
@@ -305,11 +386,12 @@ def render_file_section(file: CodeFile, index: int) -> str:
         symbols = "<li>자동으로 잡힌 함수/클래스는 없지만, 파일 전체가 설정 또는 화면 구조로 사용됩니다.</li>"
     code_rows = []
     for line_no, line in enumerate(file.content.splitlines(), start=1):
+        note = line_note_for(file.path, line)
         code_rows.append(
-            f'<tr id="{file_id}-L{line_no}"><td class="line-no">{line_no}</td><td class="code-line"><code>{html.escape(line) or " "}</code></td></tr>'
+            f'<tr id="{file_id}-L{line_no}"><td class="line-no">{line_no}</td><td class="code-line"><code>{html.escape(line) or " "}</code></td><td class="line-note">{html.escape(note) or " "}</td></tr>'
         )
     if not code_rows:
-        code_rows.append(f'<tr id="{file_id}-L1"><td class="line-no">1</td><td class="code-line"><code> </code></td></tr>')
+        code_rows.append(f'<tr id="{file_id}-L1"><td class="line-no">1</td><td class="code-line"><code> </code></td><td class="line-note"> </td></tr>')
     return f"""
 <section class="file-card" id="{file_id}" data-path="{html.escape(file.path.lower())}" data-role="{html.escape(file.role.lower())}">
   <header class="file-head">
@@ -408,6 +490,7 @@ def render(files: list[CodeFile]) -> str:
     .line-no {{ width: 58px; min-width: 58px; padding: 0 10px; text-align: right; color: #64748b; border-right: 1px solid rgba(255,255,255,.08); user-select: none; vertical-align: top; }}
     .code-line {{ padding: 0 14px; white-space: pre; vertical-align: top; }}
     .code-line code {{ font-family: inherit; }}
+    .line-note {{ width: 280px; min-width: 280px; padding: 0 12px; border-left: 1px solid rgba(255,255,255,.08); color: #93c5fd; white-space: normal; vertical-align: top; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     .explain-pane {{ border-left: 1px solid var(--line); padding: 18px; background: #fbfcfd; }}
     .explain-pane h3 {{ margin: 0 0 8px; font-size: 14px; }}
     .explain-pane p, .explain-pane li {{ color: #4b5563; font-size: 13px; line-height: 1.65; }}
@@ -441,7 +524,7 @@ def render(files: list[CodeFile]) -> str:
     <main>
       <section class="hero">
         <h1>FallAI 전체 코드 + 비전공자용 설명</h1>
-        <p>생성 시각: {generated}. 이 문서는 교수님이 GitHub에서 실제 코드를 보면서 옆 설명으로 구조를 이해할 수 있게 만든 코드 탐색 페이지입니다.</p>
+        <p>생성 시각: {generated}. 이 문서는 교수님이 GitHub에서 실제 코드를 보면서 줄별 쉬운 해석, 파일 설명, 주요 함수 위치를 함께 확인할 수 있게 만든 코드 탐색 페이지입니다.</p>
         <div class="notice">보안과 용량 문제 때문에 `node_modules`, `build`, `storage`, `outputs`, AI-Hub 원본 데이터, 업로드 영상, 모델 가중치, 이미지/폰트/대용량 바이너리, 외부 vendor 코드는 제외했습니다. 직접 작성한 서비스 코드, 서버 코드, AI/학습 스크립트, 설정 파일은 포함했습니다.</div>
       </section>
       {sections}
