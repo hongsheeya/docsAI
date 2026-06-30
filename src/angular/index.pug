@@ -31,7 +31,7 @@ html(lang="en")
         link(rel="manifest" href="/manifest.json")
 
         script(type="text/javascript").
-            window.__FALLAI_ASSET_VERSION__ = '20260616-service-render-v2';
+            window.__FALLAI_ASSET_VERSION__ = '20260630-no-portfolio-v1';
             if ('caches' in window) {
                 caches.keys().then(function(keys) {
                     keys.forEach(function(key) { caches.delete(key); });
@@ -41,7 +41,7 @@ html(lang="en")
                 navigator.serviceWorker.getRegistrations().then(function(registrations) {
                     registrations.forEach(function(reg) { reg.update(); });
                 }).catch(function() {});
-                navigator.serviceWorker.register('/sw.js?v=20260616-service-render-v2', {scope: '/'}).then(function(reg) { reg.update(); });
+                navigator.serviceWorker.register('/sw.js?v=20260630-no-portfolio-v1', {scope: '/'}).then(function(reg) { reg.update(); });
             }
 
     body
